@@ -1,0 +1,110 @@
+[package]
+name = "interviewlab"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "interviewlab_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# CUDA backend for whisper.cpp (spec §6.2). OFF by default → CPU build, so machines
+# without a CUDA Toolkit still build. Enable on a CUDA box with `--features cuda`.
+#
+# Verified on this machine (RTX 5080, sm_120 / Blackwell) with CUDA Toolkit v13.3.
+# The build needs a specific env (whisper.cpp compiles its CUDA kernels via nvcc):
+#   - Toolkit v13.3 (NOT v12.9): v12.9's cudafe++ ACCESS_VIOLATIONs on VS 2026 / MSVC
+#     14.51; v13.3's host_config.h supports VS 2019–2026.
+#   - Ninja generator (CMAKE_GENERATOR=Ninja): the VS generator uses MSBuild's
+#     "CUDA 13.3.targets" which fails to resolve CudaToolkitDir here.
+#   - CMAKE_GENERATOR_INSTANCE= (empty): stop CMake applying a VS instance under Ninja.
+#   - CMAKE_CUDA_ARCHITECTURES=120: build sm_120 kernels (whisper.cpp 1.8.3 rewrites
+#     120 -> 120a internally for Blackwell).
+#   - vcvars64 env (cl.exe + INCLUDE/LIB) so Ninja finds the MSVC toolchain.
+# The exact recipe lives in target/cuda-build.cmd (gitignored scratch). See the M4 GPU report.
+cuda = ["whisper-rs/cuda"]
+
+# Metal backend for whisper.cpp on Apple Silicon (mac-build.md). Mirrors `cuda`: OFF by
+# default → CPU build. Enable on a Mac with `--features metal`. No special build env —
+# Metal ships in the macOS SDK (Xcode Command Line Tools provide the toolchain).
+metal = ["whisper-rs/metal"]
+# Future option (Apple Silicon): CoreML / Apple Neural Engine backend for whisper.cpp.
+# whisper-rs 0.16 exposes it via `whisper-rs/coreml`; it needs an extra CoreML-encoder
+# model artifact at runtime, so it's left as a future toggle alongside `metal` rather than
+# wired now — see mac-build.md. To enable later, add:
+#   coreml = ["whisper-rs/coreml"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# protocol-asset: lets the webview load local media via the asset: protocol
+# (convertFileSrc) — the transcript editor's audio player streams recording.audio_path
+# (M5). Scoped to $APPDATA/cycles/** in tauri.conf.json + capabilities/default.json.
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+# File-picker fallback for ingest (M3): Tauri dialog plugin (spec §3.2 "or uses a file picker").
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# DB: sqlx + SQLite, Tokio runtime, compile-time migrations (spec §5.3).
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+# process/io-util/time: drive the local AI CLI adapter (M6, spec §7) via
+# tokio::process — spawn the CLI, pipe payload JSON to stdin, enforce a timeout.
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "macros"] }
+# IDs for new rows (spec §5.3 lists uuid as a core dep).
+uuid = { version = "1", features = ["v4"] }
+# ffmpeg as a sidecar (spec §6.5): auto-downloads an LGPL build, runs it as a
+# subprocess for media → 16kHz mono wav + duration probe.
+ffmpeg-sidecar = "2"
+# ASR engine (M4, spec §6.1): whisper.cpp via whisper-rs, in-process. CPU build on
+# this machine (no CUDA Toolkit/nvcc); the `cuda` feature is enabled by a build flag
+# when nvcc is present (see asr.rs note + Cargo `cuda` feature below).
+whisper-rs = "0.16"
+# Model download with progress (M4, spec §6.4). ponytail: ureq is ALREADY in the
+# dependency tree (pulled transitively), so declaring it adds zero new compilation —
+# a tiny blocking HTTP client we run on a spawn_blocking task and read in chunks to
+# emit byte-progress. Avoids adding reqwest's async/stream feature set as a new dep.
+ureq = "3"
+# Speaker diarization (feature-diarization.md): the OFFICIAL k2-fsa `sherpa-onnx` Rust
+# crate (NOT the archived thewh1teagle/sherpa-rs). Pure-native ONNX Runtime, no Python.
+# `OfflineSpeakerDiarization` = pyannote-segmentation-3.0 + 3D-Speaker ERes2Net embedding
+# + FastClustering. Runs on CPU (off the CUDA path by design) → builds on any machine,
+# Mac-ready via the same crate.
+#
+# CRT note (Windows): the default `static` feature pulls the win-x64-static-MT prebuilt,
+# which statically links onnxruntime AND the /MT C runtime — that collides with the rest
+# of this project (whisper-rs + the Tauri dylib build with /MD), producing LNK2005 /
+# LNK4098 "LIBCMT conflicts with msvcprt". So we use `shared`: sherpa + onnxruntime ship
+# as DLLs the build script auto-copies next to the binary (onnxruntime.dll ~15 MB +
+# sherpa-onnx-c-api.dll ~4 MB + 2 small ones), the import libs pull no CRT, and the whole
+# link uses one (/MD) runtime. `cargo run`/dev already loads the right DLLs (they sit next
+# to the .exe; Windows checks the app dir before System32 — important, since a stale 1.17.x
+# onnxruntime.dll lives in System32). INSTALLER packaging (adding these DLLs to
+# bundle.resources) is the M5-hardening follow-up per feature-diarization.md §7 M5.
+sherpa-onnx = { version = "1.13.3", default-features = false, features = ["shared"] }
+# First-run diarization-model download: the pyannote segmentation model ships as a
+# .tar.bz2, so we extract model.onnx with tar+bzip2. ponytail: both crates are ALREADY in
+# the tree (sherpa-onnx-sys's build script uses them to unpack its prebuilt libs), so
+# declaring them adds no new compilation — same trick as ureq.
+tar = "0.4"
+bzip2 = "0.4"
+
+# Nvidia GPU detection (M4, spec §6.3): NVML reports whether an Nvidia GPU is present
+# so Settings can show the device Badge and asr decides use_gpu. Nvidia-only, so it's
+# scoped off macOS (Apple Silicon has no Nvidia GPU) — on macOS asr.rs's probe is a stub
+# that returns None. See mac-build.md.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = "0.10"
+
+[dev-dependencies]
+# Enable tokio's test macro for the cycle CRUD integration tests.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

@@ -1,0 +1,38 @@
+# UI polish backlog (deferred)
+
+Refinements from the first design review. **Deferred** — apply in a later dedicated polish pass; not blocking functional milestones. Full-res "before" shots live in `interviewlab/.design-shots/`. The dev-mock + capture flow (Vite + headless Chrome → PNGs) is reusable for before/after on future passes.
+
+## Final pass (do LAST, after the feature/UI churn settles)
+- **Holistic UX + color/heuristics audit.** Whole-app review: the color palette must work together across all surfaces (accent / status / role colors, contrast, dark theme), and design heuristics must hold across all scenarios (consistent states — hover/selected/editing/loading/empty/error, density, visible feedback, spacing rhythm, accessibility/focus). Screenshot-review every screen, capture findings, apply fixes. Requested by user — run at the very end, not mid-churn.
+
+## Near-term — requested (do soon)
+- **Transcript editor: kill stray scrollbars + make feedback visible.** (1) Each segment row shows a vertical scrollbar AND the whole interview block has a scrollbar that **overlaps the chat split-panel** — since nothing is truncated, **turn these off**: segment text **autosizes** (no inner per-row scroll), and the editor uses a single clean scroll region that doesn't collide with the chat `ResizablePanel`. (2) The multi-select **checkboxes are nearly invisible**, **row hover is invisible**, and the **edit pencil is too subtle → remove it**; make every interaction give **clear visible feedback** (visible checkbox, obvious hover, clear selected/editing states). Touches `transcript-editor.tsx`. Requested by user. *Queued after the running range-multi-select agent (same file).*
+- **Persistent global shell + chat on ANY cycle screen (incl. the transcript editor).** Two coupled problems: (a) the "Ask AI" CTA + chat panel are mounted only in `cycle-detail.tsx`'s tab bar; (b) the **transcript editor is a full-bleed route that REPLACES the whole shell** (it renders its own header), so in an interview **both the global header nav AND Ask AI disappear**. Fix together:
+  - **Nest the editor route under the global shell layout** (`main.tsx`) so the **global top header always persists**; give the editor its own **contextual sub-toolbar** (back / interview title / version / save) UNDER the global header, not a shell replacement.
+  - **Lift the chat panel mount + Ask AI CTA into the global shell header** (`App.tsx`), **cycle-aware**: present on any `/cycles/:id/**` route (detail tabs AND the interview editor), grounding on that cycle (in the editor, context = the open interview). Remove the per-tab CTA/mount from `cycle-detail.tsx`.
+  - On non-cycle screens (cycles list / guides / settings) hide the CTA (no cycle to ground) unless the founder wants an always-present CTA with a cycle picker.
+  - Touches `App.tsx` + `main.tsx` (router) + `cycle-detail.tsx` + `transcript-editor.tsx`. Requested by user — matches the original "callable from anywhere in the cycle" requirement. *Queued after the fluid-width agent (App.tsx) + transcript-editor UX agent finish.*
+- **Range speaker-assignment UX is unclear.** The "Shift-click a row, then pick a speaker to assign a range" hint is cryptic — no visible selection, unclear how to use. Replace with a discoverable **multi-select** pattern: clicking a row selects it (Shift-click extends the range) with a **visible selection highlight**, and a contextual **"N selected → Assign speaker ▾"** action bar appears to bulk-assign the role; drop the cryptic hint text. Touches `transcript-editor.tsx`. Requested by user. *Queued right after the running transcript-editor UX agent (same file).*
+- **Products library (extract product description).** Move `cycle.product_desc` out of the cycle into a separate **Products library** — CRUD + the Plate `.md` editor, mirroring the Guides library; a cycle **references a product** (Overview product-picker, like the guide picker). Migration `0005` (`product` table + `cycle.product_id`, migrate inline `product_desc` → product rows, keep column for back-compat). Backend CRUD + a Products section (header nav) + cycle Overview product picker + dev-mock. Requested by user. *Queued after the running cycle-detail + e2e agents (shared Overview + schema).*
+- **Overview must RENDER markdown (bug).** The cycle Overview shows **raw** markdown (`##`, `-` visible) instead of rendered — the guide/product **preview** must render markdown (Plate read-only render, or Streamdown), not show raw text. *Bundle with the Products/Overview rework above.* Requested by user.
+- **Chat entry = an obvious CTA (standard pattern).** The current chat toggle is too subtle. Make the entry a prominent **CTA button** in the cycle's header (top-right) — accent-tinted, ✨/chat icon + label (e.g. "Ask AI" / "Chat about this cycle") + the ⌘J hint — per common AI-assistant patterns (optionally a floating action button too). Keep Cmd+K + the shortcut. Chat is cycle-scoped, so the CTA lives in the cycle context. Touches the header / `cycle-detail.tsx`. Requested by user. *Queued right after the header-redesign agent (same files).*
+- **Sidebar → top header nav.** Few nav items (Cycles / Guides / Settings) don't justify a full left sidebar; convert the shell to a compact **top header** nav to reclaim horizontal space for the work area. Touches the `App.tsx` shell (and diverges from the "left sidebar" note in design-direction.md — update that too). Requested by user. *Queued after M11 Phase A (same files).*
+- **Collapsed chat must not reserve width.** When the cycle chat panel is collapsed it still leaves a gap; the work-area content should **stretch to fill** the freed width (collapsed = width 0 / removed from the resizable group, not a fixed rail). Touches `cycle-detail.tsx` + `cycle-chat-panel.tsx`. Requested by user. *Queued after M11 Phase A.*
+- **Markdown toolbar.** The Plate `.md` editor (Guides library + the synthesis cycle artifact + per-interview summary — all share `src/components/markdown-editor.tsx`) needs a real formatting **toolbar**: bold / italic / underline / strikethrough / headings (H1–H3) / bullet + numbered lists / quote / code / link. Add Plate's **FixedToolbar** + mark/block toolbar buttons to that one component → it lands on every `.md` surface at once. Queued right after M10b (which is editing those surfaces). Requested by user.
+
+---
+
+**Accent:** default **indigo `#5E6AD2`** (Linear-ish) — KEEP for now; revisit the hue with the user later if desired.
+
+1. **Cycles list — lose the heavy outer card border** (row dividers only) and **tighten row height to ~40px** — more Linear-like airiness.
+2. **Cycle row leading dot is not semantic** (Activation shows accent, others grey — meaning unclear). Make it encode real state (active/done) or remove until it does.
+3. **Overview textareas clip content** (fixed height + scroll). Make them **auto-grow** so the page reads like a document.
+4. **Interviews dropzone is oversized when interviews already exist** — collapse it to a slim zone once the list is non-empty.
+5. **H1 ↔ breadcrumb redundancy** on list/settings (top-bar "Cycles" + big H1). Keep one.
+
+### Transcript editor (M5) — minor
+6. Verify role-chip colors match the role palette (interviewer=indigo, respondent=teal, observer=amber, other=neutral), and that a participant-card dot matches the segment chip for the same speaker.
+7. Waveform could be a touch taller for easier scrubbing; consider drawing the active-segment region on the waveform.
+8. The "Shift-click a row…" range-assign hint could be a tooltip/onboarding instead of persistent header text.
+
+See [design-direction.md](design-direction.md) for the full bar/tokens.

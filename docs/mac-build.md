@@ -1,0 +1,72 @@
+# macOS (Apple Silicon M3 Pro+) — readiness & build plan (req 5)
+
+The app is built/verified on **Windows + Nvidia CUDA**. This is the path to run it on **Mac Apple Silicon**. The engines are already cross-platform & **no-Python**; remaining work is feature flags + device detection + bundle config. (Honest limit: we can't run/verify on a real M3 Pro from this Windows box — we make it Mac-ready + documented; final on-device check needs a Mac.)
+
+## Cross-platform audit (current state)
+- **whisper.cpp (`whisper-rs 0.16`):** Windows uses the `cuda` feature. Apple Silicon → add a **`metal`** feature (`whisper-rs/metal`, optionally `coreml`) for GPU/ANE acceleration; CPU fallback works without it.
+- **Diarization (`sherpa-onnx 1.13.3`, `shared`):** cross-platform ONNX Runtime; macOS-arm64 prebuilt is shipped by the crate. Optionally enable the **CoreML** execution provider on Apple Silicon (else CPU ~real-time — fine). The `shared` (DLL/dylib) choice was made to dodge a Windows CRT conflict; it's also correct on macOS.
+- **Device detection (`asr.rs`) — DONE:** `nvml_wrapper` is now cfg-gated off macOS (the probe is a `#[cfg(target_os = "macos")]` stub returning `None`), and `detect_device()` has a macOS/Metal branch: on macOS with the `metal` feature it reports `device=metal, use_gpu=true`; without it, CPU.
+- **Process spawn:** `CREATE_NO_WINDOW` is `#[cfg(windows)]` → no-op on Mac ✓.
+- **Build env:** `cuda-build.cmd` is Windows-only (vcvars + CUDA 13.3 + Ninja). Mac needs **no special env** — Metal is in the SDK; build via `npm run tauri build -- --features metal` (Xcode Command Line Tools required).
+- **Paths/models:** Tauri `app_data_dir()` everywhere (cross-platform) ✓; no hardcoded `C:\` in `src` ✓.
+
+## Work to make the Mac build — STATUS
+Implemented from the Windows box (cfg-gating + config + docs). Items are marked done where
+the code/config has landed; the on-device run still needs a real Mac (see "Verify").
+
+1. **Cargo — DONE.** Added `metal = ["whisper-rs/metal"]` to `[features]` (mirrors `cuda`,
+   OFF by default → CPU build). `cuda` stays Windows/Linux-only in behavior. `nvml-wrapper`
+   is scoped under `[target.'cfg(not(target_os = "macos"))'.dependencies]`, so the macOS
+   target never tries to build the Nvidia-only crate. `coreml` is NOT wired (it needs an
+   extra CoreML-encoder model artifact); it's left as a commented future toggle in Cargo.toml.
+2. **asr.rs — DONE.** `probe_nvidia_gpu()` is cfg-split: the real NVML probe is
+   `#[cfg(not(target_os = "macos"))]`, and a `#[cfg(target_os = "macos")]` stub returns `None`
+   (so macOS compiles with no `nvml_wrapper` reference). Added `metal_build()`
+   (`cfg!(feature = "metal")`). `detect_device()` is cfg-split: non-macOS keeps the exact
+   CUDA/CPU logic; the macOS branch reports `device="metal", use_gpu=true,
+   gpu_name=Some("Apple Silicon GPU"), cuda_build=false` when the `metal` feature is on, and
+   a clear CPU `DeviceInfo` (with a "rebuild with --features metal" hint) when it's off.
+   `DeviceInfo.device` doc comment now lists `"metal"`. Whisper still uses
+   `cparams.use_gpu(use_gpu)` — Metal is selected by the whisper-rs `metal` feature at compile
+   time, so `use_gpu=true` simply runs on whatever GPU backend was compiled in. The
+   `detect_device_is_consistent` unit test now tolerates `device="metal"` on macOS without
+   changing its Windows behavior.
+3. **sherpa — confirmed cross-platform; dylib bundling is the same follow-up as Windows.**
+   `sherpa-onnx 1.13.3` with the `shared` feature ships the macOS-arm64 onnxruntime + sherpa
+   **dylibs** via the crate's prebuilt (the `shared` choice that dodged the Windows CRT clash
+   is also correct on macOS). As on Windows, the build script drops the shared libs next to the
+   binary for `cargo run`/dev. Bundling those shared libs INTO the installer (Windows `.dll` →
+   `bundle.resources`, macOS `.dylib`) is NOT yet done on EITHER platform — it's the same
+   M5-hardening follow-up (feature-diarization.md §7 M5). We deliberately did not invent a
+   macOS-only `resources` entry that Windows lacks; when the Windows DLL bundling lands, mirror
+   it for the `.dylib` set on macOS. Optional CoreML execution provider for diarization is a
+   later nicety (CPU is ~real-time and fine).
+4. **tauri.conf — DONE (bundle target).** `bundle.targets: "all"` already emits `.app`/`.dmg`
+   on macOS; added a `bundle.macOS` block with `minimumSystemVersion: "12.0"` (Apple Silicon
+   floor). No `resources` key was added — see item 3 (dylib bundling is a shared follow-up, and
+   inventing macOS-only paths absent on Windows would be misleading).
+5. **Docs — DONE.** See "Build & run on a Mac" below.
+6. **Verify — partial (see below).** Cross-checked from Windows with a plain
+   `cargo check` (DEFAULT features, no cuda): compiles cleanly, proving the non-macOS
+   cfg-gating is correct and the Windows build is intact. `cargo check --target
+   aarch64-apple-darwin --features metal` is NOT runnable from this Windows box (no Apple
+   toolchain/SDK to link against), so the macOS cfg paths are made obviously correct by
+   mirroring the existing CUDA patterns. **A real Mac is still required for the final
+   on-device build + run.**
+
+## Build & run on a Mac (Apple Silicon)
+Prereq: **Xcode Command Line Tools** (`xcode-select --install`) — provides clang + the macOS
+SDK (Metal ships in the SDK; no extra GPU env like the Windows CUDA recipe). Plus Node + Rust
+(`aarch64-apple-darwin` is the default host target on Apple Silicon).
+
+- Dev (GPU): `npm run tauri dev -- --features metal`
+- Build (GPU, produces `.app`/`.dmg`): `npm run tauri build -- --features metal`
+- CPU-only (no Metal): omit `--features metal` — the app falls back to CPU and
+  `detect_device()` reports `device="cpu"` with a hint to rebuild with Metal.
+
+Honest limit: everything above is implemented + compiles for the non-macOS targets we can build
+here; the final M3-Pro on-device check (Metal init, dylib loading, `.dmg` packaging) still needs
+a Mac.
+
+## Web-app alternative (req 5 says "web app OR Tauri")
+Tauri packages on both OSes satisfy the requirement. A pure web-app deployment would need a server-side backend (the Rust commands run locally in Tauri); out of scope unless requested.

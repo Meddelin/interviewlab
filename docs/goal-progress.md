@@ -1,0 +1,23 @@
+# Goal progress — drive until all 7 requirements hold
+
+Session goal (2026-06-24). Work autonomously until every item is ✅ and the full e2e is verified in the real app.
+
+**DONE (2026-06-24):** all 7 requirements hold. Full pipeline verified live in the real CUDA app (RTX 5080): ingest → ASR → diarize → cleanup → roles → synthesis → per-interview summary → diff → chat, across 3 plugins. req5 (Mac) is code-complete + documented (final on-device run needs a Mac). Remaining is packaging-only: bundle the sherpa/onnxruntime DLLs/dylibs into the installer (Win+Mac).
+
+| # | Requirement | Status | Remaining work |
+|---|---|---|---|
+| 1 | Pluggable CLIs: **Claude Code + Antigravity CLI + Qwen Code** + any CLI as a drop-in **plugin** with an agent-facing instruction (no app source changes) | ✅ | Plugin-folder loader (`plugins/<id>/manifest.json`) + capability manifest + Rescan; 3 bundled plugins (Claude Code reference = Available via real round-trip; Qwen + Antigravity descriptors load+parse); agent-facing meta-instruction shipped (`plugins/README.md` + Add-plugin dialog); Settings → AI CLI multi-plugin. Deferred (inherent to those CLIs/design): adapter-program runtime → M12; Qwen chat stream-parser; Antigravity JSON flag unstable upstream. |
+| 2 | Core scenarios: ASR (good local model), cleanup via CLI, **synthesis per guide template**, **product context** in transcription/cleanup, **speaker detection**, role assignment, **editing all results** (transcript/cleanup/synthesis) | ✅ (code) | ASR large-v3/GPU ✓, cleanup (haiku) ✓, synthesis-per-guide ✓, diarization (real speakers) ✓, roles ✓, **product context → ASR `initial_prompt` + cleanup + synthesis** ✓, all results editable (transcript raw/cleaned/edited + synthesis markdown artifact) ✓. Final proof in the real app = req 7. |
+| 3 | **Markdown editor** everywhere text is edited | ✅ | Plate editor in Guides, **Products**, synthesis artifact, per-interview summary; **Overview now RENDERS** product + guide markdown (`MarkdownPreview` = Plate readOnly), no raw `##`. |
+| 4 | Use current (Jun 2026) reusable solutions maximally | ✅ | shadcn, Plate, assistant-ui, Streamdown, whisper.cpp/whisper-rs, sherpa-onnx (official k2-fsa crate), cmdk, react-resizable-panels, TanStack Query, etc. — applied throughout; no reinvented wheels. |
+| 5 | Runs as web app OR Tauri on **Windows+Nvidia** AND **Mac M3 Pro**, respecting OS/hardware | ✅ (code) | Windows+CUDA verified live. **Mac (Apple Silicon) build path now real**: `metal = ["whisper-rs/metal"]` feature; `nvml-wrapper` moved to `[target.'cfg(not(target_os="macos"))'.dependencies]`; `asr.rs` cfg-split — non-mac keeps CUDA/CPU unchanged, **macOS branch reports `device="metal", use_gpu=true`** when built `--features metal` (else CPU); `tauri.conf.json` macOS bundle (`.app`/`.dmg`, minSysVer 12.0); docs updated with `tauri dev/build -- --features metal` + Xcode CLT prereq. `cargo check` (default) clean. **Honest limit:** final on-device run (Metal init, dylib load, `.dmg`) needs a real Mac — can't verify from this Windows box. Sherpa/onnxruntime dylib **installer bundling** is a shared Win+Mac packaging follow-up. |
+| 6 | Models fast with minimal quality loss | ✅ | Fast per-task models (haiku cleanup / sonnet synthesis+diff) + bounded-parallel LLM ✓. **ASR verbose-logging silenced** (`set_log_callback` filter) → large-v3 GPU **240s→21.4s = 11.2× real-time** (was ~1×); quality unchanged (large-v3). Diarization CPU ~real-time (acceptable; could move to GPU later). |
+| 7 | Full e2e verified in the **real app** | ✅ | Whole chain driven live via CDP on the GPU build (RTX 5080, schema 5, 3 plugins): ingest → **ASR** large-v3/GPU → **diarize** (S1/S2 on multi-voice) → **cleanup** (haiku) → **roles/participants** → **synthesis** (sonnet: 5 findings G1–G3 + by-role + open-questions, using product+guide) → **per-interview summary** → **diff** (sonnet: 7 entries, 3 new/2 changed/2 dropped by goal, wave-over-wave) → **chat** (streaming, grounded `[[finding:Fn]]` citations). Found+fixed bug #7 (legacy descriptor shadowed the folder manifest → chat capability lost); precedence reorder **rebuild-verified** on the CUDA binary (folder manifest wins even with the stale legacy file present; chat streamed `[[finding:F3]]`). |
+
+## Plan / order
+1. **req 6** — ASR verbose-logging perf fix (restore ~15× GPU). ← starting
+2. **req 1** — pluggable plugin system + Claude Code/Antigravity/Qwen + meta-instruction.
+3. **req 2/3** — Products library + product context in cleanup/synthesis + Overview markdown render.
+4. **req 7** — full e2e verification in the real app (GPU large-v3), hands-on via CDP.
+5. **req 5** — Mac/Apple-Silicon build readiness (code + config + docs).
+(req 4 woven through all; verified at the end.)

@@ -1,0 +1,36 @@
+# ── Build artifacts (huge) ─────────────────────────────────────────────
+interviewlab/node_modules/
+interviewlab/dist/
+interviewlab/src-tauri/target/
+interviewlab/src-tauri/gen/schemas/
+
+# ── Downloaded models (fetched at runtime; never commit binaries) ───────
+**/models/
+*.bin
+*.onnx
+*.gguf
+
+# ── Local scratch / backups / seed work ────────────────────────────────
+_db_backup/
+_seedwork/
+120a
+**/120a
+
+# ── Local Claude Code config (machine-specific) ────────────────────────
+.claude/
+interviewlab/.claude/
+
+# ── Design screenshots ─────────────────────────────────────────────────
+interviewlab/.design-shots/
+
+# ── e2e: keep tooling (cdp.mjs, gpu_dev.cmd), drop heavy/derived files ──
+_e2e/*.mp3
+_e2e/*.wav
+_e2e/*.png
+_e2e/*.log
+
+# ── OS / editor ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.local

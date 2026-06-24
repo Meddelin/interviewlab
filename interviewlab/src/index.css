@@ -1,0 +1,235 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* M11 chat: let Tailwind detect the utility classes Streamdown emits for the streamed
+   assistant markdown (its docs require an @source pointing at its dist). */
+@source "../node_modules/streamdown/dist/*.js";
+
+/* Self-hosted, offline-friendly fonts (desktop app): Inter for UI/body, JetBrains
+   Mono for numerals/timecodes. Variable variants = one file each, full weight range. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+    /* Mono face for the data of this domain: timecodes, durations, counts, dates. */
+    --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SFMono-Regular', monospace;
+
+    /* Domain status/role colors — one muted, semantic vocabulary reused everywhere
+       (interview ingest now; speaker/role tags later). Exposed as utilities. */
+    --color-status-ready: var(--status-ready);
+    --color-status-importing: var(--status-importing);
+    --color-status-error: var(--status-error);
+    --color-status-processing: var(--accent);
+
+    /* Speaker/role colors (transcript editor, M5) — same muted vocabulary, one hue
+       per role so chips read as a consistent semantic system (design-direction). */
+    --color-role-interviewer: var(--role-interviewer);
+    --color-role-respondent: var(--role-respondent);
+    --color-role-observer: var(--role-observer);
+    --color-role-other: var(--role-other);
+
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    /* Modest radii (6–10px) — not pill, not sharp. --radius drives the scale. */
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+    --radius-2xl: calc(var(--radius) + 8px);
+    --radius-3xl: calc(var(--radius) + 12px);
+    --radius-4xl: calc(var(--radius) + 16px);
+}
+
+/* ── v1 token plan: "Linear for user-interview research" ───────────────────────
+   Dark is the product identity (default). Light is a cheap courtesy mapping.
+   Concrete hexes per docs/design-direction.md §"Concrete token plan (v1)".
+
+   Order matters: <html> with class="dark" matches BOTH :root and .dark at equal
+   specificity, so .dark must come AFTER :root to win. */
+
+/* Light theme — a courtesy mapping (dark is the identity). Neutral, hairline. */
+:root {
+    --background: #ffffff;
+    --foreground: #16181d;
+    --card: #ffffff;
+    --card-foreground: #16181d;
+    --popover: #ffffff;
+    --popover-foreground: #16181d;
+    --primary: #5159c7;
+    --primary-foreground: #ffffff;
+    --secondary: #f4f5f7;
+    --secondary-foreground: #16181d;
+    --muted: #f4f5f7;
+    --muted-foreground: #6b6e76;
+    --accent: #5159c7;
+    --accent-foreground: #ffffff;
+    --destructive: #d24a35;
+
+    --border: rgba(16, 18, 24, 0.10);
+    --border-strong: rgba(16, 18, 24, 0.16);
+    --input: rgba(16, 18, 24, 0.14);
+    --ring: #5159c7;
+
+    --status-ready: #1f9d6f;
+    --status-importing: #b27d20;
+    --status-error: #d24a35;
+
+    /* Role hues (light): interviewer=accent indigo, respondent=teal, observer=amber,
+       other/unassigned=neutral. Reuses the status palette family. */
+    --role-interviewer: #5159c7;
+    --role-respondent: #1f9d6f;
+    --role-observer: #b27d20;
+    --role-other: #6b6e76;
+
+    --chart-1: #5159c7;
+    --chart-2: #1f9d6f;
+    --chart-3: #b27d20;
+    --chart-4: #6b6e76;
+    --chart-5: #9a9ca3;
+
+    --radius: 0.5rem;
+
+    --sidebar: #fafafb;
+    --sidebar-foreground: #3a3d44;
+    --sidebar-primary: #5159c7;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: rgba(16, 18, 24, 0.05);
+    --sidebar-accent-foreground: #16181d;
+    --sidebar-border: rgba(16, 18, 24, 0.08);
+    --sidebar-ring: #5159c7;
+}
+
+.dark {
+    --background: #0c0d10;          /* near-black, faint cool tint (not pure #000) */
+    --foreground: #e6e7ea;          /* primary text */
+    --card: #141519;                /* elevated surface, marginally lighter */
+    --card-foreground: #e6e7ea;
+    --popover: #16171c;             /* overlays sit slightly above surface */
+    --popover-foreground: #e6e7ea;
+
+    /* Accent = the single indigo. It marks primary action, active nav, focus ring. */
+    --primary: #5e6ad2;
+    --primary-foreground: #ffffff;
+    --secondary: #1a1b20;           /* surface-2: quiet fills, secondary buttons */
+    --secondary-foreground: #e6e7ea;
+    --muted: #1a1b20;
+    --muted-foreground: #9a9ca3;    /* secondary text */
+    --accent: #5e6ad2;              /* keep accent == primary so one hue rules */
+    --accent-foreground: #ffffff;
+    --destructive: #e5614c;         /* error red, low saturation */
+
+    --border: rgba(255, 255, 255, 0.08);        /* hairline */
+    --border-strong: rgba(255, 255, 255, 0.12);
+    --input: rgba(255, 255, 255, 0.10);
+    --ring: #5e6ad2;                /* focus ring = accent (rendered at ~50% alpha) */
+
+    /* Domain status palette — muted, semantic, consistent. */
+    --status-ready: #3fb68b;
+    --status-importing: #d9a23b;
+    --status-error: #e5614c;
+
+    /* Role hues (dark): interviewer=accent indigo, respondent=teal, observer=amber,
+       other/unassigned=neutral. Muted, one hue per role (design-direction). */
+    --role-interviewer: #7c86e3;
+    --role-respondent: #3fb68b;
+    --role-observer: #d9a23b;
+    --role-other: #9a9ca3;
+
+    --chart-1: #5e6ad2;
+    --chart-2: #3fb68b;
+    --chart-3: #d9a23b;
+    --chart-4: #9a9ca3;
+    --chart-5: #6b6e76;
+
+    --radius: 0.5rem;               /* 8px base → 6–10px across the scale */
+
+    /* Sidebar: quieter than the canvas, hairline divider, accent for active item. */
+    --sidebar: #0a0b0e;
+    --sidebar-foreground: #c4c6cc;
+    --sidebar-primary: #5e6ad2;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: rgba(255, 255, 255, 0.05);   /* subtle active/hover bg */
+    --sidebar-accent-foreground: #e6e7ea;
+    --sidebar-border: rgba(255, 255, 255, 0.07);
+    --sidebar-ring: #5e6ad2;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  /* Full-bleed app shell: let the flex layout own the whole viewport. */
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  html {
+    @apply font-sans;
+    /* Tight, deliberate UI type. Headings lead with weight, not size. */
+    letter-spacing: -0.005em;
+  }
+  /* Numerals everywhere read as tabular by default (dates/durations/counts). */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  /* Mono numerals for the data of this domain — timecodes, durations, counts. */
+  .font-numeric {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+    letter-spacing: 0;
+  }
+}
+
+/* Calm, fast motion. Honor reduced-motion: drop all animation/transition. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,167 @@
+use std::fs;
+
+use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use tauri::Manager;
+
+mod adapter;
+mod asr;
+mod chat;
+mod cleanup;
+mod cycle;
+mod diarize;
+mod diff;
+mod guides;
+mod interview;
+mod product;
+mod roles;
+mod synthesis;
+mod transcript;
+
+// Pool handle stored in Tauri state and injected into commands.
+// pub(crate) so the cycle module's commands can read the pool.
+pub(crate) struct Db {
+    pub(crate) pool: SqlitePool,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct DbHealth {
+    db_path: String,
+    schema_version: i64,
+}
+
+// Health check: returns the db file path + the highest applied migration version.
+// Called from the frontend on load to render the "backend OK" badge.
+#[tauri::command]
+async fn db_health(db: tauri::State<'_, Db>) -> Result<DbHealth, String> {
+    // _sqlx_migrations is created by sqlx::migrate!; MAX(version) = current schema version.
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    Ok(DbHealth {
+        db_path: db.path.clone(),
+        schema_version,
+    })
+}
+
+// Ensure %APPDATA%/InterviewLab/ exists, open interviewlab.db, run migrations, return the pool.
+async fn init_db(app: &tauri::AppHandle) -> Result<Db, Box<dyn std::error::Error>> {
+    // Tauri's resolved app-data dir (spec §2.3). Resolves to %APPDATA%/<bundle identifier>
+    // on Windows, i.e. %APPDATA%/com.interviewlab.app. ponytail: using Tauri's resolved
+    // dir as the spec says rather than hard-coding "InterviewLab".
+    let app_dir = app.path().app_data_dir()?;
+    fs::create_dir_all(&app_dir)?;
+
+    let db_path = app_dir.join("interviewlab.db");
+
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+
+    let pool = SqlitePoolOptions::new().connect_with(options).await?;
+
+    // Runs every .sql in ./migrations (relative to this crate) once each, tracked in _sqlx_migrations.
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    Ok(Db {
+        pool,
+        path: db_path.to_string_lossy().into_owned(),
+    })
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // block_on the async db init so the pool is in state before any command runs.
+            let handle = app.handle().clone();
+            let db = tauri::async_runtime::block_on(init_db(&handle))
+                .expect("failed to initialize database");
+            // Startup recovery (bug #1): reset any interview left in a mid-flight status
+            // (transcribing / cleaning) by a crash or force-kill — no task is running for it,
+            // so it's a zombie. Best-effort: a failure here must not block launch.
+            match tauri::async_runtime::block_on(asr::recover_stuck_interviews(&db.pool)) {
+                Ok(n) if n > 0 => eprintln!("startup recovery: reset {n} stuck interview(s) → error"),
+                Ok(_) => {}
+                Err(e) => eprintln!("startup recovery failed (non-fatal): {e}"),
+            }
+            app.manage(db);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            db_health,
+            cycle::list_cycles,
+            cycle::get_cycle,
+            cycle::create_cycle,
+            cycle::update_cycle,
+            cycle::delete_cycle,
+            interview::add_interview_files,
+            interview::list_interviews,
+            interview::delete_interview,
+            asr::asr_device,
+            asr::list_models,
+            asr::download_model,
+            asr::transcribe_interview,
+            asr::cancel_transcription,
+            asr::get_transcript,
+            asr::diarization_models_present,
+            asr::download_diarization_models,
+            asr::rediarize_interview,
+            transcript::list_transcript_versions,
+            transcript::get_transcript_version,
+            transcript::list_participants,
+            transcript::save_participants,
+            transcript::save_edited_transcript,
+            adapter::list_adapters,
+            adapter::rescan_plugins,
+            adapter::get_active_adapter,
+            adapter::set_active_adapter,
+            adapter::test_cli,
+            adapter::run_task,
+            adapter::adapter_meta_instructions,
+            adapter::plugin_manifest_schema,
+            cleanup::clean_transcript,
+            synthesis::get_synthesis,
+            synthesis::cycle_goals,
+            synthesis::run_synthesis,
+            synthesis::save_cycle_synthesis,
+            synthesis::get_interview_summary,
+            synthesis::run_interview_summary,
+            synthesis::save_interview_summary,
+            diff::get_diff,
+            diff::diff_status,
+            diff::run_diff,
+            roles::list_roles,
+            roles::create_role,
+            roles::update_role,
+            roles::delete_role,
+            guides::list_guides,
+            guides::get_guide,
+            guides::create_guide,
+            guides::update_guide,
+            guides::delete_guide,
+            product::list_products,
+            product::get_product,
+            product::create_product,
+            product::update_product,
+            product::delete_product,
+            chat::list_chat_threads,
+            chat::create_chat_thread,
+            chat::rename_chat_thread,
+            chat::delete_chat_thread,
+            chat::get_chat_messages,
+            chat::cycle_chat_append,
+            chat::cycle_chat_send,
+            chat::cycle_chat_cancel,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
