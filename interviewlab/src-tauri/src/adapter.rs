@@ -1825,6 +1825,29 @@ mod tests {
     }
 
     #[test]
+    fn extract_result_handles_real_nessy_cleanup_array() {
+        // EXACT shape of a real Nessy `--output-format json` cleanup reply: a JSON array of
+        // stream events (system/init → assistant/thinking → assistant/text → result). The
+        // terminal {"type":"result", …} carries the cleanup JSON as a STRING in `result`,
+        // markdown-fenced. used_schema=false (Nessy opts out of --json-schema via json_schema_arg).
+        let a = builtin_adapter(); // format "json", json_path "result"
+        let stdout = r#"[
+          {"type":"system","subtype":"init","session_id":"x","tools":["read_file"],"model":"qwen","nessy_cli_version":"0.12.4"},
+          {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…","signature":""}]}},
+          {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}},
+          {"type":"result","subtype":"success","is_error":false,"duration_ms":4364,"result":"```json\n{\"segments\":[{\"id\":0,\"text\":\"Привет, это про API и product-market fit.\"},{\"id\":1,\"text\":\"Да, дедлайн в пятницу.\"}]}\n```","usage":{"total_tokens":41562}}
+        ]"#;
+        let v = extract_result(&a, stdout, false).unwrap();
+        assert_eq!(
+            v,
+            json!({"segments":[
+                {"id":0,"text":"Привет, это про API и product-market fit."},
+                {"id":1,"text":"Да, дедлайн в пятницу."}
+            ]})
+        );
+    }
+
+    #[test]
     fn io_json_schema_arg_defaults_true_and_parses_false() {
         // Default (absent) → true (Claude/Qwen keep injecting --json-schema).
         let a = builtin_adapter();

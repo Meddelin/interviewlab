@@ -184,19 +184,24 @@ is tolerant-parsed (JSONL/array + markdown-fence stripping). This is config-only
     "json_schema_arg": false
   },
   "tasks": {
-    "ping":                    { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
-    "transcript-cleanup":      { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
-    "cycle-synthesis":         { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
-    "cycle-synthesis-extract": { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
-    "cycle-synthesis-reduce":  { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
-    "cycle-diff":              { "args_template": ["-p","{prompt}","--output-format","stream-json"] }
+    "ping":                    { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "transcript-cleanup":      { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "cycle-synthesis":         { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "cycle-synthesis-extract": { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "cycle-synthesis-reduce":  { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "cycle-diff":              { "args_template": ["-p","{prompt}","--output-format","json"] }
   }
 }
 ```
 Then: Settings → AI CLI → **Rescan** → select **Nessy** active → **Test CLI**. Notes:
-- Use `--output-format stream-json` (JSONL). `--output-format json` (one big array) also works now; the
-  default `text` does not (no envelope). **Do NOT pass `--json-schema`** — that's the exit-52 trap; the
-  `json_schema_arg: false` flag is what avoids it.
+- **`--output-format json` is confirmed** against a real Nessy reply (v0.12.4): it emits a **JSON array** of
+  events (`system/init` → `assistant/thinking` → `assistant/text` → `result`); the app takes the terminal
+  `{"type":"result", …}` element and reads its `result` field — a JSON **string** (markdown-fenced OK), which
+  is unwrapped + parsed into the task's `{"segments":[…]}`. `--output-format stream-json` (JSONL) also works;
+  the default `text` does not (no envelope). There's a regression test in `adapter.rs`
+  (`extract_result_handles_real_nessy_cleanup_array`) pinned to this exact shape.
+- **Do NOT pass `--json-schema`** — that's the exit-52 trap; the `json_schema_arg: false` flag is what avoids
+  it. (Nessy's reply has no `structured_output`, so the app reads `result` instead.)
 - **Chat (optional):** Nessy's stream events in the integration notes look Claude-shaped
   (`{"type":"assistant","message":{"content":[{"text":…}]}}` then `{"type":"result","result":…}`). If Nessy's
   real stream matches that, add a `chat.stream` block with **`"parse": "claude-stream-json"`** plus
