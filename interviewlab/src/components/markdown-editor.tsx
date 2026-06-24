@@ -583,6 +583,29 @@ function EditorToolbar() {
   );
 }
 
+// Heuristic: does this plain-text clipboard payload look like markdown SOURCE (vs. already-
+// rendered prose)? If yes, we parse it on paste so `## Heading`, `- item`, `**bold**`, tables,
+// fenced code, links etc. land as formatted blocks instead of literal characters. Copying
+// already-RENDERED content (which arrives as rich text/html with no `#`/`*` markers) is left to
+// Plate's default HTML paste. ponytail: a token sniff, not a full parser — a false positive just
+// round-trips through the markdown deserializer (harmless: plain prose → a paragraph).
+const MD_MARKERS: RegExp[] = [
+  /^#{1,6}\s/m, // headings
+  /^\s*[-*+]\s+/m, // bullet list
+  /^\s*\d+\.\s+/m, // ordered list
+  /^\s*>\s/m, // blockquote
+  /^\s*```/m, // fenced code
+  /^\s*\|.*\|/m, // table row
+  /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/m, // thematic break
+  /^\s*[-*]\s+\[[ xX]\]/m, // task list
+  /\*\*[^*\n]+\*\*/, // bold
+  /\[[^\]\n]+\]\([^)\n]+\)/, // link
+  /`[^`\n]+`/, // inline code
+];
+function looksLikeMarkdown(text: string): boolean {
+  return MD_MARKERS.some((re) => re.test(text));
+}
+
 export function MarkdownEditor({
   value,
   onChange,
@@ -664,6 +687,21 @@ export function MarkdownEditor({
           readOnly={readOnly}
           placeholder={placeholder}
           spellCheck={false}
+          onPaste={(e) => {
+            // Paste markdown SOURCE → formatted blocks (not literal `##`). Only when the plain
+            // text looks like markdown; otherwise let Plate's default paste run (plain text /
+            // rich HTML from rendered sources). preventDefault suppresses Slate's own handler.
+            if (readOnly) return;
+            const text = e.clipboardData.getData("text/plain");
+            if (!text || !looksLikeMarkdown(text)) return;
+            e.preventDefault();
+            // insertNodes (not insertFragment): insertFragment merges the first pasted block into
+            // the block at the caret, so a leading `## heading` would inherit the caret block's type
+            // (a paragraph) and lose its formatting. insertNodes keeps each block's own type.
+            editor.tf.insertNodes(editor.api.markdown.deserialize(text), {
+              select: true,
+            });
+          }}
           className={cn(
             "min-h-64 px-4 py-3 text-[13.5px] leading-relaxed text-foreground/90 outline-none",
             "[&_p]:my-1.5 [&_ul]:my-1.5 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1.5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5",
