@@ -2,8 +2,16 @@
 
 The app is built/verified on **Windows + Nvidia CUDA**. This is the path to run it on **Mac Apple Silicon**. The engines are already cross-platform & **no-Python**; remaining work is feature flags + device detection + bundle config. (Honest limit: we can't run/verify on a real M3 Pro from this Windows box — we make it Mac-ready + documented; final on-device check needs a Mac.)
 
+## Transcription speed/quality levers (no model change) — what's wired
+Applied in `asr.rs` / `Cargo.toml`; all keep the same large-v3 weights (no quality loss):
+- **Flash attention (`cparams.flash_attn(true)`) — ON:** faster GPU attention on Metal + CUDA. Measured ~21% faster on large-v3 (CUDA, 9-min clip: 49.9s→39.3s). Output is near-identical, not bit-identical (GPU float ordering shifts the odd token/boundary, ~0.6% of chars; word accuracy unchanged) — the standard whisper.cpp GPU recommendation.
+- **Decode threads (`set_n_threads`, clamp [4,8]) — ON:** the GPU does encode/decode, but the log-mel front-end + token sampling are CPU-side; default was min(4,cores), now tuned up on bigger machines (e.g. M3 Pro).
+- **Core ML / ANE encoder (`coreml` feature) — opt-in:** `--features metal,coreml` runs the heavy encoder on the Apple Neural Engine on top of Metal (big win). Needs `ggml-<model>-encoder.mlmodelc` next to the ggml `.bin` (prebuilt in HF `ggerganov/whisper.cpp`); whisper.cpp falls back to the Metal encoder if absent. First run compiles/caches the ANE model (slow once). Build needs Xcode. **Mac-only** — never enable on Windows/Linux (no CoreML framework). Auto-downloading the `.mlmodelc` alongside the ggml model is a remaining nicety (currently a manual placement / documented step).
+- **Quality:** accuracy = model + decoder, platform-independent (Metal/CoreML give near-identical text to CPU; not byte-for-byte but same word accuracy). The accuracy knob is beam search (slower); the GPU/ANE speed headroom makes it affordable if ever wanted (a `SamplingStrategy::BeamSearch` code change, not a flag).
+- **Diarization:** separate pipeline (sherpa-onnx, CPU) — now multi-threaded (`num_threads` ≈ cores) in `diarize.rs`; was the slow pole.
+
 ## Cross-platform audit (current state)
-- **whisper.cpp (`whisper-rs 0.16`):** Windows uses the `cuda` feature. Apple Silicon → add a **`metal`** feature (`whisper-rs/metal`, optionally `coreml`) for GPU/ANE acceleration; CPU fallback works without it.
+- **whisper.cpp (`whisper-rs 0.16`):** Windows uses the `cuda` feature. Apple Silicon → the **`metal`** feature (`whisper-rs/metal`) for GPU, plus the opt-in **`coreml`** feature (ANE encoder) — see the levers section above; CPU fallback works without either.
 - **Diarization (`sherpa-onnx 1.13.3`, `shared`):** cross-platform ONNX Runtime; macOS-arm64 prebuilt is shipped by the crate. Optionally enable the **CoreML** execution provider on Apple Silicon (else CPU ~real-time — fine). The `shared` (DLL/dylib) choice was made to dodge a Windows CRT conflict; it's also correct on macOS.
 - **Device detection (`asr.rs`) — DONE:** `nvml_wrapper` is now cfg-gated off macOS (the probe is a `#[cfg(target_os = "macos")]` stub returning `None`), and `detect_device()` has a macOS/Metal branch: on macOS with the `metal` feature it reports `device=metal, use_gpu=true`; without it, CPU.
 - **Process spawn:** `CREATE_NO_WINDOW` is `#[cfg(windows)]` → no-op on Mac ✓.

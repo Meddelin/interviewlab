@@ -35,11 +35,16 @@ cuda = ["whisper-rs/cuda"]
 # default → CPU build. Enable on a Mac with `--features metal`. No special build env —
 # Metal ships in the macOS SDK (Xcode Command Line Tools provide the toolchain).
 metal = ["whisper-rs/metal"]
-# Future option (Apple Silicon): CoreML / Apple Neural Engine backend for whisper.cpp.
-# whisper-rs 0.16 exposes it via `whisper-rs/coreml`; it needs an extra CoreML-encoder
-# model artifact at runtime, so it's left as a future toggle alongside `metal` rather than
-# wired now — see mac-build.md. To enable later, add:
-#   coreml = ["whisper-rs/coreml"]
+
+# Core ML / Apple Neural Engine ENCODER for whisper.cpp (Apple Silicon only). Composes with
+# `metal`: the heavy encoder runs on the ANE for a big speedup ON TOP of Metal — SAME model
+# weights, no quality change. Build on a Mac with `--features metal,coreml` (needs Xcode for the
+# CoreML framework). At runtime it loads a `ggml-<model>-encoder.mlmodelc` sitting next to the
+# ggml `.bin` (prebuilt ones live in HF `ggerganov/whisper.cpp`); if that artifact is absent,
+# whisper.cpp logs a notice and falls back to the Metal encoder — so the build is safe without it.
+# First run is slow (the ANE compiles/caches the model). See mac-build.md. Mac-only: do NOT add to
+# a Windows/Linux build (no CoreML framework there).
+coreml = ["whisper-rs/coreml"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

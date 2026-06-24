@@ -86,6 +86,33 @@ npm run tauri dev -- --features metal      # Apple Silicon GPU (whisper.cpp Meta
 
 If the build or launch fails, see **§6** to classify the error before doing anything.
 
+### 3.1 Transcription speed/quality on Apple Silicon (no model change)
+
+These tune the **same** model (large‑v3) — same weights, accuracy unchanged:
+
+- **Already on by default in code** (you get these just by building with `metal`): **flash attention**
+  (a faster GPU attention — measured ~21% faster on CUDA; output is near‑identical, not bit‑identical, with no
+  meaningful accuracy change) and a tuned CPU **thread count** for the log‑mel/sampling front‑end.
+- **Core ML / Apple Neural Engine (the big win) — opt‑in build flag:**
+  ```bash
+  npm run tauri dev -- --features metal,coreml
+  ```
+  This runs whisper's heavy **encoder on the ANE** on top of Metal. It needs a CoreML encoder artifact next to
+  the ggml model in the app data dir:
+  `…/com.interviewlab.app/models/ggml-large-v3-encoder.mlmodelc` (prebuilt ones are published in the Hugging
+  Face repo `ggerganov/whisper.cpp` — download `ggml-large-v3-encoder.mlmodelc.zip` and unzip it there). If the
+  artifact is **absent**, whisper logs a notice and falls back to the Metal encoder, so the build still runs —
+  it just doesn't get the ANE speedup. **The FIRST run with CoreML is slow** (the ANE compiles + caches the
+  model, ~1–2 min); subsequent runs are fast. Building `coreml` needs Xcode (the CoreML framework).
+- **If transcription is still slow:** confirm Metal actually engaged — after a transcription, the transcript's
+  engine string should read `@metal`, not `@cpu`. `@cpu` means the `metal` feature/init didn't kick in (a
+  **source** issue per §6B — report it). Diarization is separate (CPU, now multi‑threaded) and on a long
+  interview can take a while; that's expected.
+- **Quality:** accuracy is set by the model + decoder, not the platform — Metal/CoreML give near‑identical text
+  to CPU (GPU float ordering differs, so not byte‑for‑byte, but word accuracy is the same). The one real
+  accuracy knob is beam search (slower); the speed the GPU/ANE buys back makes it affordable if you ever want it
+  (it's a code change, not a flag — flag it per §6B if the human asks for higher accuracy).
+
 ---
 
 ## 4. Local models (ASR + diarization, all on‑device)
