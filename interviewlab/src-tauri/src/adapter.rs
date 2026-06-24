@@ -980,9 +980,11 @@ fn extract_result(
     if rx.format == "raw" {
         return extract_json_value(stdout);
     }
-    // JSON envelope.
-    let envelope: Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("CLI stdout was not a JSON envelope: {e}"))?;
+    let field = if rx.json_path.is_empty() { "result" } else { rx.json_path.as_str() };
+    // Parse the envelope. The common case is ONE JSON object (`claude --output-format json`),
+    // but some CLIs emit a JSONL / stream-json stream — one JSON object per line — instead.
+    // parse_envelope accepts both, so a stream-json CLI works without an app change.
+    let envelope = parse_envelope(stdout, field, used_schema)?;
 
     // Prefer structured_output when we asked for a schema (clean, already parsed).
     if used_schema {
@@ -993,7 +995,6 @@ fn extract_result(
         }
     }
 
-    let field = if rx.json_path.is_empty() { "result" } else { &rx.json_path };
     let raw = envelope
         .get(field)
         .ok_or_else(|| format!("envelope has no `{field}` field"))?;
@@ -1004,6 +1005,50 @@ fn extract_result(
         // Some CLIs may already nest an object there.
         other => Ok(other.clone()),
     }
+}
+
+// Parse the CLI's stdout into the result envelope. Two shapes are accepted:
+//   1. ONE JSON object (the common case — `claude --output-format json`, pretty-printed or not).
+//   2. A JSONL / stream-json STREAM: one compact JSON object per line. Some CLIs only emit this
+//      (even for batch tasks). We take the LAST line that parses to an object carrying the
+//      payload (`structured_output` when a schema was used, else the `field`) — that's the
+//      terminal result event of the stream — falling back to the last valid object otherwise.
+// This is why a stream-json-only CLI works without a per-task app change: the extractor, not the
+// manifest, absorbs the stream shape. (A markdown-fenced `result` string is then unwrapped by
+// extract_json_value downstream.)
+fn parse_envelope(stdout: &str, field: &str, used_schema: bool) -> Result<Value, String> {
+    let trimmed = stdout.trim();
+    // Fast path: the whole output is a single JSON value (handles multi-line pretty-printed too).
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return Ok(v);
+    }
+    // JSONL: scan lines, keep the last object overall + the last one carrying the payload.
+    let mut last_obj: Option<Value> = None;
+    let mut last_with_payload: Option<Value> = None;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !v.is_object() {
+            continue;
+        }
+        let has_payload = (used_schema
+            && v.get("structured_output").is_some_and(|x| !x.is_null()))
+            || v.get(field).is_some();
+        if has_payload {
+            last_with_payload = Some(v.clone());
+        }
+        last_obj = Some(v);
+    }
+    last_with_payload.or(last_obj).ok_or_else(|| {
+        "CLI stdout was neither a JSON object nor a JSONL stream — check the plugin's \
+         --output-format and result_extract"
+            .to_string()
+    })
 }
 
 // One spawn attempt: run the command, pipe stdin, capture stdout/stderr, enforce
@@ -1718,6 +1763,35 @@ mod tests {
         let a = builtin_adapter();
         // With --json-schema, `result` may be fence-wrapped but structured_output is clean.
         let stdout = r#"{"result":"```json\n{\"ok\": true}\n```","structured_output":{"ok":true}}"#;
+        let v = extract_result(&a, stdout, true).unwrap();
+        assert_eq!(v, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn extract_result_parses_jsonl_stream() {
+        // A stream-json / JSONL stdout (one object per line) — what a non-Claude CLI (e.g. Nessy)
+        // may emit even for batch tasks. The TERMINAL line carries `result`; earlier event lines
+        // (and a stray non-object line) must be ignored.
+        let a = builtin_adapter(); // format "json", json_path "result"
+        let stdout = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "data: keepalive\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"…\"}}\n",
+            "{\"type\":\"result\",\"result\":\"{\\\"ok\\\":true}\"}\n"
+        );
+        let v = extract_result(&a, stdout, false).unwrap();
+        assert_eq!(v, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn extract_result_jsonl_picks_structured_output_line() {
+        // JSONL + schema: take the last line that actually carries structured_output, even if a
+        // later line has only a (fence-wrapped) `result` string.
+        let a = builtin_adapter();
+        let stdout = concat!(
+            "{\"type\":\"assistant\"}\n",
+            "{\"type\":\"result\",\"structured_output\":{\"ok\":true},\"result\":\"ignored\"}\n"
+        );
         let v = extract_result(&a, stdout, true).unwrap();
         assert_eq!(v, json!({ "ok": true }));
     }
