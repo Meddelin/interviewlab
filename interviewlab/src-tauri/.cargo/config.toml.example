@@ -1,0 +1,26 @@
+# WINDOWS-ONLY build env for the ASR engine (whisper-rs / whisper.cpp).
+#
+# ⚠️ This file is a TEMPLATE. On Windows: copy it to `config.toml` and fill in YOUR paths.
+#    `config.toml` is gitignored ON PURPOSE — cargo `[env]` has no per-OS conditioning, so
+#    committing absolute Windows paths leaks them into the macOS/Linux build (the `cmake`
+#    crate picks up a Windows cmake.exe, bindgen targets MSVC, etc. → build errors).
+#
+# macOS / Linux need NONE of this — system clang provides libclang, brew/Xcode provide cmake,
+# and bindgen targets the host by default. So on those platforms there must be NO config.toml.
+#
+# Why each var (Windows):
+# - LIBCLANG_PATH: whisper-rs-sys runs bindgen, which needs libclang. Point at one (e.g. the
+#   pip `libclang` package, or an LLVM install).
+# - BINDGEN_EXTRA_CLANG_ARGS: tell clang to TARGET MSVC + give it the MSVC + Windows SDK include
+#   dirs (clang ignores MSVC's INCLUDE env). Without this, clang uses glibc-shaped headers and
+#   emits FILE/fpos_t layout asserts that overflow under MSVC — a compile error.
+# - CMAKE: the `cmake` crate compiles whisper.cpp; point it at VS BuildTools' cmake.exe if it
+#   isn't on PATH. (cc/cmake locate cl.exe via vswhere.)
+#
+# Adjust the LLVM/libclang path, the MSVC toolset version, and the Windows SDK version to match
+# your machine.
+
+[env]
+LIBCLANG_PATH = "C:\\path\\to\\libclang\\native"
+BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-pc-windows-msvc -fms-compatibility -fms-extensions -fdelayed-template-parsing -isystem \"C:\\Program Files (x86)\\Microsoft Visual Studio\\<edition>\\BuildTools\\VC\\Tools\\MSVC\\<version>\\include\" -isystem \"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\<sdk-version>\\ucrt\" -isystem \"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\<sdk-version>\\shared\" -isystem \"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\<sdk-version>\\um\" -isystem \"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\<sdk-version>\\winrt\""
+CMAKE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\<edition>\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"

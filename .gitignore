@@ -16,6 +16,12 @@ _seedwork/
 120a
 **/120a
 
+# ── Machine-specific Windows build env (libclang/MSVC/cmake paths) ─────
+# Cargo `[env]` has NO per-OS conditioning, so committing this leaks Windows
+# absolute paths into the macOS/Linux build (cmake-not-found, bindgen target
+# errors). Keep it LOCAL; a Windows dev copies config.toml.example → config.toml.
+interviewlab/src-tauri/.cargo/config.toml
+
 # ── Local Claude Code config (machine-specific) ────────────────────────
 .claude/
 interviewlab/.claude/

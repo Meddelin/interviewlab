@@ -204,11 +204,21 @@ These require editing the Rust/TS source and a rebuild — they are for the main
 4. **The exact error text** (paste it).
 Then stop on that item — do **not** invent a plugins‑folder workaround for a source bug.
 
+### Build picks up Windows paths (cmake-not-found, bindgen MSVC target)?
+If `cargo`/`cmake` errors point at a `C:\…` path (e.g. a Windows `cmake.exe`, or bindgen targeting
+`x86_64-pc-windows-msvc`), you have a stale **`interviewlab/src-tauri/.cargo/config.toml`** — it used to be
+committed with Windows-only `[env]` (LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS / CMAKE), and cargo `[env]` has
+no per-OS conditioning so it leaks onto macOS. It's now **gitignored**; `git pull` removes it. If it lingers
+(local edits), just **delete it**: `rm interviewlab/src-tauri/.cargo/config.toml`. macOS needs **no** cargo
+env file — system clang + brew/Xcode cmake are found automatically. (The committed `config.toml.example` is a
+Windows-only template; ignore it on macOS.) This is config, not a source bug — you can fix it yourself.
+
 ### Known macOS source‑side risks (expect these)
 - The **Metal** path is implemented but **never run on real hardware** — Metal init / performance is unverified.
 - **Dylib bundling for a packaged `.app`** is a known TODO; **dev mode (`tauri dev`) is the supported path**
   for now (it loads the native libs from the build output). A packaged `.dmg` may fail to find the dylibs.
-- **CoreML / Apple Neural Engine** for whisper is a future toggle, not wired up.
+- **CoreML / Apple Neural Engine** for whisper is wired as the opt-in `coreml` feature (§3.1) — needs the
+  `.mlmodelc` artifact; without it, falls back to the Metal encoder.
 - `nvml` (NVIDIA‑only) is `cfg`‑gated off macOS; if you ever see an nvml symbol/link error on macOS, that's a
   **source** gating bug — report it.
 
