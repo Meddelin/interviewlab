@@ -182,15 +182,27 @@ pub fn diarize_samples(
     // the auto case but is harmless when num_clusters is fixed.
     let num_clusters = expected.filter(|n| *n > 0).unwrap_or(-1);
 
+    // sherpa defaults BOTH ONNX sessions to num_threads = 1, so diarization runs single-threaded
+    // and is the pipeline's slow pole on long interviews (the segmentation + per-segment embedding
+    // forward passes dominate). Give the ONNX intra-op pool more cores — a multi-× speedup with NO
+    // quality change. Measured on a 9-min clip (12-core box): 1 thread 214s → 4 threads 88s (2.4×);
+    // 8 threads REGRESSED to 98s (the embedding model's many small ops don't scale past ~4-6 + ORT
+    // thread overhead). So target ~physical/performance cores: half the logical count, capped [2, 6]
+    // — floor lifts it off 1, ceiling stays under the regression point. // ponytail: tunable knob.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n_threads = (cores / 2).clamp(2, 6) as i32;
+
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
                 model: Some(seg_model.to_string_lossy().into_owned()),
             },
+            num_threads: n_threads,
             ..Default::default()
         },
         embedding: SpeakerEmbeddingExtractorConfig {
             model: Some(emb_model.to_string_lossy().into_owned()),
+            num_threads: n_threads,
             ..Default::default()
         },
         clustering: FastClusteringConfig {

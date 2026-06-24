@@ -1059,8 +1059,9 @@ pub async fn transcribe_interview(
                 });
                 // sherpa's `process` is one opaque, non-abortable call, so bound it with a
                 // timeout: on a pathologically slow CPU run we SKIP diarization (keep the raw
-                // single-speaker labels) instead of leaving the row wedged at "transcribing 100%"
-                // forever. Generous budget — diarization is ~real-time on CPU; 8× audio, floor 3min.
+                // single-speaker labels) instead of leaving the row wedged forever. Generous
+                // budget — 8× audio, floor 3min. (Speed itself is addressed in diarize.rs by
+                // multi-threading the ONNX sessions; this is just the safety ceiling.)
                 let diar_budget = std::time::Duration::from_millis(
                     (duration_ms.unwrap_or(0).max(0) as u64).saturating_mul(8).max(180_000),
                 );
