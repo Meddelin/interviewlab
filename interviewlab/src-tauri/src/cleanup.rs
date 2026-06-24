@@ -56,6 +56,14 @@ const BATCH_SIZE: usize = 60;
 // rate limits — never an unbounded fan-out of `claude` processes. A single tunable.
 const CLEANUP_CONCURRENCY: usize = 4;
 
+// Prefer ONE CLI request for the WHOLE transcript when it has at most this many segments. The
+// model then sees the full context, so it keeps terminology consistent and hallucinates LESS than
+// when we slice into context-blind batches (which can't agree on how to spell a term across a cut).
+// Bounded because a long transcript would overflow the model's OUTPUT limit (it must echo every
+// {id, text}); ~600 ≈ a 30-min interview. Above this — or if the single shot's output comes back
+// truncated (alignment fails) — we fall back to BATCH_SIZE batches. // ponytail: tunable knob.
+const SINGLE_SHOT_MAX_SEGMENTS: usize = 600;
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -476,12 +484,17 @@ async fn clean_one_batch(
     raw: &[Segment],
     // The user's per-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
+    // How many times to try this request. Batches use 2 (one alignment retry); the whole-
+    // transcript single shot uses 1 — a retry wouldn't fix a truncated output, so fail fast and
+    // let the caller fall back to batching.
+    max_attempts: usize,
 ) -> Result<Vec<Segment>, String> {
     let input = build_batch_input(language, product_desc, ids, raw);
     let schema = output_schema();
 
+    let attempts = max_attempts.max(1);
     let mut last_err: Option<String> = None;
-    for attempt in 0..2 {
+    for attempt in 0..attempts {
         // The model comes from the user override or the plugin's per-task manifest default
         // (for Claude Code that's `haiku` — mechanical text-only edits).
         let value = crate::adapter::run_cli_task_model(
@@ -500,14 +513,14 @@ async fn clean_one_batch(
                 Ok(cleaned) => return Ok(cleaned),
                 Err(align_err) => {
                     last_err = Some(format!("{align_err}"));
-                    if attempt == 0 {
-                        continue; // retry the batch once (spec §9 M7)
+                    if attempt + 1 < attempts {
+                        continue; // retry (spec §9 M7) — only when attempts remain
                     }
                 }
             },
             Err(parse_err) => {
                 last_err = Some(format!("cleanup output shape invalid: {parse_err}; got {value}"));
-                if attempt == 0 {
+                if attempt + 1 < attempts {
                     continue;
                 }
             }
@@ -543,8 +556,31 @@ async fn clean_segments(
         return Err("nothing to clean: the raw transcript has no segments".into());
     }
 
-    // Global ids = indices into the full transcript (stable, unique).
     let total = raw.len();
+
+    // SINGLE-SHOT (preferred): clean the WHOLE transcript in one CLI request when it fits — the
+    // model sees the full context, so terminology stays consistent and it hallucinates less than
+    // across context-blind batches. One attempt; on failure (most likely a truncated output on a
+    // long transcript) we fall through to the batched path below, which is the safe net.
+    if total <= SINGLE_SHOT_MAX_SEGMENTS {
+        if let Some(app) = app {
+            emit_cleanup(app, interview_id, STATUS_CLEANING, 0, 1, None);
+        }
+        let all_ids: Vec<usize> = (0..total).collect();
+        match clean_one_batch(adapter, language, product_desc, &all_ids, raw, model_override, 1).await {
+            Ok(cleaned) => {
+                if let Some(app) = app {
+                    emit_cleanup(app, interview_id, STATUS_CLEANING, 1, 1, None);
+                }
+                return Ok(cleaned);
+            }
+            Err(e) => {
+                eprintln!("cleanup: single-shot failed ({e}); falling back to batched cleanup");
+            }
+        }
+    }
+
+    // Batched fallback: chunk into BATCH_SIZE. Global ids = indices into the full transcript.
     let total_batches = total.div_ceil(BATCH_SIZE);
 
     // Pre-chunk into (batch_index, ids, segments). Order here is the AUTHORITATIVE order.
@@ -574,7 +610,7 @@ async fn clean_segments(
         let wave_futs = wave.iter().map(|(b, ids, chunk)| {
             let done = &done;
             async move {
-                let res = clean_one_batch(adapter, language, product_desc, ids, chunk, model_override).await;
+                let res = clean_one_batch(adapter, language, product_desc, ids, chunk, model_override, 2).await;
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, completed, total_batches, None);
