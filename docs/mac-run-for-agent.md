@@ -123,6 +123,12 @@ batch tasks, `streaming` + `multi-turn` for chat, `tool-use` if applicable); a p
 (how to invoke the CLI for each task, with `{prompt}` substitution); how to **extract the result** from the
 CLI's output (e.g. a JSON path); and, for chat, a `chat.stream` block naming the stream parser.
 
+> **Batch output shape:** `result_extract: { format: "json", json_path: "result" }` accepts BOTH a single
+> JSON object AND a **JSONL / stream-json stream** (one object per line — the app takes the last line
+> carrying the payload). So a CLI whose `--output-format json` emits a stream (rather than one object) works
+> as-is — prefer that over `format: "raw"` + prompt-engineering the model to "return only JSON" (brittle: the
+> model may wrap it in markdown). A markdown-fenced `result` string is also unwrapped automatically.
+
 **Reference templates** are written to the plugins folder on first run — `claude-code`, `qwen-code`,
 `antigravity`. **Copy whichever is closest to your CLI's I/O shape and adapt it** (command, args, auth,
 result‑extraction, stream parser). The bundled ones are only references; you are not required to use any of them.
