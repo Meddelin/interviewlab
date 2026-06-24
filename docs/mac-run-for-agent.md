@@ -1,6 +1,6 @@
 # Run InterviewLab on macOS (Apple Silicon) — instructions for an AI coding agent
 
-**You are an AI coding agent (e.g. Claude Code) running on a Mac with Apple Silicon (M3 Pro or better).**
+**You are an AI coding agent running on a Mac with Apple Silicon (M3 Pro or better).**
 Your job: get InterviewLab **building and running**, set up the **local AI CLI**, and **report any errors**
 clearly. A human will then drive the end‑to‑end test (upload a real interview, click through the pipeline).
 
@@ -27,7 +27,8 @@ So you know what to aim for. The human will do these clicks; you make each step 
 10. **Chat** about the cycle (streaming, grounded answers).
 
 Everything is **local**: ASR (whisper.cpp) and diarization (sherpa‑onnx) run on‑device, no cloud, no Python.
-Only the LLM steps (cleanup / synthesis / diff / chat) go through the local CLI under the user's own subscription.
+Only the LLM steps (cleanup / synthesis / diff / chat) go through a **local AI CLI you configure** (§5) —
+whatever your environment provides. **Claude is not available here**; no specific vendor is required.
 
 ---
 
@@ -45,15 +46,18 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 rustc --version                     # confirm
 
-# The local AI CLI the app drives (default plugin = Claude Code)
-npm install -g @anthropic-ai/claude-code
-claude --version                    # confirm installed
-claude login                        # subscription auth (Pro/Max). DO NOT set ANTHROPIC_API_KEY — see §5.
+# A local AI CLI for the LLM steps (cleanup / synthesis / diff / chat).
+# ⚠️ Claude / Anthropic is NOT available inside this environment. Use whatever local or
+#    internal AI CLI your perimeter provides. Install it and put its binary on PATH, then
+#    wire it up as a plugin in §5 — no source change, no specific vendor required.
+<your-cli> --version                # confirm YOUR CLI is installed and reachable
 ```
 
 Notes:
 - **No CUDA, no Python** on macOS. GPU acceleration is **Metal**, built into the SDK.
 - `ffmpeg` is required — the Rust backend invokes it to normalize audio to 16 kHz mono PCM.
+- **Do not install or rely on Claude Code here** — the app ships `claude-code` only as a *reference*
+  manifest; in this environment you must point the app at your own available CLI (§5).
 
 ---
 
@@ -97,27 +101,36 @@ App data dir on macOS: `~/Library/Application Support/com.interviewlab.app/`
 
 ## 5. Local CLI setup — the **pluggable adapter** (read this carefully)
 
-The app never hard‑codes an AI vendor. It drives a **locally‑installed CLI** through a **plugin layer**.
-The default plugin is **Claude Code**. **Adding or fixing a CLI is a config‑only operation — NO source change.**
+The app never hard‑codes an AI vendor. It drives a **locally‑installed CLI** through a **plugin layer**, so in
+this environment you point it at **your own available CLI**. **Adding or fixing a CLI is a config‑only
+operation — NO source change, no recompile.**
 
-- **Verify the active CLI:** app → **Settings → AI CLI → Test CLI**. Expected: **Available**.
-  - `Not logged in` → run `claude login` in a terminal, then Test again.
-  - The Claude Code plugin uses your **subscription session** (`claude login`). It must **not** pass `--bare`
-    and you should **not** export `ANTHROPIC_API_KEY` (that forces API‑key billing instead of the subscription).
+> ⚠️ The app's bundled **default** active plugin is `claude-code`, which **will NOT work here** (no Claude
+> access). Your first task is to register your environment's CLI as a plugin and **make it the active one**.
 
-- **Add any other CLI (Qwen Code, Antigravity, your own) — plugin folder, no recompile:**
-  drop a manifest at
-  ```
-  ~/Library/Application Support/com.interviewlab.app/plugins/<id>/manifest.json
-  ```
-  then app → Settings → AI CLI → **Rescan**. The folder name must equal the manifest `id`.
-  A manifest declares the CLI `command`, its `capabilities` (`batch-tasks`, `streaming`, `multi-turn`,
-  `tool-use`), the per‑task `args_template`, how to extract the result, and (for chat) a `chat.stream` block
-  with a named stream parser. **Use the bundled `claude-code` manifest as the reference template** (it is
-  written to that plugins folder on first run — copy it and adapt).
+**Register your CLI (the whole setup):**
+1. Drop a manifest at
+   ```
+   ~/Library/Application Support/com.interviewlab.app/plugins/<id>/manifest.json
+   ```
+   The folder name must equal the manifest `id`.
+2. App → **Settings → AI CLI → Rescan**, then **select your plugin as active**.
+3. **Test CLI** → expect **Available**. (`Not logged in` / `command not found` → fix the CLI's auth or PATH,
+   or the manifest `command`/args, then Test again.)
 
-> Rule of thumb: if a fix is "which CLI, which command, which flags, which capabilities, which parser" →
-> it's a **manifest** change in the plugins folder. You can do it yourself, no source edit. See §6.
+A manifest declares: the CLI `command`; its `capabilities` (`batch-tasks` for the cleanup/synthesis/diff
+batch tasks, `streaming` + `multi-turn` for chat, `tool-use` if applicable); a per‑task `args_template`
+(how to invoke the CLI for each task, with `{prompt}` substitution); how to **extract the result** from the
+CLI's output (e.g. a JSON path); and, for chat, a `chat.stream` block naming the stream parser.
+
+**Reference templates** are written to the plugins folder on first run — `claude-code`, `qwen-code`,
+`antigravity`. **Copy whichever is closest to your CLI's I/O shape and adapt it** (command, args, auth,
+result‑extraction, stream parser). The bundled ones are only references; you are not required to use any of them.
+
+> Rule of thumb: if a fix is "which CLI, which command, which flags, which capabilities, which result path,
+> which stream parser" → it's a **manifest** change in the plugins folder. You can do it yourself, no source
+> edit. If your CLI's chat output can't be parsed by an existing named stream parser, that parser is **source**
+> (§6B) — report it.
 
 ---
 
@@ -178,16 +191,17 @@ cd interviewlab && npm run tauri dev -- --features metal
 # run (CPU fallback)
 cd interviewlab && npm run tauri dev
 
-# local CLI
-claude login            # subscription auth, no API key
-claude --version
+# local AI CLI — YOUR environment's CLI (NOT Claude). Confirm it's installed + on PATH:
+<your-cli> --version
+# then: Settings → AI CLI → Rescan → select your plugin as active → Test CLI
 
 # app data (models, plugins, db) on macOS
 ~/Library/Application\ Support/com.interviewlab.app/
-#   ├── plugins/<id>/manifest.json   ← add/fix CLIs here (no source change)
+#   ├── plugins/<id>/manifest.json   ← register/fix YOUR CLI here (no source change)
 #   ├── models/                      ← downloaded whisper + diarization models
 #   └── *.db                         ← local SQLite
 ```
 
-**Hand back to the human once:** the app launches, Settings → AI CLI shows **Available**, and an ASR model is
-downloaded. They will upload the real interview and run the pipeline. Report any **source‑side** failures per §6B.
+**Hand back to the human once:** the app launches, **your** CLI is active and Settings → AI CLI → Test CLI
+shows **Available**, and an ASR model is downloaded. They will upload the real interview and run the pipeline.
+Report any **source‑side** failures per §6B.

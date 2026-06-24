@@ -8,7 +8,8 @@ adapter, so any CLI can be added as a drop‑in plugin **without touching app so
 Built with **Tauri 2** (Rust backend + React/shadcn frontend). Everything heavy is on‑device:
 - **ASR:** whisper.cpp via `whisper-rs` (CUDA on Windows/NVIDIA, Metal on Apple Silicon, CPU fallback).
 - **Diarization:** sherpa‑onnx (pyannote segmentation + 3D‑Speaker embedding), CPU, **no Python**.
-- **LLM steps** (cleanup / synthesis / diff / chat): a local CLI (default **Claude Code**, your own subscription).
+- **LLM steps** (cleanup / synthesis / diff / chat): a **local AI CLI you configure** — pluggable, any vendor
+  (Claude Code is the bundled reference; not required — bring whatever CLI your environment provides).
 
 ## Status
 - ✅ Verified end‑to‑end on **Windows + NVIDIA CUDA** (RTX 5080): ingest → ASR → diarize → cleanup → roles →
