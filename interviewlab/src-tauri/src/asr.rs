@@ -950,11 +950,10 @@ pub async fn transcribe_interview(
     }
 
     let device = detect_device();
-    let engine = format!(
-        "whisper.cpp:{}@{}",
-        model_id,
-        if device.use_gpu { "cuda" } else { "cpu" }
-    );
+    // Record the ACTUAL device (metal | cuda | cpu) — not a hardcoded "cuda" — so the engine
+    // string tells you whether GPU accel really kicked in (e.g. on a Mac, "cpu" here explains a
+    // slow run = the metal feature/init didn't engage).
+    let engine = format!("whisper.cpp:{}@{}", model_id, device.device);
 
     // Watchdog budget from the probed duration (#1) — read BEFORE taking the lock.
     let duration_ms = duration_ms_db(&db.pool, &interview_id).await.unwrap_or(None);
@@ -1054,12 +1053,24 @@ pub async fn transcribe_interview(
                 emit_diar(&app, &interview_id, "diarizing", 0, None);
                 let seg_model = diar_dir.join(crate::diarize::SEGMENTATION_FILE);
                 let emb_model = diar_dir.join(crate::diarize::EMBEDDING_FILE);
-                let diar = tauri::async_runtime::spawn_blocking(move || {
+                let diar_task = tauri::async_runtime::spawn_blocking(move || {
                     let samples = read_wav_16k_mono(&audio_for_diar)?;
                     crate::diarize::diarize_samples(&seg_model, &emb_model, &samples, 16000, expected_speakers)
-                })
-                .await
-                .map_err(|_| "diarization task panicked".to_string())?;
+                });
+                // sherpa's `process` is one opaque, non-abortable call, so bound it with a
+                // timeout: on a pathologically slow CPU run we SKIP diarization (keep the raw
+                // single-speaker labels) instead of leaving the row wedged at "transcribing 100%"
+                // forever. Generous budget — diarization is ~real-time on CPU; 8× audio, floor 3min.
+                let diar_budget = std::time::Duration::from_millis(
+                    (duration_ms.unwrap_or(0).max(0) as u64).saturating_mul(8).max(180_000),
+                );
+                let diar = match tokio::time::timeout(diar_budget, diar_task).await {
+                    Ok(join) => join.map_err(|_| "diarization task panicked".to_string())?,
+                    Err(_) => Err(format!(
+                        "diarization timed out after {}s — keeping single speaker",
+                        diar_budget.as_secs()
+                    )),
+                };
                 match diar {
                     Ok(turns) => {
                         crate::diarize::assign_speakers(&mut segments, &turns);

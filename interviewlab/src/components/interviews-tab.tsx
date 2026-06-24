@@ -35,11 +35,13 @@ import {
   cancelTranscription,
   CLEANUP_PROGRESS_EVENT,
   cleanTranscript,
+  DIAR_PROGRESS_EVENT,
   IN_TAURI,
   INTERVIEW_PROGRESS_EVENT,
   rediarizeInterview,
   type AsrProgress,
   type CleanupProgress,
+  type DiarProgress,
   type InterviewProgress,
   type InterviewRow,
   transcribeInterview,
@@ -95,6 +97,10 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const [asrProgress, setAsrProgress] = useState<AsrState>({});
   // Live cleanup progress per interview (interview_id → percent, cleared when done).
   const [cleanProgress, setCleanProgress] = useState<AsrState>({});
+  // Interviews currently in the DIARIZATION phase (after whisper hits 100%, before the row
+  // flips to `transcribed`). Without this the badge sat frozen at "Transcribing 100%" for the
+  // whole CPU diarization tail — now it shows a distinct "Diarizing…" phase.
+  const [diarizing, setDiarizing] = useState<Record<string, boolean>>({});
 
   // Live row updates: each finished file emits `interview://progress`; just
   // invalidate this cycle's list so the table re-renders with new status/duration.
@@ -167,6 +173,13 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         return next;
       });
       if (p.status === "transcribed" || p.status === "error") {
+        // Whisper terminal → the diarization phase is over too; drop any diarizing flag.
+        setDiarizing((prev) => {
+          if (!prev[p.interview_id]) return prev;
+          const next = { ...prev };
+          delete next[p.interview_id];
+          return next;
+        });
         qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
         if (p.status === "error") {
           toast.error(`Transcription failed: ${p.error ?? "unknown"}`);
@@ -185,6 +198,29 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       unlisten.then((fn) => fn());
     };
   }, [cycleId, qc]);
+
+  // Live diarization updates: `asr://diar-progress` fires AFTER whisper finishes, while the row
+  // is still `transcribing`. Track which interviews are in the diarization phase so the badge
+  // shows "Diarizing…" instead of a frozen "Transcribing 100%". Cleared on done/error (and on
+  // the whisper terminal event above, as a backstop). Tauri-only — the browser mock doesn't diarize.
+  useEffect(() => {
+    if (!IN_TAURI) return;
+    const unlisten = getCurrentWebview().listen<DiarProgress>(
+      DIAR_PROGRESS_EVENT,
+      (e) => {
+        const p = e.payload;
+        setDiarizing((prev) => {
+          const next = { ...prev };
+          if (p.status === "diarizing") next[p.interview_id] = true;
+          else delete next[p.interview_id]; // 'done' | 'error'
+          return next;
+        });
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [cycleId]);
 
   // Live cleanup updates: `cleanup://progress` carries batch status + percent per
   // interview. Track the percent for the row label and invalidate the list on a
@@ -379,6 +415,17 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
           const s = row.original.status;
           const live = asrProgress[row.original.id];
           const cleanLive = cleanProgress[row.original.id];
+          // Diarization runs after whisper hits 100% while the row is still `transcribing` —
+          // show it as its own phase so the badge isn't stuck at "Transcribing 100%". Checked
+          // first because it overrides the transcribing label during that window.
+          if (diarizing[row.original.id]) {
+            return (
+              <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
+                <Loader2 className="size-3 animate-spin" />
+                <span>Diarizing…</span>
+              </span>
+            );
+          }
           // Live percent overrides the static badge while a run streams.
           if (s === "transcribing" || live != null) {
             return (
