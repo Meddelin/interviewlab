@@ -93,6 +93,39 @@ pub struct TaskSpec {
     pub args_template: Vec<String>,
 }
 
+// --- per-task model selection (feature: plugin-declared models) ---------------
+//
+// The per-task LLM model must come from what the PLUGIN declares (its CLI's own model
+// ids), NOT a hardcoded Claude alias — a non-Claude CLI has no "haiku"/"sonnet". The
+// optional `models` block lets a plugin declare its flag, the models it offers (for the
+// Settings picker), and a per-task default. A plugin WITHOUT a `models` block never gets
+// a `--model` injected → the CLI uses its own default.
+
+// One selectable model for the Settings picker.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ModelOption {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Models {
+    // The CLI's model flag. Default "--model". EMPTY STRING means the CLI has no model flag →
+    // the runner NEVER injects a model (uses the CLI's own default).
+    #[serde(default = "default_model_flag")]
+    pub flag: String,
+    // Models the plugin offers, for the Settings picker. May be empty (then no picker, CLI default).
+    #[serde(default)]
+    pub available: Vec<ModelOption>,
+    // Per-TASK default model id (keys are task names like "transcript-cleanup").
+    #[serde(default)]
+    pub tasks: std::collections::BTreeMap<String, String>,
+}
+fn default_model_flag() -> String {
+    "--model".into()
+}
+
 // --- chat capability block (M11 Phase A; feature-cli-plugins.md §3.2) ----------
 //
 // The manifest is a SUPERSET of the M6 descriptor: the `chat` block declares the
@@ -220,6 +253,10 @@ pub struct Adapter {
     // surfaced as an extension point; runtime deferred (§12). // ponytail: parsed, not run.
     #[serde(default)]
     pub adapter_program: Option<AdapterProgram>,
+    // The plugin's per-task model declaration (flag + available models + per-task defaults).
+    // Optional: a plugin without it never gets a `--model` injected (its CLI default applies).
+    #[serde(default)]
+    pub models: Option<Models>,
 }
 
 fn default_manifest_version() -> i32 {
@@ -278,6 +315,10 @@ pub struct AdapterSummary {
     pub capabilities: Vec<String>,
     // True when chat.mode == "adapter-program" → the UI labels "runs external program" (§10).
     pub runs_external_program: bool,
+    // The models this plugin offers for the Settings "Task models" picker (its
+    // `models.available`, empty when it declares none → the CLI default is used).
+    #[serde(default)]
+    pub models: Vec<ModelOption>,
     // Validity: true = registered plugin; false = malformed manifest (see `error`).
     pub ok: bool,
     // The validation error for a malformed manifest (None when ok).
@@ -308,6 +349,11 @@ impl Adapter {
             tasks: self.tasks.keys().cloned().collect(),
             capabilities: self.effective_capabilities(),
             runs_external_program: runs_external,
+            models: self
+                .models
+                .as_ref()
+                .map(|m| m.available.clone())
+                .unwrap_or_default(),
             ok: true,
             error: None,
             source,
@@ -330,6 +376,7 @@ fn malformed_summary(id: String, source: String, error: String) -> AdapterSummar
         tasks: Vec::new(),
         capabilities: Vec::new(),
         runs_external_program: false,
+        models: Vec::new(),
         ok: false,
         error: Some(error),
         source: Some(source),
@@ -372,6 +419,18 @@ const CLAUDE_CODE_DESCRIPTOR: &str = r#"{
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] }
+  },
+  "models": {
+    "available": [
+      {"id":"haiku","label":"Haiku (fast)"},
+      {"id":"sonnet","label":"Sonnet (balanced)"},
+      {"id":"opus","label":"Opus (best)"}
+    ],
+    "tasks": {
+      "transcript-cleanup":"haiku",
+      "cycle-synthesis":"sonnet","cycle-synthesis-extract":"sonnet","cycle-synthesis-reduce":"sonnet",
+      "cycle-diff":"sonnet"
+    }
   },
   "chat": {
     "mode": "descriptor",
@@ -815,6 +874,36 @@ pub fn builtin_adapter_pub() -> Adapter {
     builtin_adapter()
 }
 
+// --- per-task model resolution (feature: plugin-declared models) --------------
+//
+// The pipeline runs SIX task names but the user picks from THREE buckets (cleanup /
+// synthesis / diff). This maps a task name to its bucket; tasks not in the map (e.g.
+// "ping") have no bucket and never carry a user override.
+pub fn task_bucket(task: &str) -> Option<&'static str> {
+    match task {
+        "transcript-cleanup" => Some("cleanup"),
+        "cycle-synthesis" | "cycle-synthesis-extract" | "cycle-synthesis-reduce" => Some("synthesis"),
+        "cycle-diff" => Some("diff"),
+        _ => None,
+    }
+}
+
+// The user's per-bucket model override read from app_setting (`model:<bucket>`), for a
+// given TASK. None when there's no bucket, no row, or an empty value (→ the plugin's
+// per-task manifest default applies instead). Callers (cleanup/synthesis/diff) pass the
+// result straight to `run_cli_task_model`.
+pub async fn task_model_override(pool: &sqlx::SqlitePool, task: &str) -> Option<String> {
+    let bucket = task_bucket(task)?;
+    let key = format!("model:{bucket}");
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM app_setting WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    value.filter(|s| !s.is_empty())
+}
+
 // --- prompt rendering (spec §7.1: instructions + output schema + input) -------
 
 // Build the rendered prompt for a task: a clear instruction to return ONLY JSON, the
@@ -883,15 +972,17 @@ fn args_have_json_schema(args: &[String]) -> bool {
 
 // Substitute {prompt} in the arg template; inject `--json-schema <schema>` right after
 // {prompt} when a schema is supplied and the descriptor doesn't already template it; and
-// inject `--model <alias>` when a per-task model is requested (PERF: cleanup→haiku,
-// synthesis/diff→sonnet, instead of the CLI's heavy default). The Claude Code CLI accepts
-// `--model haiku|sonnet|opus` aliases (verified via `claude --help`); model is just a
-// per-task arg, so the CLI-adapter/plugin design stays intact.
+// inject the plugin's MODEL FLAG + model id when a per-task model is resolved. The flag is
+// whatever the plugin declares (`models.flag`, default "--model"); an EMPTY flag (or no
+// resolved model) means NO model is injected — the CLI uses its own default. This keeps a
+// non-Claude CLI (which has no "haiku"/"sonnet") from breaking on a forced `--model`.
 fn build_args(
     spec: &TaskSpec,
     prompt: &str,
     output_schema: Option<&Value>,
     model: Option<&str>,
+    // The CLI's model flag (e.g. "--model", "-m"). EMPTY → never inject a model.
+    model_flag: &str,
     // false for a CLI whose `io.json_schema_arg = false` (no `--json-schema` support) — the
     // schema is then carried by the prompt only, and the result is tolerant-parsed.
     inject_schema: bool,
@@ -913,11 +1004,12 @@ fn build_args(
             args.push(schema.to_string());
         }
     }
-    // PERF: a fast per-task model. Only add it if the template didn't already pin a model
-    // (so a user descriptor that hardcodes --model still wins).
+    // A per-task model, via the plugin's declared flag. Inject only when a model resolved,
+    // the plugin has a non-empty model flag, and the template didn't already pin the flag
+    // (so a user descriptor that hardcodes the model flag still wins).
     if let Some(model) = model.filter(|m| !m.is_empty()) {
-        if !args.iter().any(|a| a == "--model") {
-            args.push("--model".to_string());
+        if !model_flag.is_empty() && !args.iter().any(|a| a == model_flag) {
+            args.push(model_flag.to_string());
             args.push(model.to_string());
         }
     }
@@ -1164,8 +1256,9 @@ async fn spawn_once(
 // descriptor, extracts the result JSON. One retry on parse failure (LLMs occasionally
 // wrap JSON in prose). M7–M9 call this with the real §7.3 contracts.
 //
-// Back-compat wrapper: callers that don't pin a model use the CLI's default. New perf-
-// conscious callers use `run_cli_task_model` to request a fast per-task model.
+// Back-compat wrapper: callers that don't pass a user override use the plugin's per-task
+// manifest default (or the CLI's own default when the plugin declares no `models`). Callers
+// that read a user override use `run_cli_task_model`.
 pub async fn run_cli_task(
     adapter: &Adapter,
     task_name: &str,
@@ -1175,14 +1268,18 @@ pub async fn run_cli_task(
     run_cli_task_model(adapter, task_name, input_json, output_schema, None).await
 }
 
-// Same as `run_cli_task` but with an optional per-task model alias (e.g. "haiku",
-// "sonnet") injected as `--model <alias>` (PERF). None → the CLI's default model.
+// Same as `run_cli_task` but with an optional USER MODEL OVERRIDE (the chosen model id, or
+// None). The final model is resolved here: the override wins; otherwise the plugin's
+// per-task manifest default (`models.tasks[task_name]`) applies; if neither resolves, NO
+// model is injected and the CLI uses its own default. The model flag is the plugin's
+// declared `models.flag` (default "--model"); an empty flag means the CLI has no model flag
+// so a model is never injected.
 pub async fn run_cli_task_model(
     adapter: &Adapter,
     task_name: &str,
     input_json: &Value,
     output_schema: Option<&Value>,
-    model: Option<&str>,
+    model_override: Option<&str>,
 ) -> Result<Value, TaskError> {
     let spec = adapter
         .tasks
@@ -1190,10 +1287,21 @@ pub async fn run_cli_task_model(
         .ok_or_else(|| TaskError::new("config", format!("adapter `{}` has no task `{task_name}`", adapter.id)))?;
 
     let prompt = render_prompt(task_name, input_json, output_schema);
+    // Resolve the final model: user override, else the plugin's per-task manifest default.
+    let model = model_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task_name).cloned()));
+    // The plugin's model flag (default "--model"; empty → never inject a model).
+    let model_flag = adapter
+        .models
+        .as_ref()
+        .map(|m| m.flag.clone())
+        .unwrap_or_else(|| "--model".into());
     // A plugin can opt out of `--json-schema` (io.json_schema_arg = false) when its CLI rejects
     // the flag; the schema then lives in the prompt and the result is tolerant-parsed.
     let inject_schema = adapter.io.as_ref().map(|io| io.json_schema_arg).unwrap_or(true);
-    let args = build_args(spec, &prompt, output_schema, model, inject_schema);
+    let args = build_args(spec, &prompt, output_schema, model.as_deref(), &model_flag, inject_schema);
     let used_schema = args_have_json_schema(&args);
     let payload = serde_json::to_vec(input_json)
         .map_err(|e| TaskError::new("config", format!("serialize input: {e}")))?;
@@ -1299,7 +1407,7 @@ pub async fn probe_cli(adapter: &Adapter) -> ProbeResult {
     let prompt = "Return ONLY this JSON object and nothing else: {\"ok\":true}";
     // Use the ping task spec but override the prompt to the trivial probe prompt.
     if let Some(spec) = adapter.tasks.get("ping") {
-        let args = build_args(spec, prompt, None, None, true);
+        let args = build_args(spec, prompt, None, None, "--model", true);
         match spawn_once(adapter, &args, b"{}").await {
             Ok((stdout, _)) => match extract_result(adapter, &stdout, false) {
                 Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => ProbeResult {
@@ -1411,6 +1519,53 @@ pub async fn set_active_adapter(
     .execute(&db.pool)
     .await
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// The user's per-bucket model override (`model:<bucket>`), or "" = the plugin's default.
+// Buckets are cleanup | synthesis | diff (the user-facing grouping of the six tasks). The
+// Settings "Task models" picker seeds from this.
+#[tauri::command]
+pub async fn get_task_model(db: tauri::State<'_, crate::Db>, bucket: String) -> Result<String, String> {
+    let key = format!("model:{bucket}");
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM app_setting WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(value.unwrap_or_default())
+}
+
+// Persist (or clear) the user's per-bucket model override. An empty `model` clears the row
+// → the plugin's per-task manifest default applies. Validates the bucket so a stray key
+// can't be written.
+#[tauri::command]
+pub async fn set_task_model(
+    db: tauri::State<'_, crate::Db>,
+    bucket: String,
+    model: String,
+) -> Result<(), String> {
+    if !matches!(bucket.as_str(), "cleanup" | "synthesis" | "diff") {
+        return Err(format!("unknown task-model bucket: {bucket}"));
+    }
+    let key = format!("model:{bucket}");
+    if model.is_empty() {
+        sqlx::query("DELETE FROM app_setting WHERE key = ?")
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        sqlx::query(
+            "INSERT INTO app_setting (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(&key)
+        .bind(&model)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1595,6 +1750,30 @@ const MANIFEST_SCHEMA: &str = r#"{
         }
       }
     },
+    "models": {
+      "type": "object",
+      "description": "Optional. The plugin's per-task model selection. OMIT it entirely and NO --model is ever injected (the CLI uses its own default model).",
+      "properties": {
+        "flag": { "type": "string", "default": "--model", "description": "The CLI's model flag (e.g. '--model', '-m'). EMPTY STRING means the CLI has no model flag → a model is never injected." },
+        "available": {
+          "type": "array",
+          "description": "Models offered in the Settings 'Task models' picker. May be empty (no picker; the CLI default applies).",
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "tasks": {
+          "type": "object",
+          "description": "Per-task default model id (keys are task names, e.g. 'transcript-cleanup'). Used when the user has set no override for the task's bucket.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
     "chat": {
       "type": "object",
       "properties": {
@@ -1682,6 +1861,27 @@ mod tests {
         assert!(a.has_capability(CAP_TOOL_USE));
         // tool-use ⇒ chat.tools present (MCP descriptor block).
         assert!(a.chat.as_ref().and_then(|c| c.tools.as_ref()).is_some());
+    }
+
+    // The claude-code descriptor carries a `models` block: the three picker options + the
+    // per-task defaults (cleanup→haiku, synthesis/diff→sonnet). The PROOF plugins carry NONE.
+    #[test]
+    fn claude_code_descriptor_has_models_block() {
+        let a = builtin_adapter();
+        let models = a.models.as_ref().expect("claude-code declares models");
+        assert_eq!(models.flag, "--model"); // default flag
+        // The three options the Settings picker shows.
+        let ids: Vec<&str> = models.available.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["haiku", "sonnet", "opus"]);
+        // Per-task defaults preserve today's behavior.
+        assert_eq!(models.tasks.get("transcript-cleanup").map(String::as_str), Some("haiku"));
+        assert_eq!(models.tasks.get("cycle-synthesis").map(String::as_str), Some("sonnet"));
+        assert_eq!(models.tasks.get("cycle-synthesis-extract").map(String::as_str), Some("sonnet"));
+        assert_eq!(models.tasks.get("cycle-synthesis-reduce").map(String::as_str), Some("sonnet"));
+        assert_eq!(models.tasks.get("cycle-diff").map(String::as_str), Some("sonnet"));
+        // The proof plugins declare NO models block → their CLI default is used (no --model forced).
+        assert!(parse_manifest(QWEN_CODE_DESCRIPTOR).unwrap().models.is_none());
+        assert!(parse_manifest(ANTIGRAVITY_CLI_DESCRIPTOR).unwrap().models.is_none());
     }
 
     // The two PROOF plugins parse + validate and expose the right capabilities/shape
@@ -1903,42 +2103,112 @@ mod tests {
         let a = builtin_adapter();
         let spec = a.tasks.get("ping").unwrap();
         // No schema: {prompt} substituted, no --json-schema.
-        let args = build_args(spec, "HELLO", None, None, true);
+        let args = build_args(spec, "HELLO", None, None, "--model", true);
         assert!(args.contains(&"HELLO".to_string()));
         assert!(!args.iter().any(|x| x == "--json-schema"));
         // With schema + inject_schema=true: --json-schema <schema> appended.
         let schema = json!({ "type": "object" });
-        let args = build_args(spec, "HELLO", Some(&schema), None, true);
+        let args = build_args(spec, "HELLO", Some(&schema), None, "--model", true);
         let i = args.iter().position(|x| x == "--json-schema").unwrap();
         assert_eq!(args[i + 1], schema.to_string());
         // OPT-OUT: a plugin with json_schema_arg=false (inject_schema=false) gets NO --json-schema
         // even when a schema is requested — the schema rides in the prompt instead (Nessy CLI).
-        let args = build_args(spec, "HELLO", Some(&schema), None, false);
+        let args = build_args(spec, "HELLO", Some(&schema), None, "--model", false);
         assert!(!args.iter().any(|x| x == "--json-schema"));
     }
 
-    // PERF: a per-task model is injected as `--model <alias>` (stubbed, no real CLI call).
+    // A per-task model is injected via the plugin's declared model flag (stubbed, no real CLI call).
     #[test]
     fn build_args_injects_model_when_requested() {
         let a = builtin_adapter();
         let spec = a.tasks.get("transcript-cleanup").unwrap();
         // No model → no --model flag (CLI default).
-        let args = build_args(spec, "P", None, None, true);
+        let args = build_args(spec, "P", None, None, "--model", true);
         assert!(!args.iter().any(|x| x == "--model"));
         // haiku model → `--model haiku` appended exactly once.
-        let args = build_args(spec, "P", None, Some("haiku"), true);
+        let args = build_args(spec, "P", None, Some("haiku"), "--model", true);
         let i = args.iter().position(|x| x == "--model").expect("--model present");
         assert_eq!(args[i + 1], "haiku");
         assert_eq!(args.iter().filter(|x| *x == "--model").count(), 1);
         // Empty model string is treated as "no model".
-        let args = build_args(spec, "P", None, Some(""), true);
+        let args = build_args(spec, "P", None, Some(""), "--model", true);
         assert!(!args.iter().any(|x| x == "--model"));
         // With a schema AND a model, both are present.
         let schema = json!({ "type": "object" });
-        let args = build_args(spec, "P", Some(&schema), Some("sonnet"), true);
+        let args = build_args(spec, "P", Some(&schema), Some("sonnet"), "--model", true);
         assert!(args.iter().any(|x| x == "--json-schema"));
         let i = args.iter().position(|x| x == "--model").unwrap();
         assert_eq!(args[i + 1], "sonnet");
+    }
+
+    // A plugin's model flag drives injection: an EMPTY flag never injects (a CLI with no
+    // model flag), and a custom flag (e.g. "-m") is used instead of "--model".
+    #[test]
+    fn build_args_honors_model_flag() {
+        let a = builtin_adapter();
+        let spec = a.tasks.get("transcript-cleanup").unwrap();
+        // Empty model flag → NO model injected even when a model is requested.
+        let args = build_args(spec, "P", None, Some("haiku"), "", true);
+        assert!(!args.iter().any(|x| x == "haiku"));
+        assert!(!args.iter().any(|x| x == "--model"));
+        // A custom flag ("-m") is used instead of "--model".
+        let args = build_args(spec, "P", None, Some("qwen-fast"), "-m", true);
+        assert!(!args.iter().any(|x| x == "--model"));
+        let i = args.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(args[i + 1], "qwen-fast");
+    }
+
+    // Model RESOLUTION (the same logic run_cli_task_model applies before build_args): the user
+    // override wins; with no override the plugin's per-task manifest default applies; a plugin
+    // with NO `models` block injects no model at all even for a task that would have one.
+    #[test]
+    fn resolve_model_override_and_manifest_default() {
+        // Mirror of run_cli_task_model's resolution, exercised directly (no CLI spawn).
+        fn resolve(adapter: &Adapter, task: &str, override_: Option<&str>) -> (Option<String>, String) {
+            let model = override_
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task).cloned()));
+            let flag = adapter
+                .models
+                .as_ref()
+                .map(|m| m.flag.clone())
+                .unwrap_or_else(|| "--model".into());
+            (model, flag)
+        }
+
+        let claude = builtin_adapter();
+        // Override wins over the manifest default.
+        let (m, _) = resolve(&claude, "transcript-cleanup", Some("opus"));
+        assert_eq!(m.as_deref(), Some("opus"));
+        // No override → the manifest task default (claude-code: cleanup→haiku, synthesis/diff→sonnet).
+        assert_eq!(resolve(&claude, "transcript-cleanup", None).0.as_deref(), Some("haiku"));
+        assert_eq!(resolve(&claude, "cycle-synthesis", None).0.as_deref(), Some("sonnet"));
+        assert_eq!(resolve(&claude, "cycle-diff", None).0.as_deref(), Some("sonnet"));
+        // Empty-string override is ignored → falls back to the manifest default.
+        assert_eq!(resolve(&claude, "cycle-diff", Some("")).0.as_deref(), Some("sonnet"));
+
+        // A plugin with NO `models` block: no model resolves for any task → build_args injects
+        // none, even for transcript-cleanup (which would have a default under claude-code).
+        let plain = parse_manifest(QWEN_CODE_DESCRIPTOR).unwrap();
+        assert!(plain.models.is_none());
+        let (m, flag) = resolve(&plain, "transcript-cleanup", None);
+        assert!(m.is_none());
+        let spec = plain.tasks.get("transcript-cleanup").unwrap();
+        let args = build_args(spec, "P", None, m.as_deref(), &flag, true);
+        assert!(!args.iter().any(|x| x == "--model"));
+    }
+
+    // The task→bucket map: the six task names collapse to the three user-facing buckets;
+    // anything else (e.g. "ping") has no bucket.
+    #[test]
+    fn task_bucket_maps_tasks_to_buckets() {
+        assert_eq!(task_bucket("transcript-cleanup"), Some("cleanup"));
+        assert_eq!(task_bucket("cycle-synthesis"), Some("synthesis"));
+        assert_eq!(task_bucket("cycle-synthesis-extract"), Some("synthesis"));
+        assert_eq!(task_bucket("cycle-synthesis-reduce"), Some("synthesis"));
+        assert_eq!(task_bucket("cycle-diff"), Some("diff"));
+        assert_eq!(task_bucket("ping"), None);
     }
 
     #[test]

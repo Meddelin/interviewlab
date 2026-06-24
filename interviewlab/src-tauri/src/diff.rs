@@ -55,11 +55,6 @@ use crate::Db;
 // Tauri event the Diff tab subscribes to for progress (single-stage: diffing → done).
 pub const DIFF_PROGRESS_EVENT: &str = "diff://progress";
 
-// PERF: the diff is one reduce-style reasoning call (align findings wave-over-wave). Like
-// synthesis it runs on `sonnet` — enough reasoning, faster than the CLI's heavy default.
-// Injected per task as `--model sonnet` through the adapter. A single tunable constant.
-const DIFF_MODEL: &str = "sonnet";
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -473,6 +468,8 @@ async fn diff_syntheses(
     current: &SynthesisDoc,
     previous: &SynthesisDoc,
     adapter: &crate::adapter::Adapter,
+    // The user's diff-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> Result<DiffDoc, String> {
     let goals = shared_goals(&current.goals, &previous.goals);
     let cur_inputs = to_diff_inputs(current);
@@ -481,8 +478,9 @@ async fn diff_syntheses(
     let input = build_diff_input(&goals, &cur_inputs, &prev_inputs);
     let schema = diff_schema();
 
-    // PERF: the diff runs on sonnet (findings-level reasoning, not the heavy default).
-    let value = crate::adapter::run_cli_task_model(adapter, "cycle-diff", &input, Some(&schema), Some(DIFF_MODEL))
+    // The model comes from the user override or the plugin's per-task manifest default
+    // (for Claude Code, `sonnet` — findings-level reasoning, not the heavy default).
+    let value = crate::adapter::run_cli_task_model(adapter, "cycle-diff", &input, Some(&schema), model_override)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -690,7 +688,9 @@ pub async fn run_diff(
 
     emit_progress(&app, &cycle_id, "diffing", 40, None);
 
-    match diff_syntheses(&current.doc, &previous.doc, &adapter).await {
+    // The user's diff-bucket model override (None → the plugin's manifest default).
+    let model_override = crate::adapter::task_model_override(&db.pool, "cycle-diff").await;
+    match diff_syntheses(&current.doc, &previous.doc, &adapter, model_override.as_deref()).await {
         Ok(doc) => {
             let row_id = store_diff_db(&db.pool, &cycle_id, &prev_id, &doc).await?;
             emit_progress(&app, &cycle_id, "done", 100, None);
@@ -1074,7 +1074,7 @@ mod tests {
             ..Default::default()
         };
 
-        let doc = diff_syntheses(&current, &previous, &adapter)
+        let doc = diff_syntheses(&current, &previous, &adapter, None)
             .await
             .expect("real diff should succeed");
 
@@ -1191,7 +1191,7 @@ mod tests {
             previous.doc.findings.len()
         );
 
-        let doc = diff_syntheses(&current.doc, &previous.doc, &adapter)
+        let doc = diff_syntheses(&current.doc, &previous.doc, &adapter, None)
             .await
             .expect("real diff should succeed");
 

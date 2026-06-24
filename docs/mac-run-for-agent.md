@@ -190,9 +190,20 @@ is tolerant-parsed (JSONL/array + markdown-fence stripping). This is config-only
     "cycle-synthesis-extract": { "args_template": ["-p","{prompt}","--output-format","json"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p","{prompt}","--output-format","json"] },
     "cycle-diff":              { "args_template": ["-p","{prompt}","--output-format","json"] }
-  }
+  },
+  "models": { "flag": "--model", "available": [
+    {"id":"tgpt/qwen35-397b-a17b-fp8","label":"Qwen 35 (smart)"},
+    {"id":"tgpt/qwen36-35b-a3b-fp8","label":"Qwen 36 (fast)"}],
+    "tasks": {"transcript-cleanup":"tgpt/qwen36-35b-a3b-fp8","cycle-synthesis-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-synthesis-reduce":"tgpt/qwen35-397b-a17b-fp8","cycle-diff":"tgpt/qwen35-397b-a17b-fp8"} }
 }
 ```
+The optional **`models`** block is what lets you pick Nessy's models per task: `flag` is the CLI's
+model flag (`--model`), `available` populates the **Settings → AI CLI → "Task models"** picker (Cleanup /
+Synthesis / Diff), and `tasks` sets each task's default model. **If you OMIT `models` entirely, the app injects
+NO `--model`** and Nessy uses its own default model — which also fixes the old breakage where the app forced
+`--model haiku` (a Claude-only alias Nessy doesn't have). Use `models` only when Nessy actually accepts a
+`--model <id>` flag; set `flag` to `""` if it has none.
+
 Then: Settings → AI CLI → **Rescan** → select **Nessy** active → **Test CLI**. Notes:
 - **`--output-format json` is confirmed** against a real Nessy reply (v0.12.4): it emits a **JSON array** of
   events (`system/init` → `assistant/thinking` → `assistant/text` → `result`); the app takes the terminal

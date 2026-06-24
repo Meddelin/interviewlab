@@ -50,11 +50,6 @@ pub const CLEANUP_PROGRESS_EVENT: &str = "cleanup://progress";
 // transcript; still comfortably within alignment + output limits.)
 const BATCH_SIZE: usize = 60;
 
-// PERF: cleanup is mechanical grammar/punctuation/filler removal — a fast, cheap model
-// handles it with negligible quality loss, instead of the CLI's heavy default. Injected
-// per task as `--model haiku` through the adapter. A single tunable constant.
-const CLEANUP_MODEL: &str = "haiku";
-
 // PERF: how many cleanup batches run concurrently. A 40-min interview ≈ ~500 segments →
 // ~9 batches that used to run STRICTLY SEQUENTIALLY; we now run up to this many at once
 // behind a bounded semaphore. Conservative (4) to respect the user's Claude subscription
@@ -479,19 +474,22 @@ async fn clean_one_batch(
     product_desc: &str,
     ids: &[usize],
     raw: &[Segment],
+    // The user's per-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> Result<Vec<Segment>, String> {
     let input = build_batch_input(language, product_desc, ids, raw);
     let schema = output_schema();
 
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        // PERF: run cleanup on the fast model (haiku) — mechanical text-only edits.
+        // The model comes from the user override or the plugin's per-task manifest default
+        // (for Claude Code that's `haiku` — mechanical text-only edits).
         let value = crate::adapter::run_cli_task_model(
             adapter,
             "transcript-cleanup",
             &input,
             Some(&schema),
-            Some(CLEANUP_MODEL),
+            model_override,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -538,6 +536,8 @@ async fn clean_segments(
     language: Option<&str>,
     product_desc: &str,
     raw: &[Segment],
+    // The user's per-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> Result<Vec<Segment>, String> {
     if raw.is_empty() {
         return Err("nothing to clean: the raw transcript has no segments".into());
@@ -574,7 +574,7 @@ async fn clean_segments(
         let wave_futs = wave.iter().map(|(b, ids, chunk)| {
             let done = &done;
             async move {
-                let res = clean_one_batch(adapter, language, product_desc, ids, chunk).await;
+                let res = clean_one_batch(adapter, language, product_desc, ids, chunk, model_override).await;
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, completed, total_batches, None);
@@ -709,7 +709,10 @@ pub async fn clean_transcript(
     emit_cleanup(&app, &interview_id, STATUS_CLEANING, 0, raw.len().div_ceil(BATCH_SIZE), None);
 
     let lang = language.as_deref();
-    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &raw).await {
+    // The user's per-bucket model override (None → the plugin's manifest default — for
+    // Claude Code, `haiku`, preserving today's behavior).
+    let model_override = crate::adapter::task_model_override(&db.pool, "transcript-cleanup").await;
+    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &raw, model_override.as_deref()).await {
         Ok(cleaned) => {
             let tid = store_cleaned_db(&db.pool, &interview_id, lang, &cleaned).await?;
             set_status_db(&db.pool, &interview_id, STATUS_CLEANED)
@@ -848,7 +851,9 @@ mod tests {
         let ids = vec![10usize, 11, 12];
         let input = build_batch_input(Some("ru"), "", &ids, &raw);
         assert_eq!(input["language"], "ru");
-        assert!(input["guidelines"].as_str().unwrap().contains("never translate"));
+        let g = input["guidelines"].as_str().unwrap();
+        assert!(g.contains("translate")); // the no-translate rule survives
+        assert!(g.contains("anglicism")); // the English-terms/anglicism normalization guidance is present
         let segs = input["segments"].as_array().unwrap();
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0]["id"], 10);
@@ -1057,7 +1062,7 @@ mod tests {
 
         let total_batches = raw.len().div_ceil(BATCH_SIZE);
         let started = std::time::Instant::now();
-        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &raw)
+        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &raw, None)
             .await
             .expect("real parallel cleanup should succeed");
         let elapsed = started.elapsed();
@@ -1122,7 +1127,7 @@ mod tests {
             Segment { start_ms: 40200, end_ms: 45000, speaker_label: "S2".into(), text: "ну наверное когда сам разберусь чтобы было что показать коллегам понимаете".into() },
         ];
 
-        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &raw)
+        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &raw, None)
             .await
             .expect("real cleanup should succeed");
 
@@ -1240,7 +1245,7 @@ mod tests {
             if has_cleaned.is_none() {
                 set_status_db(&pool, iv, STATUS_CLEANING).await.unwrap();
                 println!("cleaning {iv}: {} segments via claude ...", raw.len());
-                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &raw)
+                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &raw, None)
                     .await
                     .expect("real cleanup should succeed");
                 assert_eq!(cleaned.len(), raw.len(), "segment count preserved for {iv}");

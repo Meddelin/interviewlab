@@ -377,6 +377,13 @@ export function saveEditedTranscript(
 // graceful degradation.
 export type Capability = "batch-tasks" | "streaming" | "multi-turn" | "tool-use";
 
+// One selectable model the active plugin offers (Rust `ModelOption`), for the Settings
+// "Task models" picker. `label` is the human-readable option text (falls back to `id`).
+export type ModelOption = {
+  id: string;
+  label: string;
+};
+
 // A light summary of a discovered plugin for the Settings AI CLI tab (Rust
 // `AdapterSummary`). The full manifest stays in Rust; the UI only needs this. A summary
 // with `ok: false` is a MALFORMED manifest (skipped) carrying the validation `error`
@@ -393,6 +400,7 @@ export type AdapterSummary = {
   tasks: string[];
   capabilities: Capability[];
   runs_external_program: boolean; // adapter-program tier → "runs external program" label
+  models: ModelOption[]; // the plugin's offered models for the Task-models picker (empty = CLI default)
   ok: boolean; // false = malformed manifest (see `error`)
   error?: string | null; // validation error for a malformed manifest
   source?: string | null; // folder/file the manifest loaded from
@@ -433,6 +441,23 @@ export function getActiveAdapter(): Promise<string> {
 // Persist the active adapter id (spec §4.4 "persist the choice").
 export function setActiveAdapter(id: string): Promise<void> {
   return invoke<void>("set_active_adapter", { id });
+}
+
+// The per-task model buckets the user can override (the three user-facing groupings of the
+// pipeline's tasks). The picker writes/reads one model id per bucket.
+export type TaskModelBucket = "cleanup" | "synthesis" | "diff";
+
+// The user's saved model override for a bucket ("" = use the plugin's per-task default).
+export function getTaskModel(bucket: TaskModelBucket): Promise<string> {
+  return invoke<string>("get_task_model", { bucket });
+}
+
+// Persist (or clear, with "") the user's model override for a bucket.
+export function setTaskModel(
+  bucket: TaskModelBucket,
+  model: string,
+): Promise<void> {
+  return invoke<void>("set_task_model", { bucket, model });
 }
 
 // Run the two-step "Test CLI" probe for an adapter (or the active one when omitted).

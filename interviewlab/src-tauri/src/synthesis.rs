@@ -62,12 +62,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// PERF: synthesis needs reasoning (cross-interview extraction + reduction), but not the
-// CLI's heaviest default model — `sonnet` balances quality and speed for both the MAP
-// (per-interview extraction, where extraction quality matters) and the REDUCE. Injected
-// per task as `--model sonnet` through the adapter. A single tunable constant.
-const SYNTHESIS_MODEL: &str = "sonnet";
-
 // PERF: how many per-interview MAP extractions run concurrently. The MAP stage used to run
 // interviews STRICTLY SEQUENTIALLY (one `claude` call per interview, in series). We now run
 // up to this many at once, in waves. Conservative (4) to respect the user's Claude
@@ -1334,12 +1328,15 @@ async fn extract_one(
     product_desc: &str,
     goals: &[Goal],
     interview: &InterviewInput,
+    // The user's synthesis-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> (ExtractOutput, InterviewExtraction) {
     let input = build_extract_input(product_desc, goals, interview);
     let schema = extract_schema();
 
-    // PERF: extraction runs on sonnet (good reasoning, faster than the heavy default).
-    let output = match crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-extract", &input, Some(&schema), Some(SYNTHESIS_MODEL)).await
+    // The model comes from the user override or the plugin's per-task manifest default
+    // (for Claude Code, `sonnet` — good reasoning, faster than the heavy default).
+    let output = match crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-extract", &input, Some(&schema), model_override).await
     {
         Ok(value) => serde_json::from_value::<ExtractOutput>(value).unwrap_or_default(),
         Err(_) => ExtractOutput::default(),
@@ -1363,13 +1360,15 @@ async fn reduce(
     goals: &[Goal],
     extractions: &[InterviewExtraction],
     valid_segments: &HashMap<String, usize>,
+    // The user's synthesis-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> Result<SynthesisDoc, String> {
     let input = build_reduce_input(product_desc, guide, goals, extractions);
     let schema = reduce_schema();
 
-    // PERF: the reduce runs on sonnet (cross-interview synthesis; reasoning-heavy but not
-    // worth the slowest default model).
-    let value = crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-reduce", &input, Some(&schema), Some(SYNTHESIS_MODEL))
+    // The model comes from the user override or the plugin's per-task manifest default
+    // (for Claude Code, `sonnet` — cross-interview synthesis, reasoning-heavy).
+    let value = crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-reduce", &input, Some(&schema), model_override)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1412,6 +1411,8 @@ async fn synthesize_cycle(
     guide: &str,
     adapter: &crate::adapter::Adapter,
     interviews: &[InterviewInput],
+    // The user's synthesis-bucket model override (None → the plugin's manifest default).
+    model_override: Option<&str>,
 ) -> Result<CycleSynthesisResult, String> {
     let goals = derive_goals(guide);
     if goals.is_empty() {
@@ -1443,7 +1444,7 @@ async fn synthesize_cycle(
             let done = &done;
             let goals = &goals;
             async move {
-                let (output, extraction) = extract_one(adapter, product_desc, goals, iv).await;
+                let (output, extraction) = extract_one(adapter, product_desc, goals, iv, model_override).await;
                 let summary = assemble_interview_summary(goals, iv.segments.len(), &output);
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
@@ -1464,7 +1465,7 @@ async fn synthesize_cycle(
     if let Some(app) = app {
         emit_progress(app, cycle_id, "reduce", total, total, 85, None);
     }
-    let doc = reduce(adapter, product_desc, guide, &goals, &extractions, &valid_segments).await?;
+    let doc = reduce(adapter, product_desc, guide, &goals, &extractions, &valid_segments, model_override).await?;
 
     Ok(CycleSynthesisResult { doc, summaries })
 }
@@ -1556,7 +1557,10 @@ pub async fn run_interview_summary(
     let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id))?;
 
     emit_summary_progress(&app, &interview_id, "running", 50, None);
-    let (output, _extraction) = extract_one(&adapter, &product_desc, &goals, &iv).await;
+    // The user's synthesis-bucket model override (None → the plugin's manifest default).
+    let model_override =
+        crate::adapter::task_model_override(&db.pool, "cycle-synthesis-extract").await;
+    let (output, _extraction) = extract_one(&adapter, &product_desc, &goals, &iv, model_override.as_deref()).await;
     let doc = assemble_interview_summary(&goals, iv.segments.len(), &output);
     let content_md = render_interview_markdown(&doc, &title);
     let model_meta = json!({ "adapter": adapter.id, "goals": doc.goals.len() }).to_string();
@@ -1643,7 +1647,9 @@ pub async fn run_synthesis(
     };
     let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id))?;
 
-    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &adapter, &interviews).await {
+    // The user's synthesis-bucket model override (None → the plugin's manifest default).
+    let model_override = crate::adapter::task_model_override(&db.pool, "cycle-synthesis").await;
+    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &adapter, &interviews, model_override.as_deref()).await {
         Ok(result) => {
             // Persist each per-interview summary (the MAP artifacts).
             for (iv_id, title, summary) in &result.summaries {
@@ -2290,7 +2296,7 @@ mod tests {
             ],
         };
 
-        let result = synthesize_cycle(None, "m10b-verify", product_desc, guide, &adapter, &[iv1.clone(), iv2.clone()])
+        let result = synthesize_cycle(None, "m10b-verify", product_desc, guide, &adapter, &[iv1.clone(), iv2.clone()], None)
             .await
             .expect("real synthesis should succeed");
         let doc = &result.doc;
@@ -2453,7 +2459,7 @@ mod tests {
             assert!(!interviews.is_empty(), "no cleaned interviews for {name} (run stage 2 first)");
             println!("synthesizing {name}: {} interviews via claude ...", interviews.len());
 
-            let result = synthesize_cycle(None, cycle_id, &product_desc, &guide, &adapter, &interviews)
+            let result = synthesize_cycle(None, cycle_id, &product_desc, &guide, &adapter, &interviews, None)
                 .await
                 .expect("real synthesis should succeed");
 

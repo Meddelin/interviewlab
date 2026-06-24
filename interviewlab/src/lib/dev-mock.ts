@@ -701,6 +701,11 @@ const mockAdapters: AdapterSummary[] = [
     tasks: ["ping", "transcript-cleanup", "cycle-synthesis", "cycle-diff"],
     capabilities: ["batch-tasks", "streaming", "multi-turn", "tool-use"],
     runs_external_program: false,
+    models: [
+      { id: "haiku", label: "Haiku (fast)" },
+      { id: "sonnet", label: "Sonnet (balanced)" },
+      { id: "opus", label: "Opus (best)" },
+    ],
     ok: true,
     error: null,
     source: "<bundled>/claude-code",
@@ -718,6 +723,7 @@ const mockAdapters: AdapterSummary[] = [
     tasks: ["ping", "transcript-cleanup", "cycle-synthesis", "cycle-diff"],
     capabilities: ["batch-tasks"],
     runs_external_program: false,
+    models: [], // no models block → uses its built-in model
     ok: true,
     error: null,
     source: "<bundled>/antigravity-cli",
@@ -735,6 +741,7 @@ const mockAdapters: AdapterSummary[] = [
     tasks: ["ping", "transcript-cleanup", "cycle-synthesis", "cycle-diff"],
     capabilities: ["batch-tasks", "streaming", "tool-use"],
     runs_external_program: false,
+    models: [], // no models block → uses its built-in model
     ok: true,
     error: null,
     source: "<bundled>/qwen-code",
@@ -743,6 +750,14 @@ const mockAdapters: AdapterSummary[] = [
 
 // Active adapter id (persisted across the session in the browser mock).
 let mockActiveAdapter = "claude-code";
+
+// Per-bucket task-model overrides (persisted across the session in the browser mock).
+// Empty string = the plugin's per-task default (no override).
+const mockTaskModels: Record<string, string> = {
+  cleanup: "",
+  synthesis: "",
+  diff: "",
+};
 
 // The §9 plugin-authoring meta-instruction, abridged for the browser preview (the real
 // Rust command returns the full text). Tells any AI agent how to drop in a new CLI plugin.
@@ -1845,6 +1860,16 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 
     case "set_active_adapter": {
       mockActiveAdapter = String(a.id);
+      return Promise.resolve(undefined as T);
+    }
+
+    case "get_task_model": {
+      const bucket = String(a.bucket);
+      return Promise.resolve((mockTaskModels[bucket] ?? "") as T);
+    }
+
+    case "set_task_model": {
+      mockTaskModels[String(a.bucket)] = String(a.model);
       return Promise.resolve(undefined as T);
     }
 

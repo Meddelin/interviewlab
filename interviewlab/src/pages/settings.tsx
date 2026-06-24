@@ -45,6 +45,7 @@ import {
   useAdapterMeta,
   useAdapters,
   usePluginManifestSchema,
+  useTaskModel,
 } from "@/lib/adapter-queries";
 import { useUiStore } from "@/lib/ui-store";
 import {
@@ -56,13 +57,16 @@ import {
   downloadModel,
   rescanPlugins,
   setActiveAdapter,
+  setTaskModel,
   testCli,
   type AdapterSummary,
   type Capability,
   type DiarModelProgress,
+  type ModelOption,
   type ModelProgress,
   type ProbeResult,
   type ProbeStatus,
+  type TaskModelBucket,
 } from "@/lib/tauri";
 import { mockOnDiarModelProgress, mockOnModelProgress } from "@/lib/dev-mock";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -651,6 +655,82 @@ function AddAdapterDialog() {
   );
 }
 
+// One task-model row (Cleanup / Synthesis / Diff): a Select seeded from the saved override,
+// whose options are a leading "Plugin default" (value "") plus the active plugin's models.
+// On change → persist the override + invalidate so the seed refreshes.
+function TaskModelRow({
+  bucket,
+  label,
+  models,
+}: {
+  bucket: TaskModelBucket;
+  label: string;
+  models: ModelOption[];
+}) {
+  const qc = useQueryClient();
+  const { data: saved } = useTaskModel(bucket);
+  const save = useMutation({
+    mutationFn: (model: string) => setTaskModel(bucket, model),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: adapterKeys.taskModel(bucket) }),
+    onError: (e) => toast.error(`Couldn't save model. ${String(e)}`),
+  });
+  // "" is the "Plugin default" sentinel; Radix Select can't use "" as an item value, so the
+  // default option carries a stable sentinel that maps back to "" on save.
+  const DEFAULT = "__default__";
+  const value = saved ? saved : DEFAULT;
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-sm text-foreground">{label}</span>
+      <Select
+        value={value}
+        onValueChange={(v) => save.mutate(v === DEFAULT ? "" : v)}
+      >
+        <SelectTrigger className="w-56">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={DEFAULT}>Plugin default</SelectItem>
+          {models.map((m) => (
+            <SelectItem key={m.id} value={m.id}>
+              {m.label || m.id}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+// The "Task models" section: lets the user pick which of the ACTIVE plugin's models runs
+// each task bucket. Shown only when the active plugin offers models; otherwise a muted note
+// (the CLI's built-in model is used and there's nothing to pick).
+function TaskModelsSection({ active }: { active?: AdapterSummary }) {
+  const models = active?.models ?? [];
+  return (
+    <div className="flex flex-col gap-3 border-t border-border pt-6">
+      <div className="flex flex-col gap-0.5">
+        <span className="text-sm font-medium text-foreground">Task models</span>
+        <span className="text-xs text-muted-foreground">
+          Which of {active ? active.name : "the active plugin"}’s models runs each
+          task. “Plugin default” uses the plugin’s own per-task choice.
+        </span>
+      </div>
+      {models.length === 0 ? (
+        <span className="text-xs text-muted-foreground">
+          This CLI uses its built-in model.
+        </span>
+      ) : (
+        <div className="flex max-w-md flex-col gap-3">
+          <TaskModelRow bucket="cleanup" label="Cleanup" models={models} />
+          <TaskModelRow bucket="synthesis" label="Synthesis" models={models} />
+          <TaskModelRow bucket="diff" label="Diff" models={models} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AiCliTab() {
   const { data: adapters, isPending: adaptersPending } = useAdapters();
   const { data: activeId } = useActiveAdapter();
@@ -770,6 +850,13 @@ function AiCliTab() {
           </span>
         )}
       </div>
+
+      {/* Task models (only meaningful once the active plugin is known) */}
+      {!adaptersPending && adapters && (
+        <TaskModelsSection
+          active={okAdapters.find((a) => a.id === effectiveActiveId)}
+        />
+      )}
 
       {/* Installed plugins */}
       <div className="flex flex-col gap-3 border-t border-border pt-6">

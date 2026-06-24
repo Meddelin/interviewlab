@@ -124,6 +124,8 @@ pub fn run() {
             adapter::rescan_plugins,
             adapter::get_active_adapter,
             adapter::set_active_adapter,
+            adapter::get_task_model,
+            adapter::set_task_model,
             adapter::test_cli,
             adapter::run_task,
             adapter::adapter_meta_instructions,
