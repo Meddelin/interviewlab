@@ -3,12 +3,21 @@
 The app is built/verified on **Windows + Nvidia CUDA**. This is the path to run it on **Mac Apple Silicon**. The engines are already cross-platform & **no-Python**; remaining work is feature flags + device detection + bundle config. (Honest limit: we can't run/verify on a real M3 Pro from this Windows box — we make it Mac-ready + documented; final on-device check needs a Mac.)
 
 ## Transcription speed/quality levers (no model change) — what's wired
-Applied in `asr.rs` / `Cargo.toml`; all keep the same large-v3 weights (no quality loss):
+Applied in `asr.rs` / `Cargo.toml`; all keep the same large-v3 weights (no model swap; word accuracy unchanged).
+**Fastest Mac build:** `npm run tauri build -- --features metal,coreml` (+ the `.mlmodelc` artifact, see below).
 - **Flash attention (`cparams.flash_attn(true)`) — ON:** faster GPU attention on Metal + CUDA. Measured ~21% faster on large-v3 (CUDA, 9-min clip: 49.9s→39.3s). Output is near-identical, not bit-identical (GPU float ordering shifts the odd token/boundary, ~0.6% of chars; word accuracy unchanged) — the standard whisper.cpp GPU recommendation.
 - **Decode threads (`set_n_threads`, clamp [4,8]) — ON:** the GPU does encode/decode, but the log-mel front-end + token sampling are CPU-side; default was min(4,cores), now tuned up on bigger machines (e.g. M3 Pro).
 - **Core ML / ANE encoder (`coreml` feature) — opt-in:** `--features metal,coreml` runs the heavy encoder on the Apple Neural Engine on top of Metal (big win). Needs `ggml-<model>-encoder.mlmodelc` next to the ggml `.bin` (prebuilt in HF `ggerganov/whisper.cpp`); whisper.cpp falls back to the Metal encoder if absent. First run compiles/caches the ANE model (slow once). Build needs Xcode. **Mac-only** — never enable on Windows/Linux (no CoreML framework). Auto-downloading the `.mlmodelc` alongside the ggml model is a remaining nicety (currently a manual placement / documented step).
-- **Quality:** accuracy = model + decoder, platform-independent (Metal/CoreML give near-identical text to CPU; not byte-for-byte but same word accuracy). The accuracy knob is beam search (slower); the GPU/ANE speed headroom makes it affordable if ever wanted (a `SamplingStrategy::BeamSearch` code change, not a flag).
+- **Quality:** accuracy = model + decoder, **platform-independent** (Metal/CoreML give near-identical text to CPU; not byte-for-byte but same word accuracy). So there's no Mac-specific quality to "recover" — it isn't lost on Mac. The only real accuracy knob is **beam search** (slower).
 - **Diarization:** separate pipeline (sherpa-onnx, CPU) — now multi-threaded (`num_threads` ≈ cores) in `diarize.rs`; was the slow pole.
+
+### Available option, NOT yet built — a Speed vs Accuracy toggle
+Decoding is currently `SamplingStrategy::Greedy { best_of: 1 }` + temperature fallback (fast, good). The one
+lever for **higher accuracy** is **beam search** (e.g. `BeamSearch { beam_size: 5 }`) — ~2-3× slower, but the
+speed reclaimed by flash attention + Core ML/ANE makes it affordable on Apple Silicon. To offer it as a user
+choice: add a Settings **"Transcription mode: Speed | Accuracy"** preference, thread it to `transcribe_interview`,
+and pick the `SamplingStrategy` in `run_whisper` accordingly (Speed = greedy as today; Accuracy = beam search).
+This is a code change (backend + a Settings control), not a build flag — implement on request.
 
 ## Cross-platform audit (current state)
 - **whisper.cpp (`whisper-rs 0.16`):** Windows uses the `cuda` feature. Apple Silicon → the **`metal`** feature (`whisper-rs/metal`) for GPU, plus the opt-in **`coreml`** feature (ANE encoder) — see the levers section above; CPU fallback works without either.
