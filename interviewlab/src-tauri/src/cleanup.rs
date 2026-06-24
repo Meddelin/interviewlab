@@ -102,14 +102,40 @@ struct CleanupOutput {
 
 // Default cleanup guidelines (spec §7.3.1). Language-aware: we instruct the model to
 // clean in the ORIGINAL language and never translate (Russian-first per the spec).
+// Cleanup guidelines (the §7.3.1 "no grammar errors" pass). Tech/product interviews in
+// Russian are full of English terms and anglicisms that the ASR mangles or spells
+// phonetically in Cyrillic, so beyond grammar/filler we give explicit terminology rules.
+// Grounded in ASR-error-correction practice (Amazon Science generative AEC; Apple/DeRAGEC
+// retrieval entity correction; code-aware ASR refinement) and Russian loanword orthography
+// (borrowings appear in BOTH Latin & Cyrillic — there's no single right script, so the goal
+// is CONSISTENCY + following the domain/glossary convention, not blanket Latinizing).
+// ponytail: rules + a few illustrative examples, NOT a term dump — over-stuffing a glossary
+// is counterproductive (WMT'25 terminology work). The product context (below) is the entity
+// phrase-list that anchors named-entity / brand spellings the model otherwise can't recover.
 fn guidelines_for(language: Option<&str>) -> String {
     let lang = language.unwrap_or("the original");
     format!(
-        "Fix grammar, punctuation, and capitalization. Remove pure filler words (e.g. \
-         Russian «эм», «ну вот», «значит»; English \"um\", \"uh\", \"like\") ONLY when they \
-         add nothing. Do NOT paraphrase, translate, summarize, merge, split, or reorder. \
-         Clean the text IN ITS ORIGINAL LANGUAGE ({lang}) — never translate to another \
-         language. Keep the speaker's meaning, terminology, and tone."
+        "Rewrite each segment into clean, readable {lang} that says EXACTLY what the speaker said. \
+         Fix grammar, punctuation, and capitalization; remove only pure filler that carries no meaning \
+         (Russian «эм», «ну вот», «значит», «как бы», «короче»; English \"um\", \"uh\", \"like\"). Do NOT \
+         paraphrase, translate, summarize, merge, split, or reorder, and keep the speaker's meaning, tone, \
+         and language mix. Do NOT invent words, names, or numbers that aren't in the audio — when a span is \
+         unclear, keep it close to the original rather than guessing.\n\
+         \n\
+         English terms & anglicisms (these are tech/product interviews, so getting them right matters — the \
+         ASR often mangles them or renders them phonetically in Cyrillic):\n\
+         - Fix phonetically garbled / mis-heard English terms when the intended term is clear from context: \
+           «эй-пи-ай»/«апишка» → «API», «продакт-маркет фит» → «product-market fit», «джира» → «Jira», \
+           «эс-кью-эл» → «SQL», «гитхаб» → «GitHub».\n\
+         - Acronyms / initialisms → UPPERCASE Latin: API, MVP, SaaS, B2B, KPI, UX, UI, AI, ML, LLM, CRM, SDK, ROI.\n\
+         - Product / brand / tool / library names → their canonical spelling: Figma, Jira, GitHub, Notion, Slack.\n\
+         - Anglicisms fully assimilated into Russian speech → keep the normal Cyrillic spelling, do NOT \
+           Latinize them: дедлайн, фича, баг, релиз, кейс, юзер, фидбэк, апдейт, таск, митинг, бэклог, онбординг.\n\
+         - Never TRANSLATE a term the speaker chose (don't turn «churn» into «отток» or «отток» into «churn») — \
+           keep their word, just spell it canonically.\n\
+         - Spell each term CONSISTENTLY — pick one form per term and use it every time.\n\
+         When product/glossary context is provided below, treat ITS spelling of any product, brand, or domain \
+         term as the AUTHORITY — it overrides the rules above."
     )
 }
 
@@ -167,9 +193,9 @@ fn build_batch_input(
         // Explicit, contract-restating instruction (belt + suspenders with the schema):
         // the renderer in adapter.rs also says "return ONLY JSON matching the schema".
         "instructions": "Return ONLY a JSON object {\"segments\":[{\"id\":<int>,\"text\":<cleaned string>}, …]}. \
-                         Include EVERY input segment id exactly once. Change ONLY the text \
-                         (fix grammar/punctuation/casing, drop pure filler, and normalize \
-                         product/brand terms using the product context if present). Do not add, \
+                         Include EVERY input segment id exactly once. Change ONLY the text — apply the \
+                         `guidelines` (grammar, filler, and the English-terms / anglicism normalization), \
+                         using `product_desc` as the glossary for product/brand/domain spellings. Do not add, \
                          drop, merge, split, reorder, or translate segments.",
         "segments": segments
     });
