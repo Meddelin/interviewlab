@@ -64,6 +64,9 @@ fn default_timeout_sec() -> u64 {
 fn default_max_stdin_bytes() -> u64 {
     10_000_000
 }
+fn default_true() -> bool {
+    true
+}
 
 // The io block: where the payload + prompt go, how to extract the result, limits.
 #[derive(Serialize, Deserialize, Clone)]
@@ -76,6 +79,12 @@ pub struct Io {
     pub timeout_sec: u64,
     #[serde(default = "default_max_stdin_bytes")]
     pub max_stdin_bytes: u64,
+    // Whether the runner may inject `--json-schema <schema>` when a task requests structured
+    // output. Default true (Claude/Qwen support it). Set FALSE for a CLI that has no schema flag
+    // or rejects it (e.g. Nessy CLI, which exits 52): the schema still goes into the PROMPT and we
+    // tolerant-parse the `result` string, instead of breaking the run on an unsupported flag.
+    #[serde(default = "default_true")]
+    pub json_schema_arg: bool,
 }
 
 // One task entry: the arg template with {prompt} placeholders.
@@ -883,6 +892,9 @@ fn build_args(
     prompt: &str,
     output_schema: Option<&Value>,
     model: Option<&str>,
+    // false for a CLI whose `io.json_schema_arg = false` (no `--json-schema` support) — the
+    // schema is then carried by the prompt only, and the result is tolerant-parsed.
+    inject_schema: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::with_capacity(spec.args_template.len() + 4);
     for a in &spec.args_template {
@@ -893,9 +905,10 @@ fn build_args(
         }
     }
     // Harden synthesis/diff parsing (spec §7.2): pass the schema so the CLI returns
-    // structured_output. Only add it if the template didn't already include it.
+    // structured_output. Only when the plugin supports the flag and the template didn't
+    // already include it.
     if let Some(schema) = output_schema {
-        if !args_have_json_schema(&args) {
+        if inject_schema && !args_have_json_schema(&args) {
             args.push("--json-schema".to_string());
             args.push(schema.to_string());
         }
@@ -1020,35 +1033,49 @@ fn parse_envelope(stdout: &str, field: &str, used_schema: bool) -> Result<Value,
     let trimmed = stdout.trim();
     // Fast path: the whole output is a single JSON value (handles multi-line pretty-printed too).
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Ok(v);
+        return match v {
+            // A single object IS the envelope.
+            Value::Object(_) => Ok(v),
+            // An ARRAY of events (some CLIs' `--output-format json` emits one JSON array of the
+            // whole stream) → pick the payload-bearing element, same rule as the JSONL case.
+            Value::Array(items) => pick_payload_object(items.into_iter(), field, used_schema)
+                .ok_or_else(|| "CLI returned a JSON array with no element carrying the payload".to_string()),
+            other => Ok(other),
+        };
     }
-    // JSONL: scan lines, keep the last object overall + the last one carrying the payload.
+    // JSONL / stream-json: one JSON object per line.
+    let objs = trimmed
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok());
+    pick_payload_object(objs, field, used_schema).ok_or_else(|| {
+        "CLI stdout was neither a JSON object, a JSON array, nor a JSONL stream — check the \
+         plugin's --output-format and result_extract"
+            .to_string()
+    })
+}
+
+// From a sequence of stream events, pick the LAST object that carries the payload
+// (`structured_output` when a schema was used, else the `field`), falling back to the last
+// object overall. Shared by the JSON-array and JSONL paths.
+fn pick_payload_object(
+    items: impl Iterator<Item = Value>,
+    field: &str,
+    used_schema: bool,
+) -> Option<Value> {
     let mut last_obj: Option<Value> = None;
     let mut last_with_payload: Option<Value> = None;
-    for line in trimmed.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for v in items {
         if !v.is_object() {
             continue;
         }
-        let has_payload = (used_schema
-            && v.get("structured_output").is_some_and(|x| !x.is_null()))
+        let has_payload = (used_schema && v.get("structured_output").is_some_and(|x| !x.is_null()))
             || v.get(field).is_some();
         if has_payload {
             last_with_payload = Some(v.clone());
         }
         last_obj = Some(v);
     }
-    last_with_payload.or(last_obj).ok_or_else(|| {
-        "CLI stdout was neither a JSON object nor a JSONL stream — check the plugin's \
-         --output-format and result_extract"
-            .to_string()
-    })
+    last_with_payload.or(last_obj)
 }
 
 // One spawn attempt: run the command, pipe stdin, capture stdout/stderr, enforce
@@ -1163,7 +1190,10 @@ pub async fn run_cli_task_model(
         .ok_or_else(|| TaskError::new("config", format!("adapter `{}` has no task `{task_name}`", adapter.id)))?;
 
     let prompt = render_prompt(task_name, input_json, output_schema);
-    let args = build_args(spec, &prompt, output_schema, model);
+    // A plugin can opt out of `--json-schema` (io.json_schema_arg = false) when its CLI rejects
+    // the flag; the schema then lives in the prompt and the result is tolerant-parsed.
+    let inject_schema = adapter.io.as_ref().map(|io| io.json_schema_arg).unwrap_or(true);
+    let args = build_args(spec, &prompt, output_schema, model, inject_schema);
     let used_schema = args_have_json_schema(&args);
     let payload = serde_json::to_vec(input_json)
         .map_err(|e| TaskError::new("config", format!("serialize input: {e}")))?;
@@ -1269,7 +1299,7 @@ pub async fn probe_cli(adapter: &Adapter) -> ProbeResult {
     let prompt = "Return ONLY this JSON object and nothing else: {\"ok\":true}";
     // Use the ping task spec but override the prompt to the trivial probe prompt.
     if let Some(spec) = adapter.tasks.get("ping") {
-        let args = build_args(spec, prompt, None, None);
+        let args = build_args(spec, prompt, None, None, true);
         match spawn_once(adapter, &args, b"{}").await {
             Ok((stdout, _)) => match extract_result(adapter, &stdout, false) {
                 Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => ProbeResult {
@@ -1550,7 +1580,8 @@ const MANIFEST_SCHEMA: &str = r#"{
           }
         },
         "timeout_sec": { "type": "integer", "default": 600 },
-        "max_stdin_bytes": { "type": "integer", "default": 10000000 }
+        "max_stdin_bytes": { "type": "integer", "default": 10000000 },
+        "json_schema_arg": { "type": "boolean", "default": true, "description": "Inject --json-schema when a task wants structured output. Set false for a CLI that lacks/rejects the flag (e.g. Nessy); the schema then rides in the prompt and the result string is tolerant-parsed." }
       }
     },
     "tasks": {
@@ -1784,6 +1815,31 @@ mod tests {
     }
 
     #[test]
+    fn extract_result_parses_json_array_stream() {
+        // Some CLIs emit ONE JSON array of the whole event stream (e.g. Nessy `--output-format
+        // json`). Take the element carrying `result`; ignore the non-payload events.
+        let a = builtin_adapter(); // format "json", json_path "result"
+        let stdout = r#"[{"type":"system","subtype":"init"},{"type":"assistant","message":{}},{"type":"result","result":"{\"ok\":true}"}]"#;
+        let v = extract_result(&a, stdout, false).unwrap();
+        assert_eq!(v, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn io_json_schema_arg_defaults_true_and_parses_false() {
+        // Default (absent) → true (Claude/Qwen keep injecting --json-schema).
+        let a = builtin_adapter();
+        assert!(a.io.as_ref().unwrap().json_schema_arg);
+        // A plugin can opt out (Nessy): json_schema_arg=false parses + round-trips.
+        let m = r#"{"manifest_version":1,"id":"nessy","name":"Nessy","command":"nessy",
+            "capabilities":["batch-tasks"],"probe":{"args":["--version"],"expect_exit_code":0},
+            "auth":{"type":"none"},
+            "io":{"payload_via":"stdin","result_extract":{"format":"json","json_path":"result"},"json_schema_arg":false},
+            "tasks":{"transcript-cleanup":{"args_template":["-p","{prompt}","--output-format","stream-json"]}}}"#;
+        let nessy = parse_manifest(m).unwrap();
+        assert!(!nessy.io.as_ref().unwrap().json_schema_arg);
+    }
+
+    #[test]
     fn extract_result_jsonl_picks_structured_output_line() {
         // JSONL + schema: take the last line that actually carries structured_output, even if a
         // later line has only a (fence-wrapped) `result` string.
@@ -1824,14 +1880,18 @@ mod tests {
         let a = builtin_adapter();
         let spec = a.tasks.get("ping").unwrap();
         // No schema: {prompt} substituted, no --json-schema.
-        let args = build_args(spec, "HELLO", None, None);
+        let args = build_args(spec, "HELLO", None, None, true);
         assert!(args.contains(&"HELLO".to_string()));
         assert!(!args.iter().any(|x| x == "--json-schema"));
-        // With schema: --json-schema <schema> appended.
+        // With schema + inject_schema=true: --json-schema <schema> appended.
         let schema = json!({ "type": "object" });
-        let args = build_args(spec, "HELLO", Some(&schema), None);
+        let args = build_args(spec, "HELLO", Some(&schema), None, true);
         let i = args.iter().position(|x| x == "--json-schema").unwrap();
         assert_eq!(args[i + 1], schema.to_string());
+        // OPT-OUT: a plugin with json_schema_arg=false (inject_schema=false) gets NO --json-schema
+        // even when a schema is requested — the schema rides in the prompt instead (Nessy CLI).
+        let args = build_args(spec, "HELLO", Some(&schema), None, false);
+        assert!(!args.iter().any(|x| x == "--json-schema"));
     }
 
     // PERF: a per-task model is injected as `--model <alias>` (stubbed, no real CLI call).
@@ -1840,19 +1900,19 @@ mod tests {
         let a = builtin_adapter();
         let spec = a.tasks.get("transcript-cleanup").unwrap();
         // No model → no --model flag (CLI default).
-        let args = build_args(spec, "P", None, None);
+        let args = build_args(spec, "P", None, None, true);
         assert!(!args.iter().any(|x| x == "--model"));
         // haiku model → `--model haiku` appended exactly once.
-        let args = build_args(spec, "P", None, Some("haiku"));
+        let args = build_args(spec, "P", None, Some("haiku"), true);
         let i = args.iter().position(|x| x == "--model").expect("--model present");
         assert_eq!(args[i + 1], "haiku");
         assert_eq!(args.iter().filter(|x| *x == "--model").count(), 1);
         // Empty model string is treated as "no model".
-        let args = build_args(spec, "P", None, Some(""));
+        let args = build_args(spec, "P", None, Some(""), true);
         assert!(!args.iter().any(|x| x == "--model"));
         // With a schema AND a model, both are present.
         let schema = json!({ "type": "object" });
-        let args = build_args(spec, "P", Some(&schema), Some("sonnet"));
+        let args = build_args(spec, "P", Some(&schema), Some("sonnet"), true);
         assert!(args.iter().any(|x| x == "--json-schema"));
         let i = args.iter().position(|x| x == "--model").unwrap();
         assert_eq!(args[i + 1], "sonnet");
