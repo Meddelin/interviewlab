@@ -321,6 +321,17 @@ async fn set_status_db(pool: &SqlitePool, interview_id: &str, status: &str) -> R
     Ok(())
 }
 
+// Read the interview's current status (so a failed cleanup can restore it). None if the row /
+// query fails — the caller falls back to a safe default.
+async fn get_status_db(pool: &SqlitePool, interview_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT status FROM interview WHERE id = ?")
+        .bind(interview_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
 // The raw transcript is the cleanup source: same shape transcript.rs reads. We read it
 // directly here (rather than reaching into transcript.rs internals) to keep modules
 // decoupled. Returns (language, segments).
@@ -658,6 +669,14 @@ pub async fn clean_transcript(
         .await
         .unwrap_or_default();
 
+    // Capture the status BEFORE we flip to `cleaning`, so a failed cleanup can restore it. The
+    // raw/cleaned transcript is intact — cleanup is an enrichment, not the interview's terminal
+    // state — so a failure must NOT mark the whole interview `error` (that locked the user out of a
+    // perfectly good transcript). Fall back to `transcribed` if the read fails.
+    let prior_status = get_status_db(&db.pool, &interview_id)
+        .await
+        .unwrap_or_else(|| "transcribed".to_string());
+
     set_status_db(&db.pool, &interview_id, STATUS_CLEANING)
         .await
         .map_err(|e| format!("set cleaning: {e}"))?;
@@ -675,8 +694,10 @@ pub async fn clean_transcript(
             Ok(tid)
         }
         Err(e) => {
-            // Don't store anything; flip back to a terminal error status + surface it.
-            set_status_db(&db.pool, &interview_id, STATUS_ERROR).await.ok();
+            // Don't store anything. RESTORE the prior status (transcribed/cleaned/edited) — the
+            // transcript is intact, so the interview stays openable + the user can retry cleanup.
+            // We still surface the failure via the event (error toast) + the returned Err.
+            set_status_db(&db.pool, &interview_id, &prior_status).await.ok();
             emit_cleanup(&app, &interview_id, STATUS_ERROR, 0, 0, Some(e.clone()));
             Err(e)
         }

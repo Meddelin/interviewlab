@@ -346,7 +346,11 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     return (
       row.status === "transcribed" ||
       row.status === "cleaned" ||
-      row.status === "edited"
+      row.status === "edited" ||
+      // Also open `error` rows: a failed cleanup (or other post-transcription step) must never
+      // lock the user out of a good transcript. The editor loads whatever versions exist and
+      // shows a graceful empty state if there genuinely is none, so this is always safe.
+      row.status === "error"
     );
   }
 
