@@ -150,11 +150,63 @@ batch tasks, `streaming` + `multi-turn` for chat, `tool-use` if applicable); a p
 (how to invoke the CLI for each task, with `{prompt}` substitution); how to **extract the result** from the
 CLI's output (e.g. a JSON path); and, for chat, a `chat.stream` block naming the stream parser.
 
-> **Batch output shape:** `result_extract: { format: "json", json_path: "result" }` accepts BOTH a single
-> JSON object AND a **JSONL / stream-json stream** (one object per line — the app takes the last line
-> carrying the payload). So a CLI whose `--output-format json` emits a stream (rather than one object) works
-> as-is — prefer that over `format: "raw"` + prompt-engineering the model to "return only JSON" (brittle: the
-> model may wrap it in markdown). A markdown-fenced `result` string is also unwrapped automatically.
+> **Batch output shape:** `result_extract: { format: "json", json_path: "result" }` accepts a single JSON
+> object, a **JSONL / stream-json** stream (one object per line), OR a **JSON array** of stream events — the
+> app picks the element/line carrying `result`. So a CLI whose `--output-format json` emits a stream or an
+> array works as-is. Prefer that over `format: "raw"` + prompt-engineering "return only JSON" (brittle). A
+> markdown-fenced `result` string is unwrapped automatically.
+
+### 5.1 Recipe: a stream-json CLI with NO `--json-schema` support (e.g. **Nessy CLI**)
+
+Some CLIs can't do schema-constrained output. The app, by default, **auto-injects `--json-schema`** into the
+cleanup / synthesis / diff tasks (to get clean structured output from Claude/Qwen). A CLI that rejects that
+flag (Nessy **exits 52**: "model produced plain text instead of calling the structured_output tool") would
+fail every one of those tasks — and **no `args_template` can stop the injection**.
+
+The fix is a manifest flag — **`io.json_schema_arg: false`** — which tells the runner to skip `--json-schema`
+for this plugin. The schema still goes into the **prompt** (so the model knows the contract), and the result
+is tolerant-parsed (JSONL/array + markdown-fence stripping). This is config-only, no source change.
+
+**Working Nessy manifest** — `~/Library/Application Support/com.interviewlab.app/plugins/nessy/manifest.json`:
+```json
+{
+  "manifest_version": 1,
+  "id": "nessy",
+  "name": "Nessy CLI",
+  "command": "nessy",
+  "capabilities": ["batch-tasks"],
+  "probe": { "args": ["--version"], "expect_exit_code": 0 },
+  "auth": { "type": "session" },
+  "io": {
+    "payload_via": "stdin",
+    "prompt_via": "arg",
+    "result_extract": { "format": "json", "json_path": "result" },
+    "json_schema_arg": false
+  },
+  "tasks": {
+    "ping":                    { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
+    "transcript-cleanup":      { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
+    "cycle-synthesis":         { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
+    "cycle-synthesis-extract": { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
+    "cycle-synthesis-reduce":  { "args_template": ["-p","{prompt}","--output-format","stream-json"] },
+    "cycle-diff":              { "args_template": ["-p","{prompt}","--output-format","stream-json"] }
+  }
+}
+```
+Then: Settings → AI CLI → **Rescan** → select **Nessy** active → **Test CLI**. Notes:
+- Use `--output-format stream-json` (JSONL). `--output-format json` (one big array) also works now; the
+  default `text` does not (no envelope). **Do NOT pass `--json-schema`** — that's the exit-52 trap; the
+  `json_schema_arg: false` flag is what avoids it.
+- **Chat (optional):** Nessy's stream events in the integration notes look Claude-shaped
+  (`{"type":"assistant","message":{"content":[{"text":…}]}}` then `{"type":"result","result":…}`). If Nessy's
+  real stream matches that, add a `chat.stream` block with **`"parse": "claude-stream-json"`** plus
+  `capabilities` `streaming` + `multi-turn` — **no new parser needed**. If the stream shape differs, a new
+  named parser is a **source change** (§6B) — report the actual stream format rather than guessing.
+- **Residual risk — cleanup id-alignment:** without `--json-schema`, the model holds the "echo EVERY segment
+  id exactly once" contract by prompt only. It's guarded by a per-batch retry + a hard alignment check, but a
+  weaker model may trip it more often (you'll see a cleanup error; the transcript stays intact and re-runnable).
+  If it fails repeatedly, that's a prompt tweak (generic, not Nessy-specific) — report it, don't hand-parse the
+  output (parsing speaker-labelled prose back to segments by order silently corrupts the transcript).
 
 **Reference templates** are written to the plugins folder on first run — `claude-code`, `qwen-code`,
 `antigravity`. **Copy whichever is closest to your CLI's I/O shape and adapt it** (command, args, auth,
