@@ -34,6 +34,9 @@ export function useLiveAsr() {
           // The list tab keeps its own listener; this covers the case where the editor is the
           // only screen mounted. Broad prefix invalidation is fine for these small reads.
           qc.invalidateQueries({ queryKey: ["interviews"] });
+          // The checkpoint is cleared on success / (re)written on error — refresh either way
+          // so the "resume from M:SS" banner appears or disappears.
+          qc.invalidateQueries({ queryKey: ["transcribe-checkpoint"] });
           if (e.payload.status === "transcribed") {
             qc.invalidateQueries({ queryKey: ["transcript"] });
             qc.invalidateQueries({ queryKey: ["participants"] });

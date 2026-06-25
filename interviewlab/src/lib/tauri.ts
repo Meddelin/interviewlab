@@ -277,6 +277,62 @@ export function rediarizeInterview(
   });
 }
 
+// Re-transcribe + re-diarize just a TIME RANGE of the audio (redo a chunk that came out
+// wrong). Runs whisper on [startMs, endMs], splices the result over the stored transcript in
+// that window, then re-diarizes the whole audio. Streams live progress via ASR_PROGRESS_EVENT;
+// resolves with the new transcript id. The window is taken from the editor's selected segments.
+export function retranscribeRange(
+  interviewId: string,
+  startMs: number,
+  endMs: number,
+  modelId: string,
+  language: string,
+  expectedSpeakers: number | null,
+): Promise<string> {
+  return invoke<string>("retranscribe_range", {
+    interviewId,
+    startMs,
+    endMs,
+    modelId,
+    language,
+    expectedSpeakers,
+  });
+}
+
+// A saved transcription checkpoint (Rust `Checkpoint`): the partial result of a run that
+// failed/crashed, so the editor can offer "resume from M:SS". null when there's nothing to resume.
+export type Checkpoint = {
+  interview_id: string;
+  processed_ms: number; // last decoded segment end — where resume continues
+  total_ms: number | null; // audio duration — resume's target end
+  model_id: string;
+  language: string | null;
+  segments_json: string;
+  updated_at: number;
+};
+
+// Read the saved checkpoint for an interview (drives the "resume" banner). null = none.
+export function getTranscribeCheckpoint(
+  interviewId: string,
+): Promise<Checkpoint | null> {
+  return invoke<Checkpoint | null>("get_transcribe_checkpoint", { interviewId });
+}
+
+// Resume a failed/crashed transcription from its checkpoint: re-transcribes only the
+// remaining tail [processed_ms, total_ms], appends to the saved prefix, then diarizes the
+// whole audio. Streams live progress via ASR_PROGRESS_EVENT; resolves with the transcript id.
+export function resumeTranscription(
+  interviewId: string,
+  language: string,
+  expectedSpeakers: number | null,
+): Promise<string> {
+  return invoke<string>("resume_transcription", {
+    interviewId,
+    language,
+    expectedSpeakers,
+  });
+}
+
 // --- Transcript editor (Milestone 5) ------------------------------------------
 // Mirrors of the Rust transcript-editor structs/commands (src-tauri/src/transcript.rs).
 

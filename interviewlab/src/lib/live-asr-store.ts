@@ -54,11 +54,19 @@ export const useLiveAsrStore = create<LiveAsrState>((set) => ({
       let next: LiveAsr;
       if (p.status === "transcribing") {
         if (p.segment) {
-          // A live segment tick (progress === -1): append it to the accumulating transcript.
+          // A live segment tick (progress === -1): append it. If we weren't already in a run
+          // (status was idle/error/transcribed), this segment STARTS a fresh one — clear stale
+          // segments first. This matters for resume, whose first ticks REPLAY the saved prefix:
+          // without the reset they'd pile on top of a previous failed run's leftover segments.
+          const fresh = prev.status !== "transcribing";
           next = {
             ...prev,
             status: "transcribing",
-            segments: [...prev.segments, p.segment],
+            segments: fresh ? [p.segment] : [...prev.segments, p.segment],
+            diarActive: fresh ? false : prev.diarActive,
+            diarStartedAt: fresh ? null : prev.diarStartedAt,
+            speakers: fresh ? null : prev.speakers,
+            error: null,
           };
         } else if (p.progress >= 0) {
           // A percent tick. The FIRST one (progress 0) opens a fresh run — clear any stale

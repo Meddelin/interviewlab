@@ -1702,6 +1702,32 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       return Promise.resolve(detected as T);
     }
 
+    // --- partial re-transcribe + crash resume (browser preview) --------------
+    // The real engine work is in Rust; the preview just emits a short live run so the editor's
+    // live view + progress are demonstrable, then resolves with a fake transcript id.
+    case "retranscribe_range":
+    case "resume_transcription": {
+      const interviewId = String(a.interviewId);
+      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 10, segment_text: null, segment: null, error: null });
+      const seg = { start_ms: Number(a.startMs ?? 0), end_ms: Number(a.endMs ?? 2000), speaker_label: "S1", text: "Перетранскрибированный фрагмент (preview)." };
+      setTimeout(() => {
+        emitAsr({ interview_id: interviewId, status: "transcribing", progress: -1, segment_text: seg.text, segment: seg, error: null });
+      }, 200);
+      setTimeout(() => {
+        emitDiar({ interview_id: interviewId, status: "diarizing", progress: 50, speakers: null });
+      }, 400);
+      setTimeout(() => {
+        emitDiar({ interview_id: interviewId, status: "done", progress: 100, speakers: 2 });
+        emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, segment: null, error: null });
+      }, 700);
+      return Promise.resolve(uuid() as T);
+    }
+
+    case "get_transcribe_checkpoint": {
+      // No saved partial run in the browser preview.
+      return Promise.resolve(null as T);
+    }
+
     // --- M5 transcript editor ------------------------------------------------
 
     case "list_transcript_versions": {

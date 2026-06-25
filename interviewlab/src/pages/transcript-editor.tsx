@@ -17,6 +17,7 @@ import {
   Pause,
   Play,
   Plus,
+  RotateCcw,
   Save,
   Trash2,
   Users,
@@ -64,16 +65,25 @@ import { useInterviews } from "@/lib/interview-queries";
 import {
   useParticipants,
   useSaveEditedTranscript,
+  useTranscribeCheckpoint,
   useTranscriptVersion,
   useTranscriptVersions,
 } from "@/lib/transcript-queries";
+import { useUiStore } from "@/lib/ui-store";
+import { useModels } from "@/lib/asr-queries";
 import type {
   InterviewRow,
   Participant,
   ParticipantInput,
   Segment,
 } from "@/lib/tauri";
-import { cancelTranscription, IN_TAURI, rewriteSegment } from "@/lib/tauri";
+import {
+  cancelTranscription,
+  IN_TAURI,
+  resumeTranscription,
+  retranscribeRange,
+  rewriteSegment,
+} from "@/lib/tauri";
 import { EMPTY_LIVE_ASR, useLiveAsrStore } from "@/lib/live-asr-store";
 import { LiveTranscriptView } from "@/components/live-transcript-view";
 import { mockAudioSrc } from "@/lib/dev-mock";
@@ -703,6 +713,17 @@ export function TranscriptEditorPage() {
     }
   }, [live.status, version, interview?.status, interviewId, resetLive]);
 
+  // ── Re-transcribe a selection / resume a crashed run ──
+  // These reuse the Settings-chosen model/language/expected-speakers (same source as the list).
+  // The handlers that need the segment/selection state live further down, after it's declared.
+  const asrModelId = useUiStore((s) => s.asrModelId);
+  const asrLanguage = useUiStore((s) => s.asrLanguage);
+  const asrExpectedSpeakers = useUiStore((s) => s.asrExpectedSpeakers);
+  const { data: models } = useModels();
+  const expectedSpeakers =
+    asrExpectedSpeakers === "auto" ? null : Number(asrExpectedSpeakers);
+  const { data: checkpoint } = useTranscribeCheckpoint(interviewId);
+
   // ── Local editable buffers (edits are local until Save, spec §4.5). ──
   const [segments, setSegments] = useState<Segment[]>([]);
   const [participants, setParticipants] = useState<DraftParticipant[]>([]);
@@ -940,6 +961,46 @@ export function TranscriptEditorPage() {
     setDirty(true);
   }
 
+  // Re-transcribe the selected segments' time span: the badly-cut part gets redone (whisper +
+  // whole-audio re-diarization) and spliced back in. Range = [first selected start, last
+  // selected end]; the backend drops the overlapping segments and inserts the fresh ones, then
+  // the live store flips us into live mode as the new run streams.
+  const retranscribeSelection = useCallback(async () => {
+    if (!interviewId || selected.size === 0) return;
+    const idxs = [...selected].sort((a, b) => a - b);
+    const startMs = Math.min(...idxs.map((i) => segments[i]?.start_ms ?? 0));
+    const endMs = Math.max(...idxs.map((i) => segments[i]?.end_ms ?? 0));
+    if (endMs <= startMs) return;
+    if (!models?.find((m) => m.id === asrModelId)?.downloaded) {
+      toast.error("Модель не скачана — Settings → Transcription.");
+      return;
+    }
+    clearSelection();
+    try {
+      await retranscribeRange(
+        interviewId,
+        startMs,
+        endMs,
+        asrModelId,
+        asrLanguage,
+        expectedSpeakers,
+      );
+    } catch (e) {
+      toast.error(`Не удалось перетранскрибировать фрагмент. ${String(e)}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interviewId, selected, segments, models, asrModelId, asrLanguage, expectedSpeakers]);
+
+  // Resume a failed/crashed run from its saved checkpoint (continue, don't restart).
+  const doResume = useCallback(async () => {
+    if (!interviewId) return;
+    try {
+      await resumeTranscription(interviewId, asrLanguage, expectedSpeakers);
+    } catch (e) {
+      toast.error(`Не удалось продолжить. ${String(e)}`);
+    }
+  }, [interviewId, asrLanguage, expectedSpeakers]);
+
   // Play-from-here: seek to the segment's start AND start playback (one click). If this
   // row is already the one playing, toggle to pause instead. Highlight follows from
   // activeMs, which `onTime` keeps live during playback.
@@ -1122,6 +1183,28 @@ export function TranscriptEditorPage() {
         </div>
       </header>
 
+      {/* ── Resume banner: a prior run failed/crashed with saved progress. Offer to continue
+          from where it stopped instead of re-running the whole file. Hidden while a run is
+          live (the live view owns that state). ── */}
+      {checkpoint && !isLive && (
+        <div className="flex items-center gap-3 border-b border-status-importing/30 bg-status-importing/10 px-4 py-2">
+          <RotateCcw className="size-4 shrink-0 text-status-importing" />
+          <div className="min-w-0 flex-1 text-xs">
+            <span className="font-medium text-foreground">
+              Транскрипция прервалась на {formatTimecode(checkpoint.processed_ms)}
+            </span>
+            <span className="text-muted-foreground">
+              {" "}
+              — сохранён частичный результат. Можно продолжить с этого места.
+            </span>
+          </div>
+          <Button size="sm" onClick={doResume}>
+            <RotateCcw className="size-3.5" />
+            Продолжить
+          </Button>
+        </div>
+      )}
+
       {/* ── Two-pane resizable body ── */}
       <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
         {/* Left: media + participants. */}
@@ -1290,6 +1373,17 @@ export function TranscriptEditorPage() {
                       <ChevronDown className="size-3 opacity-70" />
                     </Button>
                   </SpeakerPicker>
+                  {/* Re-transcribe just the selected span (redo a chunk that came out wrong):
+                      whisper re-runs on [first start, last end] + the whole audio re-diarizes. */}
+                  <Button
+                    size="xs"
+                    variant="secondary"
+                    onClick={retranscribeSelection}
+                    title="Перетранскрибировать выделенный фрагмент аудио заново"
+                  >
+                    <RotateCcw className="size-3" />
+                    Перетранскрибировать
+                  </Button>
                   <Button
                     size="xs"
                     variant="ghost"
