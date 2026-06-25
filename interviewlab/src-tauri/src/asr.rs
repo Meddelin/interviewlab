@@ -1004,9 +1004,80 @@ pub async fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, String
     Ok(out)
 }
 
+// --- macOS Core ML / ANE encoder artifact (whisper `coreml` feature) --------------------
+//
+// When built with `--features metal,coreml`, whisper.cpp runs the heavy ENCODER on the Apple
+// Neural Engine — but only if a compiled CoreML bundle `ggml-<id>-encoder.mlmodelc` sits next
+// to the ggml `.bin`. Hugging Face ships it as a `.zip`; we fetch + unzip it best-effort right
+// after the `.bin` lands, so the ANE path engages with no manual placement. It is purely an
+// enhancement: a missing/failed artifact just makes whisper.cpp log a notice and fall back to
+// the Metal encoder, so this NEVER gates ASR. Compiled to a no-op off the macOS+coreml build.
+
+// The encoder bundle dir name for a model: `ggml-large-v3.bin` → `ggml-large-v3-encoder.mlmodelc`.
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn coreml_encoder_name(entry: &CatalogEntry) -> String {
+    format!("{}-encoder.mlmodelc", entry.file.trim_end_matches(".bin"))
+}
+
+// Fetch + extract the CoreML encoder bundle into `dir` (best-effort; idempotent). Blocking I/O
+// (ureq + zip) → callers run it on a spawn_blocking task.
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn fetch_coreml_encoder(dir: &std::path::Path, entry: &CatalogEntry) -> Result<(), String> {
+    use std::io::Read as _;
+    let name = coreml_encoder_name(entry);
+    let dest = dir.join(&name);
+    if dest.exists() {
+        return Ok(()); // already have the bundle
+    }
+    let url = format!("{HF_BASE}/{name}.zip");
+    let resp = ureq::get(&url).call().map_err(|e| format!("request coreml encoder: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read coreml encoder zip: {e}"))?;
+    // Extract into a staging sibling, then atomically move the bundle into place so a partial
+    // unzip never looks complete.
+    let staging = dir.join(format!("{name}.part"));
+    let _ = std::fs::remove_dir_all(&staging);
+    zip::ZipArchive::new(std::io::Cursor::new(buf))
+        .map_err(|e| format!("open coreml encoder zip: {e}"))?
+        .extract(&staging)
+        .map_err(|e| format!("extract coreml encoder zip: {e}"))?;
+    // The archive usually wraps the files in a top-level `<name>/` dir; tolerate both layouts.
+    let inner = staging.join(&name);
+    let src = if inner.is_dir() { inner } else { staging.clone() };
+    std::fs::rename(&src, &dest).map_err(|e| format!("finalize coreml encoder: {e}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+// Best-effort: fetch the CoreML encoder for `entry` into `dir`, logging the outcome. Never
+// errors out of band — the ggml `.bin` alone is enough to transcribe (Metal-encoder fallback).
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn ensure_coreml_encoder(dir: &std::path::Path, entry: &CatalogEntry) {
+    match fetch_coreml_encoder(dir, entry) {
+        Ok(()) => log::info!(
+            target: "interviewlab::asr",
+            "coreml encoder ready next to {} ({} ANE path)", entry.file, coreml_encoder_name(entry)
+        ),
+        Err(e) => log::warn!(
+            target: "interviewlab::asr",
+            "coreml encoder for '{}' not fetched ({e}); whisper.cpp will use the Metal encoder \
+             (slower but fine). hint: check network/proxy + that HF has {}.zip",
+            entry.id, coreml_encoder_name(entry)
+        ),
+    }
+}
+
+// No-op off the macOS+coreml build (other platforms have no CoreML framework).
+#[cfg(not(all(target_os = "macos", feature = "coreml")))]
+fn ensure_coreml_encoder(_dir: &std::path::Path, _entry: &CatalogEntry) {}
+
 // Download a ggml model into models/ with byte-progress events (spec §6.4). Streams to
 // a .part file then renames, so an interrupted download never leaves a half file that
-// looks complete. Runs the blocking HTTP read on a spawn_blocking task.
+// looks complete. Runs the blocking HTTP read on a spawn_blocking task. On the macOS+coreml
+// build it then fetches the matching CoreML encoder bundle so the ANE path engages.
 #[tauri::command]
 pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let entry = catalog_entry(&model_id).ok_or_else(|| format!("unknown model id: {model_id}"))?;
@@ -1014,8 +1085,12 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
     std::fs::create_dir_all(&dir).map_err(|e| format!("create models dir: {e}"))?;
     let dest = dir.join(entry.file);
     if dest.exists() {
+        // Have the weights already — still ensure the CoreML encoder bundle is present (e.g.
+        // after upgrading to a coreml build). Best-effort, off-thread; a no-op on other builds.
+        let dir2 = dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || ensure_coreml_encoder(&dir2, entry)).await;
         emit_model(&app, &model_id, 1, 1, true, None);
-        return Ok(()); // already have it
+        return Ok(()); // already have the weights
     }
     let url = format!("{HF_BASE}/{}", entry.file);
     let part = dest.with_extension("part");
@@ -1073,6 +1148,10 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
         emit_model(&app, &model_id, 0, 0, true, Some(e.clone()));
     } else {
         log::info!(target: "interviewlab::asr", "model download OK: '{model_id}' ({}) into {}", entry.file, dir.display());
+        // Weights are in place — fetch the matching CoreML encoder so the ANE path engages.
+        // Best-effort, off-thread; a no-op off the macOS+coreml build.
+        let dir2 = dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || ensure_coreml_encoder(&dir2, entry)).await;
     }
     result
 }

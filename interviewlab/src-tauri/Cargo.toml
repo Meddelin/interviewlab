@@ -108,6 +108,14 @@ sherpa-onnx = { version = "1.13.3", default-features = false, features = ["share
 # declaring them adds no new compilation — same trick as ureq.
 tar = "0.4"
 bzip2 = "0.4"
+# macOS Core ML / ANE encoder artifacts (whisper `coreml` feature): Hugging Face ships the
+# `ggml-<model>-encoder.mlmodelc` bundle as a .zip, so we unzip it next to the ggml .bin.
+# ponytail: `zip` is ALREADY in the tree (pulled by ffmpeg-sidecar), so declaring it adds zero
+# new compilation — same trick as ureq/tar/bzip2. Only used on the macOS+coreml build path.
+# default-features=false + just `deflate`: the .mlmodelc archives are deflate/stored, and pulling
+# zip's default `lzma` would drag in liblzma-sys, which conflicts with ffmpeg-sidecar's lzma-sys
+# (two crates both `links = "lzma"`). deflate keeps the link graph clean.
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Nvidia GPU detection (M4, spec §6.3): NVML reports whether an Nvidia GPU is present
 # so Settings can show the device Badge and asr decides use_gpu. Nvidia-only, so it's
