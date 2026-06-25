@@ -5,6 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  BookText,
   FileAudio,
   FileText,
   Loader2,
@@ -46,6 +47,7 @@ import {
   type InterviewRow,
   transcribeInterview,
 } from "@/lib/tauri";
+import { GlossarySuggestDialog } from "@/components/glossary-suggest-dialog";
 // dev-mock: browser-only, never active under Tauri.
 import {
   mockOnAsrProgress,
@@ -97,6 +99,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const [asrProgress, setAsrProgress] = useState<AsrState>({});
   // Live cleanup progress per interview (interview_id → percent, cleared when done).
   const [cleanProgress, setCleanProgress] = useState<AsrState>({});
+  // The interview whose glossary-suggest dialog is open (null = closed).
+  const [glossaryFor, setGlossaryFor] = useState<InterviewRow | null>(null);
   // Interviews currently in the DIARIZATION phase (after whisper hits 100%, before the row
   // flips to `transcribed`). Without this the badge sat frozen at "Transcribing 100%" for the
   // whole CPU diarization tail — now it shows a distinct "Diarizing…" phase.
@@ -555,6 +559,22 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   {s === "cleaned" ? "Re-clean" : "Clean"}
                 </Button>
               )}
+              {canClean && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy}
+                  aria-label={`Suggest glossary terms from ${row.original.title}`}
+                  className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setGlossaryFor(row.original);
+                  }}
+                >
+                  <BookText className="size-3.5" />
+                  Glossary
+                </Button>
+              )}
               {canRediarize && (
                 <Button
                   variant="ghost"
@@ -698,6 +718,15 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
           }}
         />
       )}
+
+      {/* Glossary suggestion (B/C): mine terms from an interview's transcript or the user's
+          edits and add them to the cycle's product glossary. */}
+      <GlossarySuggestDialog
+        interview={glossaryFor}
+        onOpenChange={(open) => {
+          if (!open) setGlossaryFor(null);
+        }}
+      />
     </div>
   );
 }

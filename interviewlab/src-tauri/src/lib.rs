@@ -11,6 +11,7 @@ mod cleanup;
 mod cycle;
 mod diarize;
 mod diff;
+mod glossary;
 mod guides;
 mod interview;
 mod logging;
@@ -222,6 +223,13 @@ pub fn run() {
             product::create_product,
             product::update_product,
             product::delete_product,
+            glossary::list_glossary_terms,
+            glossary::create_glossary_term,
+            glossary::update_glossary_term,
+            glossary::delete_glossary_term,
+            glossary::add_glossary_terms,
+            glossary::suggest_glossary_terms,
+            glossary::suggest_glossary_terms_from_edits,
             chat::list_chat_threads,
             chat::create_chat_thread,
             chat::rename_chat_thread,

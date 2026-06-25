@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { MarkdownEditor } from "@/components/markdown-editor";
+import { GlossaryPanel } from "@/components/glossary-panel";
 import {
   useCreateProduct,
   useDeleteProduct,
@@ -186,6 +187,10 @@ function ProductEditor({ product }: { product: Product }) {
         }}
         placeholder="Describe the product, the persona, key terms — start with a heading…"
       />
+
+      {/* Glossary: the focused term→canonical list that anchors anglicisms / tech terms /
+          product names across transcription + cleanup (docs/transcription-terminology.md). */}
+      <GlossaryPanel productId={product.id} />
     </div>
   );
 }

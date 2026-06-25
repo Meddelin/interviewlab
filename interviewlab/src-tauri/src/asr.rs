@@ -559,6 +559,20 @@ fn sanitize_initial_prompt(raw: &str) -> String {
     flattened[..end].trim_end().to_string()
 }
 
+// Combine the curated glossary's canonical terms with the product prose into one raw
+// `initial_prompt` string (sanitize_initial_prompt then flattens + hard-caps it). Glossary
+// terms lead — they're the high-value entity list we most want whisper biased toward, and
+// leading placement means they survive the cap even when the prose is long. Either side may be
+// empty (no glossary, or inline-only product context).
+fn build_initial_prompt(terms: &[crate::glossary::GlossaryTerm], product_ctx: &str) -> String {
+    let blurb = crate::glossary::render_terms_for_asr(terms, INITIAL_PROMPT_MAX_CHARS);
+    match (blurb.is_empty(), product_ctx.trim().is_empty()) {
+        (true, _) => product_ctx.to_string(),
+        (false, true) => blurb,
+        (false, false) => format!("{blurb}. {product_ctx}"),
+    }
+}
+
 // --- the blocking whisper run -------------------------------------------------
 
 // Run whisper.cpp on the given samples. Pure compute (no async, no DB) so it lives on
@@ -1024,13 +1038,20 @@ pub async fn transcribe_interview(
     let duration_ms = duration_ms_db(&db.pool, &interview_id).await.unwrap_or(None);
     let budget = std::time::Duration::from_millis(watchdog_budget_ms(duration_ms) as u64);
 
-    // Product context (Products library / req #2): resolve the interview's cycle product
-    // (linked product → content_md, falling back to inline product_desc) and feed it to
-    // whisper as the `initial_prompt` so product/brand terms transcribe correctly. Best-
-    // effort — a missing cycle/product just means no prompt (unchanged behavior).
-    let initial_prompt = product_context_for_interview_db(&db.pool, &interview_id)
+    // Product context + GLOSSARY → whisper `initial_prompt` (Products library / req #2;
+    // docs/transcription-terminology.md). We feed whisper an entity hint so brand / product /
+    // technical terms transcribe correctly. The curated glossary's CANONICAL spellings go FIRST
+    // (the highest-value entity list — biasing the ASR up-front recovers terms far better than
+    // fixing them after), then the product prose. run_whisper sanitizes + hard-caps the result.
+    // Best-effort throughout — a missing cycle/product/glossary just means a shorter (or empty)
+    // prompt (unchanged behavior).
+    let product_ctx = product_context_for_interview_db(&db.pool, &interview_id)
         .await
         .unwrap_or_default();
+    let glossary = crate::glossary::glossary_for_interview_db(&db.pool, &interview_id)
+        .await
+        .unwrap_or_default();
+    let initial_prompt = build_initial_prompt(&glossary, &product_ctx);
 
     // Serialize ASR runs (concurrency = 1). Held across the whole transcription.
     let _guard = asr_lock().lock().await;
@@ -1409,6 +1430,23 @@ mod tests {
         let long = "Слово ".repeat(400); // Cyrillic (multibyte) well past the cap
         let capped = sanitize_initial_prompt(&long);
         assert!(capped.len() <= INITIAL_PROMPT_MAX_CHARS);
+    }
+
+    // The glossary's canonical terms lead the initial_prompt (so they survive the cap), then
+    // the product prose; either side may be empty.
+    #[test]
+    fn build_initial_prompt_leads_with_glossary_terms() {
+        fn term(c: &str) -> crate::glossary::GlossaryTerm {
+            crate::glossary::GlossaryTerm {
+                id: "x".into(), product_id: "p".into(), canonical: c.into(),
+                aliases: vec![], notes: String::new(), created_at: 0, updated_at: 0,
+            }
+        }
+        let g = vec![term("API"), term("Figma")];
+        assert_eq!(build_initial_prompt(&g, "Acme Analytics"), "API, Figma. Acme Analytics");
+        assert_eq!(build_initial_prompt(&g, "   "), "API, Figma", "no prose → just the terms");
+        assert_eq!(build_initial_prompt(&[], "Acme Analytics"), "Acme Analytics", "no glossary → just the prose");
+        assert_eq!(build_initial_prompt(&[], ""), "", "neither → empty");
     }
 
     // Product context resolves through the interview → cycle → effective product chain

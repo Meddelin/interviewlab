@@ -137,8 +137,10 @@ fn guidelines_for(language: Option<&str>) -> String {
          - Never TRANSLATE a term the speaker chose (don't turn «churn» into «отток» or «отток» into «churn») — \
            keep their word, just spell it canonically.\n\
          - Spell each term CONSISTENTLY — pick one form per term and use it every time.\n\
-         When product/glossary context is provided below, treat ITS spelling of any product, brand, or domain \
-         term as the AUTHORITY — it overrides the rules above."
+         When a `glossary` is provided below, it is the AUTHORITY: each entry maps a `canonical` spelling to \
+         the variant/garbled `aliases` the ASR produces — wherever the text contains a term (in any of its \
+         alias forms), rewrite it to that entry's canonical spelling. The `product_desc` context is a secondary \
+         authority for any product/brand/domain term not in the glossary. Both override the general rules above."
     )
 }
 
@@ -175,6 +177,7 @@ fn output_schema() -> Value {
 fn build_batch_input(
     language: Option<&str>,
     product_desc: &str,
+    glossary: &Value,
     ids: &[usize],
     batch: &[Segment],
 ) -> Value {
@@ -198,7 +201,8 @@ fn build_batch_input(
         "instructions": "Return ONLY a JSON object {\"segments\":[{\"id\":<int>,\"text\":<cleaned string>}, …]}. \
                          Include EVERY input segment id exactly once. Change ONLY the text — apply the \
                          `guidelines` (grammar, filler, and the English-terms / anglicism normalization), \
-                         using `product_desc` as the glossary for product/brand/domain spellings. Do not add, \
+                         using the `glossary` (term→canonical, with aliases) as the AUTHORITY for term \
+                         spellings and `product_desc` for any other product/brand/domain term. Do not add, \
                          drop, merge, split, reorder, or translate segments.",
         "segments": segments
     });
@@ -206,6 +210,11 @@ fn build_batch_input(
     // doesn't bloat the prompt. The model uses it to normalize product/brand terms.
     if !product_desc.trim().is_empty() {
         input["product_desc"] = json!(product_desc.trim());
+    }
+    // Curated glossary (the entity phrase-list): the strongest lever for term consistency +
+    // recovery. Only included when non-empty so an empty glossary stays out of the prompt.
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
     }
     input
 }
@@ -480,6 +489,7 @@ async fn clean_one_batch(
     adapter: &crate::adapter::Adapter,
     language: Option<&str>,
     product_desc: &str,
+    glossary: &Value,
     ids: &[usize],
     raw: &[Segment],
     // The user's per-bucket model override (None → the plugin's manifest default).
@@ -489,7 +499,7 @@ async fn clean_one_batch(
     // let the caller fall back to batching.
     max_attempts: usize,
 ) -> Result<Vec<Segment>, String> {
-    let input = build_batch_input(language, product_desc, ids, raw);
+    let input = build_batch_input(language, product_desc, glossary, ids, raw);
     let schema = output_schema();
 
     let attempts = max_attempts.max(1);
@@ -575,6 +585,7 @@ async fn clean_segments(
     adapter: &crate::adapter::Adapter,
     language: Option<&str>,
     product_desc: &str,
+    glossary: &Value,
     raw: &[Segment],
     // The user's per-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
@@ -594,7 +605,7 @@ async fn clean_segments(
             emit_cleanup(app, interview_id, STATUS_CLEANING, 0, 1, None);
         }
         let all_ids: Vec<usize> = (0..total).collect();
-        match clean_one_batch(adapter, language, product_desc, &all_ids, raw, model_override, 1).await {
+        match clean_one_batch(adapter, language, product_desc, glossary, &all_ids, raw, model_override, 1).await {
             Ok(cleaned) => {
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, 1, 1, None);
@@ -641,7 +652,7 @@ async fn clean_segments(
         let wave_futs = wave.iter().map(|(b, ids, chunk)| {
             let done = &done;
             async move {
-                let res = clean_one_batch(adapter, language, product_desc, ids, chunk, model_override, 2).await;
+                let res = clean_one_batch(adapter, language, product_desc, glossary, ids, chunk, model_override, 2).await;
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, completed, total_batches, None);
@@ -796,6 +807,17 @@ pub async fn clean_transcript(
         }
     };
 
+    // Curated glossary (docs/transcription-terminology.md): the focused term→canonical list for
+    // the interview's product, rendered as the entity phrase-list. It's the AUTHORITY for term
+    // spellings and the only thing that guarantees the SAME term is spelled the same way across
+    // independent batches. Best-effort: a missing/empty glossary just yields `[]` (omitted from
+    // the prompt) — cleanup never gates on it.
+    let glossary = crate::glossary::render_for_prompt(
+        &crate::glossary::glossary_for_interview_db(&db.pool, &interview_id)
+            .await
+            .unwrap_or_default(),
+    );
+
     // Capture the status BEFORE we flip to `cleaning`, so a failed cleanup can restore it. The
     // raw/cleaned transcript is intact — cleanup is an enrichment, not the interview's terminal
     // state — so a failure must NOT mark the whole interview `error` (that locked the user out of a
@@ -821,7 +843,7 @@ pub async fn clean_transcript(
         model_override.as_deref().unwrap_or("<plugin-default>"),
         adapter.id
     );
-    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &raw, model_override.as_deref()).await {
+    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &glossary, &raw, model_override.as_deref()).await {
         Ok(cleaned) => {
             let tid = store_cleaned_db(&db.pool, &interview_id, lang, &cleaned).await.map_err(|e| {
                 log::error!(target: "interviewlab::cleanup", "[E-CLEAN-STORE] clean_transcript: interview '{interview_id}': cleaned OK but STORING failed: {e}");
@@ -866,21 +888,25 @@ pub async fn clean_transcript(
 // Build the single-segment rewrite input. Mirrors build_batch_input's fields (so the model sees
 // the same guidelines + product glossary) but carries ONE `text` instead of a `segments` array,
 // and asks for a plain-text reply rather than a JSON envelope.
-fn build_rewrite_input(language: Option<&str>, product_desc: &str, text: &str) -> Value {
+fn build_rewrite_input(language: Option<&str>, product_desc: &str, glossary: &Value, text: &str) -> Value {
     let mut input = json!({
         "task": "transcript-cleanup",
         "language": language.unwrap_or("auto"),
         "guidelines": guidelines_for(language),
         "instructions": "Rewrite the ONE segment in `text` per `guidelines` (grammar, filler, the \
-                         English-terms / anglicism normalization), using `product_desc` as the \
-                         glossary for product/brand/domain spellings. Return ONLY the corrected \
-                         text as plain text — do NOT translate, summarize, add, drop, or invent \
-                         anything, and do NOT guess at unclear spans (keep them close to the \
+                         English-terms / anglicism normalization), using the `glossary` \
+                         (term→canonical, with aliases) as the AUTHORITY for term spellings and \
+                         `product_desc` for any other product/brand/domain term. Return ONLY the \
+                         corrected text as plain text — do NOT translate, summarize, add, drop, or \
+                         invent anything, and do NOT guess at unclear spans (keep them close to the \
                          original). If it's already clean, return it unchanged.",
         "text": text,
     });
     if !product_desc.trim().is_empty() {
         input["product_desc"] = json!(product_desc.trim());
+    }
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
     }
     input
 }
@@ -926,16 +952,21 @@ pub async fn rewrite_segment(
         e
     })?;
 
-    // Product context (same source as cleanup) — best-effort.
+    // Product context + glossary (same sources as whole-transcript cleanup) — best-effort.
     let product_desc = product_context_for_interview_db(&db.pool, &interview_id)
         .await
         .unwrap_or_default();
+    let glossary = crate::glossary::render_for_prompt(
+        &crate::glossary::glossary_for_interview_db(&db.pool, &interview_id)
+            .await
+            .unwrap_or_default(),
+    );
 
     // The user's per-bucket model override (None → the plugin's per-task default — for Claude
     // Code that's `haiku`, matching whole-transcript cleanup).
     let model_override = crate::adapter::task_model_override(&db.pool, "transcript-cleanup").await;
 
-    let input = build_rewrite_input(language.as_deref(), &product_desc, original);
+    let input = build_rewrite_input(language.as_deref(), &product_desc, &glossary, original);
     let cleaned = crate::adapter::run_cli_task_text(
         &adapter,
         "transcript-cleanup",
@@ -1073,7 +1104,7 @@ mod tests {
     fn batch_input_carries_ids_and_language() {
         let raw = raw3();
         let ids = vec![10usize, 11, 12];
-        let input = build_batch_input(Some("ru"), "", &ids, &raw);
+        let input = build_batch_input(Some("ru"), "", &json!([]), &ids, &raw);
         assert_eq!(input["language"], "ru");
         let g = input["guidelines"].as_str().unwrap();
         assert!(g.contains("translate")); // the no-translate rule survives
@@ -1092,35 +1123,56 @@ mod tests {
         let raw = raw3();
         let ids = vec![0usize, 1, 2];
         let product = "Acme Analytics — funnels + retention; the product is called 'Acme'.";
-        let with = build_batch_input(Some("ru"), product, &ids, &raw);
+        let with = build_batch_input(Some("ru"), product, &json!([]), &ids, &raw);
         assert_eq!(
             with["product_desc"], product,
             "product context flows into the cleanup prompt"
         );
 
         // Empty product context is omitted from the prompt (kept lean).
-        let without = build_batch_input(Some("ru"), "   ", &ids, &raw);
+        let without = build_batch_input(Some("ru"), "   ", &json!([]), &ids, &raw);
         assert!(
             without.get("product_desc").is_none(),
             "empty product context is not added to the prompt"
         );
     }
 
+    // The curated glossary (entity phrase-list) is carried into the cleanup prompt when present
+    // and omitted (kept lean) when empty.
+    #[test]
+    fn batch_input_includes_glossary_when_present() {
+        let raw = raw3();
+        let ids = vec![0usize, 1, 2];
+        let glossary = json!([{ "canonical": "API", "aliases": ["эй-пи-ай", "апишка"] }]);
+        let with = build_batch_input(Some("ru"), "", &glossary, &ids, &raw);
+        assert_eq!(with["glossary"], glossary, "glossary flows into the cleanup prompt");
+        assert!(
+            with["instructions"].as_str().unwrap().contains("glossary"),
+            "instructions point the model at the glossary"
+        );
+
+        let without = build_batch_input(Some("ru"), "", &json!([]), &ids, &raw);
+        assert!(without.get("glossary").is_none(), "empty glossary is omitted");
+    }
+
     // The per-segment rewrite input carries ONE `text` (not a segments array) plus the same
     // guidelines, and folds in product context only when present.
     #[test]
     fn rewrite_input_carries_single_text_and_guidelines() {
-        let input = build_rewrite_input(Some("ru"), "Acme Analytics", "ну вот эээ заказы");
+        let glossary = json!([{ "canonical": "Jira", "aliases": ["джира"] }]);
+        let input = build_rewrite_input(Some("ru"), "Acme Analytics", &glossary, "ну вот эээ заказы");
         assert_eq!(input["language"], "ru");
         assert_eq!(input["text"], "ну вот эээ заказы");
         assert!(input.get("segments").is_none(), "rewrite is single-segment, no array");
         let g = input["guidelines"].as_str().unwrap();
         assert!(g.contains("translate")); // the no-translate rule is present
         assert_eq!(input["product_desc"], "Acme Analytics");
+        assert_eq!(input["glossary"], glossary, "glossary flows into the rewrite prompt");
 
-        // Empty product context is omitted (kept lean), like the batch path.
-        let without = build_rewrite_input(Some("ru"), "   ", "текст");
+        // Empty product context + glossary are omitted (kept lean), like the batch path.
+        let without = build_rewrite_input(Some("ru"), "   ", &json!([]), "текст");
         assert!(without.get("product_desc").is_none());
+        assert!(without.get("glossary").is_none());
     }
 
     // The schema is well-formed JSON-Schema with the required segments/id/text shape.
@@ -1303,7 +1355,7 @@ mod tests {
 
         let total_batches = raw.len().div_ceil(BATCH_SIZE);
         let started = std::time::Instant::now();
-        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &raw, None)
+        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &json!([]), &raw, None)
             .await
             .expect("real parallel cleanup should succeed");
         let elapsed = started.elapsed();
@@ -1368,7 +1420,7 @@ mod tests {
             Segment { start_ms: 40200, end_ms: 45000, speaker_label: "S2".into(), text: "ну наверное когда сам разберусь чтобы было что показать коллегам понимаете".into() },
         ];
 
-        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &raw, None)
+        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &json!([]), &raw, None)
             .await
             .expect("real cleanup should succeed");
 
@@ -1486,7 +1538,7 @@ mod tests {
             if has_cleaned.is_none() {
                 set_status_db(&pool, iv, STATUS_CLEANING).await.unwrap();
                 println!("cleaning {iv}: {} segments via claude ...", raw.len());
-                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &raw, None)
+                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &json!([]), &raw, None)
                     .await
                     .expect("real cleanup should succeed");
                 assert_eq!(cleaned.len(), raw.len(), "segment count preserved for {iv}");
