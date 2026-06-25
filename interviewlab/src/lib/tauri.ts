@@ -514,6 +514,23 @@ export function cleanTranscript(
   });
 }
 
+// Rewrite ONE transcript segment's text via the CLI ("хуйня, переписывай"). Sends just this
+// segment's text and gets back PLAIN TEXT — the simplest shape, far less prone to the
+// hallucination the whole-transcript JSON-echo cleanup invites. Resolves with the cleaned text
+// (or the original unchanged when the model returns nothing usable). Stateless server-side: the
+// editor applies the result to its local buffer and persists it on Save (the `edited` version).
+export function rewriteSegment(
+  interviewId: string,
+  text: string,
+  adapterId?: string,
+): Promise<string> {
+  return invoke<string>("rewrite_segment", {
+    interviewId,
+    text,
+    adapterId: adapterId ?? null,
+  });
+}
+
 // --- Cycle synthesis (Milestone 8, spec §8 / §7.3.2) --------------------------
 // The cycle's guide is parsed into stable GOALS; a map-reduce over the role-labeled
 // transcripts produces findings tied to goal_ids, each with evidence quotes. The Rust

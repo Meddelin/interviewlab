@@ -853,6 +853,110 @@ pub async fn clean_transcript(
     }
 }
 
+// --- per-segment rewrite (the "хуйня, переписывай" button) --------------------
+//
+// Whole-transcript cleanup forces the model to echo an {id,text} envelope for EVERY segment;
+// on long transcripts that JSON-echo contract is where most hallucination creeps in (the model
+// drifts, invents, or "tidies" spans it shouldn't). The per-segment rewrite is the antidote:
+// the user hits "rewrite" on ONE segment, we send just that segment's text and get back PLAIN
+// TEXT — the simplest possible shape — which the model handles far more faithfully. The result
+// updates the editor's local buffer; the user saves it into the `edited` version like any edit.
+// No timing/speaker/count invariants to enforce here: a single segment in, a single string out.
+
+// Build the single-segment rewrite input. Mirrors build_batch_input's fields (so the model sees
+// the same guidelines + product glossary) but carries ONE `text` instead of a `segments` array,
+// and asks for a plain-text reply rather than a JSON envelope.
+fn build_rewrite_input(language: Option<&str>, product_desc: &str, text: &str) -> Value {
+    let mut input = json!({
+        "task": "transcript-cleanup",
+        "language": language.unwrap_or("auto"),
+        "guidelines": guidelines_for(language),
+        "instructions": "Rewrite the ONE segment in `text` per `guidelines` (grammar, filler, the \
+                         English-terms / anglicism normalization), using `product_desc` as the \
+                         glossary for product/brand/domain spellings. Return ONLY the corrected \
+                         text as plain text — do NOT translate, summarize, add, drop, or invent \
+                         anything, and do NOT guess at unclear spans (keep them close to the \
+                         original). If it's already clean, return it unchanged.",
+        "text": text,
+    });
+    if !product_desc.trim().is_empty() {
+        input["product_desc"] = json!(product_desc.trim());
+    }
+    input
+}
+
+// Rewrite a SINGLE transcript segment's text via the CLI, returning the cleaned plain text.
+// Stateless: it does NOT touch the DB transcript rows — the editor applies the returned text to
+// its local buffer and persists it on Save (as the `edited` version). Language is sourced from
+// the raw transcript; product context from the cycle's product. Best-effort throughout: a failed
+// lookup just means less context, never a hard error. Returns the original text unchanged when
+// the model gives back nothing usable (never blanks a segment).
+#[tauri::command]
+pub async fn rewrite_segment(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    interview_id: String,
+    text: String,
+    adapter_id: Option<String>,
+) -> Result<String, String> {
+    let original = text.trim();
+    if original.is_empty() {
+        return Ok(String::new());
+    }
+    log::info!(
+        target: "interviewlab::cleanup",
+        "rewrite_segment: interview '{interview_id}' ({} chars, adapter override: {adapter_id:?})",
+        original.chars().count()
+    );
+
+    // Language from the raw transcript (best-effort: None → the model auto-detects).
+    let language = raw_source_db(&db.pool, &interview_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(lang, _)| lang);
+
+    // Resolve the adapter (explicit id → that one; else the active one).
+    let id = match adapter_id {
+        Some(id) => id,
+        None => crate::adapter::active_adapter_id(&db.pool).await?,
+    };
+    let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id)).map_err(|e| {
+        log::error!(target: "interviewlab::cleanup", "rewrite_segment: could not resolve adapter '{id}': {e}");
+        e
+    })?;
+
+    // Product context (same source as cleanup) — best-effort.
+    let product_desc = product_context_for_interview_db(&db.pool, &interview_id)
+        .await
+        .unwrap_or_default();
+
+    // The user's per-bucket model override (None → the plugin's per-task default — for Claude
+    // Code that's `haiku`, matching whole-transcript cleanup).
+    let model_override = crate::adapter::task_model_override(&db.pool, "transcript-cleanup").await;
+
+    let input = build_rewrite_input(language.as_deref(), &product_desc, original);
+    let cleaned = crate::adapter::run_cli_task_text(
+        &adapter,
+        "transcript-cleanup",
+        &input,
+        model_override.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        log::error!(target: "interviewlab::cleanup", "rewrite_segment: interview '{interview_id}': CLI failed: {e}");
+        e.to_string()
+    })?;
+
+    let cleaned = cleaned.trim();
+    // Never blank a segment: if the model returned nothing usable, keep the original.
+    Ok(if cleaned.is_empty() {
+        original.to_string()
+    } else {
+        cleaned.to_string()
+    })
+}
+
 // --- tests --------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1000,6 +1104,23 @@ mod tests {
             without.get("product_desc").is_none(),
             "empty product context is not added to the prompt"
         );
+    }
+
+    // The per-segment rewrite input carries ONE `text` (not a segments array) plus the same
+    // guidelines, and folds in product context only when present.
+    #[test]
+    fn rewrite_input_carries_single_text_and_guidelines() {
+        let input = build_rewrite_input(Some("ru"), "Acme Analytics", "ну вот эээ заказы");
+        assert_eq!(input["language"], "ru");
+        assert_eq!(input["text"], "ну вот эээ заказы");
+        assert!(input.get("segments").is_none(), "rewrite is single-segment, no array");
+        let g = input["guidelines"].as_str().unwrap();
+        assert!(g.contains("translate")); // the no-translate rule is present
+        assert_eq!(input["product_desc"], "Acme Analytics");
+
+        // Empty product context is omitted (kept lean), like the batch path.
+        let without = build_rewrite_input(Some("ru"), "   ", "текст");
+        assert!(without.get("product_desc").is_none());
     }
 
     // The schema is well-formed JSON-Schema with the required segments/id/text shape.

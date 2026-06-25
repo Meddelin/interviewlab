@@ -22,6 +22,7 @@ import {
   Sparkles,
   Trash2,
   Users,
+  Wand2,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -76,7 +77,7 @@ import type {
   ParticipantInput,
   Segment,
 } from "@/lib/tauri";
-import { CLEANUP_PROGRESS_EVENT, IN_TAURI } from "@/lib/tauri";
+import { CLEANUP_PROGRESS_EVENT, IN_TAURI, rewriteSegment } from "@/lib/tauri";
 import { mockAudioSrc, mockOnCleanupProgress } from "@/lib/dev-mock";
 import { formatTimecode } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -362,18 +363,26 @@ function SegmentLine({
   active,
   playing,
   selected,
+  canRewrite,
+  rewriting,
   onPlay,
   onText,
   onToggleSelect,
+  onRewrite,
 }: {
   segment: Segment;
   index: number;
   active: boolean;
   playing: boolean;
   selected: boolean;
+  // Whether the per-segment rewrite button is available (an editable version is shown).
+  canRewrite: boolean;
+  // This row's rewrite is in flight (the CLI is cleaning just this segment).
+  rewriting: boolean;
   onPlay: () => void;
   onText: (text: string) => void;
   onToggleSelect: (e: React.MouseEvent) => void;
+  onRewrite: () => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -477,6 +486,33 @@ function SegmentLine({
           )}
           {formatTimecode(segment.start_ms)}
         </button>
+
+        {/* Per-segment rewrite ("хуйня, переписывай"): re-clean JUST this segment via the CLI
+            and swap in the plain-text result. The antidote to whole-transcript hallucination —
+            one segment in, one clean string out. Quiet at rest, brightens on row hover; shows a
+            spinner while its own request is in flight. Disabled when no editable version is open. */}
+        {canRewrite && (
+          <button
+            type="button"
+            onClick={onRewrite}
+            disabled={rewriting}
+            title="хуйня, переписывай — переписать этот сегмент"
+            aria-label={`Rewrite segment ${index + 1}`}
+            className={cn(
+              "group/rw flex w-fit items-center gap-1 rounded-md px-1 py-0.5 -ml-1 text-[11px] transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
+              rewriting
+                ? "text-primary"
+                : "text-muted-foreground/50 opacity-60 group-hover/seg:opacity-100 hover:bg-secondary/60 hover:text-primary focus-visible:text-primary",
+            )}
+          >
+            {rewriting ? (
+              <Loader2 className="size-3 shrink-0 animate-spin" />
+            ) : (
+              <Wand2 className="size-3 shrink-0" />
+            )}
+            <span>{rewriting ? "Переписываю…" : "Переписать"}</span>
+          </button>
+        )}
       </div>
 
       {/* Editable text. ponytail: pencil icon REMOVED — instead the field itself clearly
@@ -523,10 +559,13 @@ function TurnBlock({
   activeIndex,
   isPlaying,
   selected,
+  canRewrite,
+  rewritingIndex,
   onAssignTurn,
   onPlay,
   onText,
   onToggleSelect,
+  onRewrite,
 }: {
   turn: { speakerLabel: string; startMs: number; segmentIndices: number[] };
   segments: Segment[];
@@ -538,10 +577,14 @@ function TurnBlock({
   activeIndex: number;
   isPlaying: boolean;
   selected: Set<number>;
+  // Whether per-segment rewrite is available, and which segment index is currently rewriting.
+  canRewrite: boolean;
+  rewritingIndex: number | null;
   onAssignTurn: (label: string) => void;
   onPlay: (index: number) => void;
   onText: (index: number, text: string) => void;
   onToggleSelect: (index: number, e: React.MouseEvent) => void;
+  onRewrite: (index: number) => void;
 }) {
   return (
     <div className="flex flex-col gap-0.5 py-1.5">
@@ -582,9 +625,12 @@ function TurnBlock({
             active={i === activeIndex}
             playing={isPlaying && i === activeIndex}
             selected={selected.has(i)}
+            canRewrite={canRewrite}
+            rewriting={rewritingIndex === i}
             onPlay={() => onPlay(i)}
             onText={(t) => onText(i, t)}
             onToggleSelect={(e) => onToggleSelect(i, e)}
+            onRewrite={() => onRewrite(i)}
           />
         ))}
       </div>
@@ -682,6 +728,9 @@ export function TranscriptEditorPage() {
   // is the last row clicked, so Shift-click can extend a contiguous range from it. ──
   const [selected, setSelected] = useState<Set<number>>(() => new Set());
   const [anchor, setAnchor] = useState<number | null>(null);
+  // Which segment index is currently being rewritten via the per-segment "хуйня, переписывай"
+  // button (null = none in flight). One at a time keeps it obvious + cheap on the CLI.
+  const [rewritingIndex, setRewritingIndex] = useState<number | null>(null);
   // Which right-pane view is shown: the transcript segments or the per-interview Summary
   // artifact (Milestone 10b).
   const [pane, setPane] = useState<"transcript" | "summary">("transcript");
@@ -816,6 +865,35 @@ export function TranscriptEditorPage() {
     setSegments((prev) => prev.map((s, i) => (i === index ? { ...s, text } : s)));
     setDirty(true);
   }
+
+  // Per-segment rewrite ("хуйня, переписывай"): re-clean JUST this one segment via the CLI and
+  // swap in the plain-text result. This is the per-segment alternative to whole-transcript
+  // cleanup — it sends only this segment's text, so the model has nothing to drift across and
+  // hallucinates far less. One at a time; the result lands in the local buffer (Save persists it).
+  const rewriteSegmentAt = useCallback(
+    async (index: number) => {
+      if (!interviewId || rewritingIndex !== null) return;
+      const original = segments[index]?.text ?? "";
+      if (!original.trim()) return;
+      setRewritingIndex(index);
+      try {
+        const cleaned = await rewriteSegment(interviewId, original);
+        const next = cleaned.trim();
+        if (next && next !== original.trim()) {
+          setText(index, next);
+          toast.success("Сегмент переписан");
+        } else {
+          toast("Без изменений");
+        }
+      } catch (e) {
+        toast.error(`Не удалось переписать. ${String(e)}`);
+      } finally {
+        setRewritingIndex(null);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [interviewId, rewritingIndex, segments],
+  );
 
   // ── Selection helpers (multi-select + bulk assign) ──
   // Toggle/extend the selection from a row's checkbox click, honoring modifiers:
@@ -1181,12 +1259,15 @@ export function TranscriptEditorPage() {
                         activeIndex={activeIndex}
                         isPlaying={isPlaying}
                         selected={selected}
+                        canRewrite={editable}
+                        rewritingIndex={rewritingIndex}
                         onAssignTurn={(label) =>
                           assignTurn(turn.segmentIndices, label)
                         }
                         onPlay={(i) => playSegment(i, segments[i])}
                         onText={(i, t) => setText(i, t)}
                         onToggleSelect={(i, e) => toggleSelect(i, e)}
+                        onRewrite={(i) => rewriteSegmentAt(i)}
                       />
                     );
                   })}

@@ -945,6 +945,27 @@ fn render_prompt(task_name: &str, input_json: &Value, output_schema: Option<&Val
     p
 }
 
+// Render the prompt for a PLAIN-TEXT task (the per-segment rewrite, run_cli_task_text). Unlike
+// render_prompt this does NOT demand a JSON object — the contract is "return ONLY the rewritten
+// text" — because for a single segment a free-form string is the simplest, most robust shape and
+// the model hallucinates far less than when forced to echo an {id,text,…} envelope. The input's
+// own `guidelines`/`instructions`/`text` carry the task detail; we just nail down the output form.
+fn render_prompt_text(task_name: &str, input_json: &Value) -> String {
+    let mut p = String::new();
+    p.push_str(&format!(
+        "You are running the InterviewLab `{task_name}` task. The input JSON is provided on stdin. "
+    ));
+    p.push_str(
+        "Respond with ONLY the rewritten text as PLAIN TEXT — no JSON, no quotes, no markdown, no \
+         code fences, no labels, no explanation. Output just the corrected text and nothing else. \
+         Follow the input's `guidelines` and `instructions`; rewrite ONLY the `text` field.\n",
+    );
+    // Inline the input too (stdin stays the primary channel for the payload).
+    p.push_str("\nInput:\n");
+    p.push_str(&serde_json::to_string(input_json).unwrap_or_else(|_| "{}".into()));
+    p
+}
+
 // --- runner (spec §7.2) -------------------------------------------------------
 
 // Typed task errors (spec: "treats non-zero exit / parse failure as a clear typed
@@ -1118,6 +1139,28 @@ fn extract_result(
         // Some CLIs may already nest an object there.
         other => Ok(other.clone()),
     }
+}
+
+// Like extract_result but for a PLAIN-TEXT task (run_cli_task_text): pull the model's free-form
+// text answer out of the CLI envelope WITHOUT JSON-parsing it. The `result` field of a
+// `claude --output-format json` envelope already holds the assistant's final text; we return it
+// verbatim (a non-string payload is stringified), stripping any stray markdown code fence the
+// model may have wrapped it in. Never used with a schema, so used_schema is always false here.
+fn extract_result_text(adapter: &Adapter, stdout: &str) -> Result<String, String> {
+    let rx = &adapter.io_or_err()?.result_extract;
+    if rx.format == "raw" {
+        return Ok(strip_code_fence(stdout.trim()).trim().to_string());
+    }
+    let field = if rx.json_path.is_empty() { "result" } else { rx.json_path.as_str() };
+    let envelope = parse_envelope(stdout, field, false)?;
+    let raw = envelope
+        .get(field)
+        .ok_or_else(|| format!("envelope has no `{field}` field"))?;
+    let s = match raw {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    Ok(strip_code_fence(s.trim()).trim().to_string())
 }
 
 // Parse the CLI's stdout into the result envelope. Two shapes are accepted:
@@ -1459,6 +1502,102 @@ pub async fn run_cli_task_model(
     }
     // Unreachable (loop always returns), but satisfy the type checker.
     Err(TaskError::new("parse", last_parse_err.unwrap_or_else(|| "parse failed".into())))
+}
+
+// Run a task expecting a PLAIN-TEXT reply (no JSON schema), returning the model's text answer
+// verbatim. This powers the per-segment "rewrite" tool: cleaning ONE segment at a time with a
+// free-form string output is far more robust against hallucination than the whole-transcript
+// JSON-echo contract (run_cli_task_model), which forces the model to re-emit every {id,text}.
+// The model is resolved the same way (user override → plugin per-task default → CLI default);
+// no `--json-schema` is ever injected. One retry on an empty/unparseable reply, then a typed
+// error. Trims the result; an empty reply is surfaced as a parse error (the caller keeps the
+// original text rather than blanking the segment).
+pub async fn run_cli_task_text(
+    adapter: &Adapter,
+    task_name: &str,
+    input_json: &Value,
+    model_override: Option<&str>,
+) -> Result<String, TaskError> {
+    let spec = adapter
+        .tasks
+        .get(task_name)
+        .ok_or_else(|| TaskError::new("config", format!("adapter `{}` has no task `{task_name}`", adapter.id)))?;
+
+    let prompt = render_prompt_text(task_name, input_json);
+    // Same model resolution as run_cli_task_model: user override, else the plugin's per-task default.
+    let model = model_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task_name).cloned()));
+    let model_flag = adapter
+        .models
+        .as_ref()
+        .map(|m| m.flag.clone())
+        .unwrap_or_else(|| "--model".into());
+    // No schema, ever: plain-text output. inject_schema=false keeps `--json-schema` off the args.
+    let args = build_args(spec, &prompt, None, model.as_deref(), &model_flag, false);
+    let payload = serde_json::to_vec(input_json).map_err(|e| {
+        TaskError::new(
+            "config",
+            format!("could not serialize the `{task_name}` input JSON to send to the CLI: {e}"),
+        )
+    })?;
+
+    log::info!(
+        target: "interviewlab::adapter",
+        "run text task='{task_name}' adapter='{}' model={} payload_bytes={}",
+        adapter.id,
+        model.as_deref().unwrap_or("<cli-default>"),
+        payload.len()
+    );
+
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        let (stdout, stderr) = spawn_once(adapter, &args, &payload).await.map_err(|e| {
+            log::error!(
+                target: "interviewlab::adapter",
+                "text task='{task_name}' adapter='{}' aborted on attempt {}/2 ({} error): {}",
+                adapter.id, attempt + 1, e.kind, e.message
+            );
+            e
+        })?;
+        match extract_result_text(adapter, &stdout) {
+            Ok(s) if !s.trim().is_empty() => return Ok(s),
+            Ok(_) => {
+                last_err = Some("CLI returned an empty text reply".to_string());
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+        if attempt == 0 {
+            log::warn!(
+                target: "interviewlab::adapter",
+                "text task='{task_name}' adapter='{}' got no usable text ({}); retrying once.\n  stdout(head): {}",
+                adapter.id,
+                last_err.as_deref().unwrap_or("?"),
+                crate::logging::truncate(stdout.trim(), 2000)
+            );
+            continue;
+        }
+        let err = TaskError::with_stderr(
+            "parse",
+            format!(
+                "the `{task_name}` CLI returned no usable plain-text output after a retry: {}",
+                last_err.as_deref().unwrap_or("unknown")
+            ),
+            if stderr.trim().is_empty() { stdout.clone() } else { stderr.clone() },
+        );
+        log::error!(
+            target: "interviewlab::adapter",
+            "[E-CLI-TEXT] text task='{task_name}' adapter='{}': {}\n  stdout: {}",
+            adapter.id,
+            last_err.as_deref().unwrap_or("?"),
+            crate::logging::truncate(stdout.trim(), 4000)
+        );
+        return Err(err);
+    }
+    Err(TaskError::new("parse", last_err.unwrap_or_else(|| "text task failed".into())))
 }
 
 // --- "Test CLI" probe (spec §4.4 / §7.2) --------------------------------------
@@ -2146,6 +2285,25 @@ mod tests {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"ok\":true}","session_id":"x","total_cost_usd":0.04}"#;
         let v = extract_result(&a, stdout, false).unwrap();
         assert_eq!(v, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn extract_result_text_pulls_plain_result_string() {
+        // The per-segment rewrite path: `result` is the model's FREE-FORM text (not JSON). The
+        // text extractor returns it verbatim, NOT trying to JSON-parse it.
+        let a = builtin_adapter();
+        let stdout = r#"{"type":"result","is_error":false,"result":"Я обычно захожу и сразу смотрю заказы.","session_id":"x"}"#;
+        let s = extract_result_text(&a, stdout).unwrap();
+        assert_eq!(s, "Я обычно захожу и сразу смотрю заказы.");
+    }
+
+    #[test]
+    fn extract_result_text_strips_code_fence() {
+        // A model that wraps its plain-text answer in a stray ``` fence still yields clean text.
+        let a = builtin_adapter();
+        let stdout = "{\"result\":\"```\\nИсправленный текст.\\n```\"}";
+        let s = extract_result_text(&a, stdout).unwrap();
+        assert_eq!(s, "Исправленный текст.");
     }
 
     #[test]
