@@ -2027,7 +2027,9 @@ name = "interviewlab"
 version = "0.1.0"
 dependencies = [
  "bzip2",
+ "chrono",
  "ffmpeg-sidecar",
+ "log",
  "nvml-wrapper",
  "serde",
  "serde_json",

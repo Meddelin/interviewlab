@@ -59,6 +59,13 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Centralized logging (src/logging.rs): the `log` facade + `chrono` for timestamps.
+# ponytail: BOTH are already in the dependency tree transitively (tauri/sqlx pull
+# `log`; sherpa/tauri pull `chrono`), so declaring them adds ZERO new compilation —
+# same trick as ureq/tar/bzip2. We implement our own `log::Log` sink (tee stderr +
+# rolling file) rather than pulling tauri-plugin-log (a brand-new dep tree).
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # DB: sqlx + SQLite, Tokio runtime, compile-time migrations (spec §5.3).
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 # process/io-util/time: drive the local AI CLI adapter (M6, spec §7) via

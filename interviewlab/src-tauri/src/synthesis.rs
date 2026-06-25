@@ -1336,10 +1336,32 @@ async fn extract_one(
 
     // The model comes from the user override or the plugin's per-task manifest default
     // (for Claude Code, `sonnet` — good reasoning, faster than the heavy default).
+    // NOTE: a MAP-stage failure is non-fatal (one interview contributing no points must not
+    // sink the whole cycle synthesis), so we degrade to an empty extraction — but we LOG it
+    // loudly, because silently dropping an interview's evidence is exactly the kind of thing
+    // a debugging agent needs to see (the reduce will be missing this interview's points).
     let output = match crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-extract", &input, Some(&schema), model_override).await
     {
-        Ok(value) => serde_json::from_value::<ExtractOutput>(value).unwrap_or_default(),
-        Err(_) => ExtractOutput::default(),
+        Ok(value) => match serde_json::from_value::<ExtractOutput>(value.clone()) {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!(
+                    target: "interviewlab::synthesis",
+                    "[E-SYN-EXTRACT] extract: interview='{}' ('{}') returned an unparseable shape — dropping its points: {e}. Got: {}",
+                    interview.id, interview.title,
+                    crate::logging::truncate(&value.to_string(), 1500)
+                );
+                ExtractOutput::default()
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                target: "interviewlab::synthesis",
+                "[E-SYN-EXTRACT] extract: interview='{}' ('{}') CLI call FAILED — this interview contributes NO points to the synthesis: {e}",
+                interview.id, interview.title
+            );
+            ExtractOutput::default()
+        }
     };
 
     let extraction = InterviewExtraction {
@@ -1370,10 +1392,25 @@ async fn reduce(
     // (for Claude Code, `sonnet` — cross-interview synthesis, reasoning-heavy).
     let value = crate::adapter::run_cli_task_model(adapter, "cycle-synthesis-reduce", &input, Some(&schema), model_override)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            // The reduce is the synthesis's spine — without it there are no findings. A failure
+            // here sinks the whole run, so it's an ERROR (the extract failures above are warns).
+            log::error!(
+                target: "interviewlab::synthesis",
+                "[E-SYN-REDUCE] reduce: cross-interview synthesis CLI call FAILED over {} interview extraction(s), {} goal(s): {e}",
+                extractions.len(), goals.len()
+            );
+            e.to_string()
+        })?;
 
-    let output: ReduceOutput = serde_json::from_value(value.clone())
-        .map_err(|e| format!("reduce output shape invalid: {e}; got {value}"))?;
+    let output: ReduceOutput = serde_json::from_value(value.clone()).map_err(|e| {
+        log::error!(
+            target: "interviewlab::synthesis",
+            "[E-SYN-REDUCE] reduce: output shape invalid (no findings can be assembled): {e}. Got: {}",
+            crate::logging::truncate(&value.to_string(), 2000)
+        );
+        format!("reduce output shape invalid: {e}; got {value}")
+    })?;
 
     let findings = assemble_findings(goals, valid_segments, &output);
     let by_role = assemble_by_role(goals, &output);
@@ -1416,11 +1453,18 @@ async fn synthesize_cycle(
 ) -> Result<CycleSynthesisResult, String> {
     let goals = derive_goals(guide);
     if goals.is_empty() {
+        log::warn!(target: "interviewlab::synthesis", "[E-SYN-NO-GOALS] synthesize: cycle='{cycle_id}': no goals derivable from the guide ({} chars) — aborting", guide.len());
         return Err("no goals could be derived from the guide — add a Goals section first".into());
     }
     if interviews.is_empty() {
+        log::warn!(target: "interviewlab::synthesis", "[E-SYN-NO-INTERVIEWS] synthesize: cycle='{cycle_id}': no transcribed interviews to synthesize — aborting");
         return Err("no transcribed interviews in this cycle to synthesize".into());
     }
+    log::info!(
+        target: "interviewlab::synthesis",
+        "synthesize: cycle='{cycle_id}': MAP {} interview(s) × {} goal(s) then REDUCE (adapter='{}', model={})",
+        interviews.len(), goals.len(), adapter.id, model_override.unwrap_or("<plugin-default>")
+    );
 
     // valid_segments per interview, for evidence-ref validation in the reduce.
     let valid_segments: HashMap<String, usize> = interviews
@@ -1508,6 +1552,7 @@ pub async fn run_interview_summary(
     interview_id: String,
     adapter_id: Option<String>,
 ) -> Result<InterviewSummaryRow, String> {
+    log::info!(target: "interviewlab::synthesis", "run_interview_summary: starting interview='{interview_id}' (adapter override: {adapter_id:?})");
     emit_summary_progress(&app, &interview_id, "running", 10, None);
 
     // Resolve the interview's cycle + title, the cycle's product desc + goals.
@@ -1564,8 +1609,12 @@ pub async fn run_interview_summary(
     let doc = assemble_interview_summary(&goals, iv.segments.len(), &output);
     let content_md = render_interview_markdown(&doc, &title);
     let model_meta = json!({ "adapter": adapter.id, "goals": doc.goals.len() }).to_string();
-    let row_id = store_interview_summary_db(&db.pool, &cycle_id, &interview_id, &doc, &content_md, &model_meta).await?;
+    let row_id = store_interview_summary_db(&db.pool, &cycle_id, &interview_id, &doc, &content_md, &model_meta).await.map_err(|e| {
+        log::error!(target: "interviewlab::synthesis", "[E-SYN-STORE] run_interview_summary: interview='{interview_id}': storing the summary failed: {e}");
+        e
+    })?;
     emit_summary_progress(&app, &interview_id, "done", 100, None);
+    log::info!(target: "interviewlab::synthesis", "run_interview_summary: interview='{interview_id}': DONE (row id={row_id})");
 
     Ok(InterviewSummaryRow {
         id: row_id,
@@ -1649,6 +1698,7 @@ pub async fn run_synthesis(
 
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     let model_override = crate::adapter::task_model_override(&db.pool, "cycle-synthesis").await;
+    log::info!(target: "interviewlab::synthesis", "run_synthesis: cycle='{cycle_id}' ('{name}'): {} interview(s), adapter='{}'", interviews.len(), adapter.id);
     match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &adapter, &interviews, model_override.as_deref()).await {
         Ok(result) => {
             // Persist each per-interview summary (the MAP artifacts).
@@ -1669,8 +1719,16 @@ pub async fn run_synthesis(
                 "findings": result.doc.findings.len(),
             })
             .to_string();
-            let row_id = store_cycle_synthesis_db(&db.pool, &cycle_id, &result.doc, &content_md, &model_meta).await?;
+            let row_id = store_cycle_synthesis_db(&db.pool, &cycle_id, &result.doc, &content_md, &model_meta).await.map_err(|e| {
+                log::error!(target: "interviewlab::synthesis", "[E-SYN-STORE] run_synthesis: cycle='{cycle_id}': synthesis succeeded but STORING it failed: {e}");
+                e
+            })?;
             emit_progress(&app, &cycle_id, "done", interviews.len(), interviews.len(), 100, None);
+            log::info!(
+                target: "interviewlab::synthesis",
+                "run_synthesis: cycle='{cycle_id}': DONE — {} finding(s) across {} goal(s) (row id={row_id})",
+                result.doc.findings.len(), result.doc.goals.len()
+            );
             Ok(SynthesisRow {
                 id: row_id,
                 cycle_id,
@@ -1681,6 +1739,7 @@ pub async fn run_synthesis(
             })
         }
         Err(e) => {
+            log::error!(target: "interviewlab::synthesis", "run_synthesis: cycle='{cycle_id}': FAILED: {e}");
             emit_progress(&app, &cycle_id, "error", 0, interviews.len(), 0, Some(e.clone()));
             Err(e)
         }
