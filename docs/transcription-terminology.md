@@ -37,16 +37,31 @@ The cleanup guidelines now carry explicit terminology rules:
 - The **product context** is framed as the **glossary** — its spelling of any product/brand/domain term
   is the authority.
 
-## Recommended next step — a dedicated, curated glossary (highest leverage)
-The product `content_md` is prose; the research's strongest lever is a **focused term list**. Add a
-per-product (and/or per-cycle) **Glossary**: `term → canonical spelling` (+ optional aliases/notes),
-and inject it into:
-1. **Whisper `initial_prompt`** — bias the ASR so it gets the terms right upfront (entity recovery is
-   far better before the fact than after).
-2. **Every cleanup batch** — the entity phrase-list anchors named-entity spellings AND fixes the
-   cross-batch consistency gap (batches are independent `claude` calls today, so only the glossary +
-   the deterministic rules guarantee the same term is spelled the same way across the whole transcript).
-3. Optionally synthesis/chat — consistent term usage in findings.
+## Curated glossary — IMPLEMENTED (the highest-leverage lever)
+The product `content_md` is prose; the research's strongest lever is a **focused term list**, so a
+per-**product** **Glossary** is now built: each entry is a `canonical` spelling + `aliases` (the
+garbled/variant forms the ASR produces) + optional `notes`. It lives on the product (mirrors how
+`content_md` is product-scoped and reused across cycles) and is injected into:
+1. **Whisper `initial_prompt`** (`asr.rs` → `build_initial_prompt`) — the canonical terms lead the
+   prompt (so they survive the char cap) ahead of the product prose, biasing the ASR up-front.
+2. **Every cleanup batch + the single-shot + the per-segment rewrite** (`cleanup.rs`) — the glossary
+   rides in the prompt as the entity phrase-list (`render_for_prompt`), declared the AUTHORITY for
+   term spellings. This anchors named entities AND closes the cross-batch consistency gap (batches
+   are independent CLI calls, so only the glossary + deterministic rules guarantee one spelling).
 
-This is a moderate feature (a field on product/cycle + a small editor + wiring into 2-3 prompts).
-Not built yet — implement on request.
+Schema: `migrations/0006_glossary.sql` (`glossary_term`, FK→product `ON DELETE CASCADE`). Backend:
+`glossary.rs` (CRUD + shared resolve/render helpers + extraction). UI: a CRUD panel on the product
+editor (`components/glossary-panel.tsx`).
+
+### Auto-fill the glossary (so it isn't hand-authored from scratch)
+Two extraction entry points (both review-then-accept, via `components/glossary-suggest-dialog.tsx`,
+triggered from the Interviews tab; both run the `glossary-extract` CLI task):
+- **B — `suggest_glossary_terms`**: mine candidate terms from an interview's transcript + product
+  context; candidates already in the glossary are filtered out.
+- **C — `suggest_glossary_terms_from_edits`**: mine the user's own raw→edited corrections so the
+  glossary **learns from manual fixes** (alias = the before form, canonical = the after form).
+
+### Possible follow-ups (not built)
+- Retrieval-augmented cleanup (DeRAGEC): inject only the glossary entries relevant to each batch on
+  very long transcripts, to keep the prompt lean.
+- Glossary into synthesis/chat for consistent term usage in findings.

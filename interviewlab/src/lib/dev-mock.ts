@@ -44,6 +44,12 @@ import type {
   Product,
   CreateProductInput,
   UpdateProductInput,
+  GlossaryTerm,
+  CreateGlossaryTermInput,
+  UpdateGlossaryTermInput,
+  NewGlossaryTerm,
+  SuggestResult,
+  SuggestedTerm,
   Role,
   Segment,
   SynthesisDoc,
@@ -261,6 +267,28 @@ const products: Product[] = [
     name: "Acme Analytics",
     content_md: ACME_PRODUCT_MD,
     created_at: now - 41 * DAY,
+    updated_at: now - 3 * DAY,
+  },
+];
+
+// A small seeded glossary for the Acme product so the editor panel renders populated.
+const glossaryTerms: GlossaryTerm[] = [
+  {
+    id: "g1111111-1111-4111-8111-111111111111",
+    product_id: PRODUCT_ID.acme,
+    canonical: "API",
+    aliases: ["эй-пи-ай", "апишка"],
+    notes: "",
+    created_at: now - 3 * DAY,
+    updated_at: now - 3 * DAY,
+  },
+  {
+    id: "g2222222-2222-4222-8222-222222222222",
+    product_id: PRODUCT_ID.acme,
+    canonical: "Acme Analytics",
+    aliases: ["акме", "акми аналитикс"],
+    notes: "the product name",
+    created_at: now - 3 * DAY,
     updated_at: now - 3 * DAY,
   },
 ];
@@ -2318,7 +2346,115 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       if (i >= 0) products.splice(i, 1);
       // Unlink any cycle pointing at it (mirrors Rust: product_id cleared, inline kept).
       for (const c of cycles) if (c.product_id === id) c.product_id = null;
+      // Cascade-delete the product's glossary (mirrors the FK ON DELETE CASCADE).
+      for (let i = glossaryTerms.length - 1; i >= 0; i--) {
+        if (glossaryTerms[i].product_id === id) glossaryTerms.splice(i, 1);
+      }
       return Promise.resolve(undefined as T);
+    }
+
+    // --- Glossary (docs/transcription-terminology.md) -------------------------
+    case "list_glossary_terms": {
+      const productId = String(a.productId);
+      const rows = glossaryTerms
+        .filter((t) => t.product_id === productId)
+        .sort((x, y) => x.canonical.localeCompare(y.canonical));
+      return Promise.resolve(rows.map((t) => ({ ...t })) as T);
+    }
+
+    case "create_glossary_term": {
+      const req = (a.req ?? {}) as CreateGlossaryTermInput;
+      const ts = Date.now();
+      const term: GlossaryTerm = {
+        id: uuid(),
+        product_id: req.product_id,
+        canonical: (req.canonical ?? "").trim(),
+        aliases: (req.aliases ?? []).map((s) => s.trim()).filter(Boolean),
+        notes: (req.notes ?? "").trim(),
+        created_at: ts,
+        updated_at: ts,
+      };
+      glossaryTerms.push(term);
+      return Promise.resolve({ ...term } as T);
+    }
+
+    case "update_glossary_term": {
+      const req = a.req as UpdateGlossaryTermInput;
+      const term = glossaryTerms.find((t) => t.id === req.id);
+      if (!term) return Promise.reject(new Error(`glossary term not found: ${req.id}`));
+      term.canonical = req.canonical.trim() || term.canonical;
+      term.aliases = (req.aliases ?? []).map((s) => s.trim()).filter(Boolean);
+      term.notes = (req.notes ?? "").trim();
+      term.updated_at = Date.now();
+      return Promise.resolve({ ...term } as T);
+    }
+
+    case "delete_glossary_term": {
+      const id = String(a.id);
+      const i = glossaryTerms.findIndex((t) => t.id === id);
+      if (i >= 0) glossaryTerms.splice(i, 1);
+      return Promise.resolve(undefined as T);
+    }
+
+    case "add_glossary_terms": {
+      const productId = String(a.productId);
+      const incoming = (a.terms ?? []) as NewGlossaryTerm[];
+      const seen = new Set(
+        glossaryTerms
+          .filter((t) => t.product_id === productId)
+          .map((t) => t.canonical.trim().toLowerCase()),
+      );
+      const ts = Date.now();
+      const inserted: GlossaryTerm[] = [];
+      for (const n of incoming) {
+        const key = (n.canonical ?? "").trim().toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        const term: GlossaryTerm = {
+          id: uuid(),
+          product_id: productId,
+          canonical: n.canonical.trim(),
+          aliases: (n.aliases ?? []).map((s) => s.trim()).filter(Boolean),
+          notes: (n.notes ?? "").trim(),
+          created_at: ts,
+          updated_at: ts,
+        };
+        glossaryTerms.push(term);
+        inserted.push({ ...term });
+      }
+      return Promise.resolve(inserted as T);
+    }
+
+    case "suggest_glossary_terms":
+    case "suggest_glossary_terms_from_edits": {
+      const interviewId = String(a.interviewId);
+      const iv = interviews.find((i) => i.id === interviewId);
+      const cycle = iv ? cycles.find((c) => c.id === iv.cycle_id) : undefined;
+      const productId = cycle?.product_id ?? null;
+      const product = productId ? products.find((p) => p.id === productId) : undefined;
+      const existing = new Set(
+        glossaryTerms
+          .filter((t) => t.product_id === productId)
+          .map((t) => t.canonical.trim().toLowerCase()),
+      );
+      const pool: SuggestedTerm[] =
+        cmd === "suggest_glossary_terms_from_edits"
+          ? [
+              { canonical: "Jira", aliases: ["джира"], notes: "", reason: "you corrected «джира» → «Jira» in your edits" },
+              { canonical: "churn", aliases: ["чёрн"], notes: "", reason: "kept the English term, fixed the spelling" },
+            ]
+          : [
+              { canonical: "Figma", aliases: ["фигма"], notes: "", reason: "design tool mentioned several times" },
+              { canonical: "retention", aliases: ["ретеншн"], notes: "", reason: "core metric in the interview" },
+              { canonical: "MVP", aliases: ["эм-ви-пи"], notes: "", reason: "acronym rendered phonetically" },
+            ];
+      const terms = pool.filter((t) => !existing.has(t.canonical.toLowerCase()));
+      const result: SuggestResult = {
+        product_id: productId,
+        product_name: product?.name ?? null,
+        terms,
+      };
+      return new Promise((resolve) => setTimeout(() => resolve(result as T), 500));
     }
 
     // --- Cycle chat (M11 Phase A) ---------------------------------------------

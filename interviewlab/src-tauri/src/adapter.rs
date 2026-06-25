@@ -418,6 +418,7 @@ const CLAUDE_CODE_DESCRIPTOR: &str = r#"{
     "cycle-synthesis":         { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
+    "glossary-extract":        { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] }
   },
   "models": {
@@ -429,6 +430,7 @@ const CLAUDE_CODE_DESCRIPTOR: &str = r#"{
     "tasks": {
       "transcript-cleanup":"haiku",
       "cycle-synthesis":"sonnet","cycle-synthesis-extract":"sonnet","cycle-synthesis-reduce":"sonnet",
+      "glossary-extract":"sonnet",
       "cycle-diff":"sonnet"
     }
   },
@@ -504,6 +506,7 @@ const QWEN_CODE_DESCRIPTOR: &str = r#"{
     "cycle-synthesis":         { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
+    "glossary-extract":        { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
     "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json"] }
   },
   "chat": {
@@ -559,6 +562,7 @@ const ANTIGRAVITY_CLI_DESCRIPTOR: &str = r#"{
     "cycle-synthesis":         { "args_template": ["-p", "{prompt}"] },
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}"] },
+    "glossary-extract":        { "args_template": ["-p", "{prompt}"] },
     "cycle-diff":              { "args_template": ["-p", "{prompt}"] }
   }
 }"#;
@@ -891,6 +895,9 @@ pub fn task_bucket(task: &str) -> Option<&'static str> {
     match task {
         "transcript-cleanup" => Some("cleanup"),
         "cycle-synthesis" | "cycle-synthesis-extract" | "cycle-synthesis-reduce" => Some("synthesis"),
+        // Glossary extraction (B/C) shares the synthesis model bucket — it's the same kind of
+        // analytical map step, so the user's synthesis model choice applies.
+        "glossary-extract" => Some("synthesis"),
         "cycle-diff" => Some("diff"),
         _ => None,
     }

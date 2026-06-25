@@ -972,6 +972,99 @@ export function deleteProduct(id: string): Promise<void> {
   return invoke<void>("delete_product", { id });
 }
 
+// --- Glossary (docs/transcription-terminology.md) ----------------------------
+// A per-product, focused `term → canonical` list that anchors anglicisms / technical terms /
+// local product names across the pipeline: it feeds the whisper initial_prompt (so the ASR gets
+// the terms right up-front) and every cleanup/rewrite prompt (so terms normalize consistently).
+// `canonical` is the authoritative spelling; `aliases` are the garbled/variant forms the ASR
+// produces. Mirror of the Rust `GlossaryTerm` (src-tauri/src/glossary.rs).
+export type GlossaryTerm = {
+  id: string;
+  product_id: string;
+  canonical: string;
+  aliases: string[];
+  notes: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type CreateGlossaryTermInput = {
+  product_id: string;
+  canonical: string;
+  aliases?: string[];
+  notes?: string;
+};
+
+export type UpdateGlossaryTermInput = {
+  id: string;
+  canonical: string;
+  aliases?: string[];
+  notes?: string;
+};
+
+// A bare term used for bulk-add (accepting suggestions or importing).
+export type NewGlossaryTerm = {
+  canonical: string;
+  aliases?: string[];
+  notes?: string;
+};
+
+// A model-suggested candidate (B/C). `reason` explains why it's worth adding; it is NOT
+// persisted — only canonical/aliases/notes become a term on accept.
+export type SuggestedTerm = {
+  canonical: string;
+  aliases: string[];
+  notes: string;
+  reason: string;
+};
+
+// The result of a suggest run: the candidates + the product they'd be saved to (resolved from
+// the interview's cycle). product_id is null when the cycle has no LINKED product.
+export type SuggestResult = {
+  product_id: string | null;
+  product_name: string | null;
+  terms: SuggestedTerm[];
+};
+
+export function listGlossaryTerms(productId: string): Promise<GlossaryTerm[]> {
+  return invoke<GlossaryTerm[]>("list_glossary_terms", { productId });
+}
+
+export function createGlossaryTerm(req: CreateGlossaryTermInput): Promise<GlossaryTerm> {
+  return invoke<GlossaryTerm>("create_glossary_term", { req });
+}
+
+export function updateGlossaryTerm(req: UpdateGlossaryTermInput): Promise<GlossaryTerm> {
+  return invoke<GlossaryTerm>("update_glossary_term", { req });
+}
+
+export function deleteGlossaryTerm(id: string): Promise<void> {
+  return invoke<void>("delete_glossary_term", { id });
+}
+
+export function addGlossaryTerms(
+  productId: string,
+  terms: NewGlossaryTerm[],
+): Promise<GlossaryTerm[]> {
+  return invoke<GlossaryTerm[]>("add_glossary_terms", { productId, terms });
+}
+
+// B — mine candidate terms from an interview's transcript + product context.
+export function suggestGlossaryTerms(
+  interviewId: string,
+  adapterId?: string,
+): Promise<SuggestResult> {
+  return invoke<SuggestResult>("suggest_glossary_terms", { interviewId, adapterId });
+}
+
+// C — mine candidate terms from the user's own raw→edited corrections.
+export function suggestGlossaryTermsFromEdits(
+  interviewId: string,
+  adapterId?: string,
+): Promise<SuggestResult> {
+  return invoke<SuggestResult>("suggest_glossary_terms_from_edits", { interviewId, adapterId });
+}
+
 // --- Cycle chat (Milestone 11 Phase A, feature-cycle-chat.md) -----------------
 // The grounded streaming Q&A side panel. Threads + messages persist per cycle; a turn
 // streams tokens via the chat://<thread_id> Tauri event. Mirrors the Rust chat.rs types.
