@@ -469,6 +469,72 @@ async fn get_raw_transcript_db(pool: &SqlitePool, interview_id: &str) -> Result<
     .await
 }
 
+// --- transcription checkpoint (0007: crash-safe progress + resume) ------------
+//
+// One row per interview holding the partial transcript as whisper streams it. Written
+// periodically during a run (every few seconds) and on error; CLEARED on success. Its
+// presence after a failure is what powers the editor's "resume from M:SS".
+#[derive(Serialize, sqlx::FromRow, Clone)]
+pub struct Checkpoint {
+    pub interview_id: String,
+    pub processed_ms: i64,        // last decoded segment end — where resume continues from
+    pub total_ms: Option<i64>,    // audio duration — resume's target end
+    pub model_id: String,
+    pub language: Option<String>,
+    pub segments_json: String,
+    pub updated_at: i64,
+}
+
+// Upsert the current partial result for an interview. Best-effort: a checkpoint write must
+// never fail the run, so callers ignore the error (the run keeps going either way).
+async fn upsert_checkpoint_db(
+    pool: &SqlitePool,
+    interview_id: &str,
+    processed_ms: i64,
+    total_ms: Option<i64>,
+    model_id: &str,
+    language: Option<&str>,
+    segments_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO transcribe_checkpoint \
+           (interview_id, processed_ms, total_ms, model_id, language, segments_json, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(interview_id) DO UPDATE SET \
+           processed_ms = excluded.processed_ms, total_ms = excluded.total_ms, \
+           model_id = excluded.model_id, language = excluded.language, \
+           segments_json = excluded.segments_json, updated_at = excluded.updated_at",
+    )
+    .bind(interview_id)
+    .bind(processed_ms)
+    .bind(total_ms)
+    .bind(model_id)
+    .bind(language)
+    .bind(segments_json)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn get_checkpoint_db(pool: &SqlitePool, interview_id: &str) -> Result<Option<Checkpoint>, sqlx::Error> {
+    sqlx::query_as::<_, Checkpoint>(
+        "SELECT interview_id, processed_ms, total_ms, model_id, language, segments_json, updated_at \
+         FROM transcribe_checkpoint WHERE interview_id = ? LIMIT 1",
+    )
+    .bind(interview_id)
+    .fetch_optional(pool)
+    .await
+}
+
+async fn clear_checkpoint_db(pool: &SqlitePool, interview_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM transcribe_checkpoint WHERE interview_id = ?")
+        .bind(interview_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
 // --- segment shape (schema §2.2: [{start_ms,end_ms,speaker_label,text}, ...]) -----
 
 #[derive(Serialize, serde::Deserialize, Clone)]
@@ -595,7 +661,9 @@ fn run_whisper(
     // whisper-rs 0.16's set_progress_callback_safe requires a 'static callback (it's
     // handed to the C side), so on_progress must own its captures.
     mut on_progress: impl FnMut(i32) + 'static,
-    mut on_segment: impl FnMut(Segment),
+    // Live per-segment callback, fired as each segment is DECODED (not after the run) via
+    // whisper.cpp's new-segment callback — hence the 'static bound (handed to the C side).
+    mut on_segment: impl FnMut(Segment) + 'static,
 ) -> Result<Vec<Segment>, String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -715,6 +783,24 @@ fn run_whisper(
     // Progress 0..100 (spec §3.3 "Progress bar streams percent").
     params.set_progress_callback_safe(move |p: i32| on_progress(p));
 
+    // Live segment streaming (Mac slow-run observability): whisper.cpp fires its new-segment
+    // callback as EACH segment is decoded, so a watcher can accumulate the transcript in real
+    // time instead of waiting for the whole run. We deliberately use this (not the post-run
+    // get_segment loop below) for the live signal — state.full() only returns once the WHOLE
+    // decode is done, so the post-loop is a burst, not a stream. The post-loop still builds the
+    // authoritative Vec for storage; this callback only emits the live ticks. Live segments carry
+    // the placeholder "S1" — real diarization relabels them in the final stored transcript.
+    // whisper-rs 0.16's `set_segment_callback_safe` takes a 'static FnMut(SegmentCallbackData);
+    // timestamps are centiseconds → ms (same scale as get_segment below).
+    params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
+        on_segment(Segment {
+            start_ms: data.start_timestamp * 10,
+            end_ms: data.end_timestamp * 10,
+            speaker_label: "S1".to_string(),
+            text: data.text.trim().to_string(),
+        });
+    });
+
     // Abort callback (bug #1/#5): polled by whisper.cpp between compute steps. Returning
     // true aborts the run mid-flight → state.full returns an error → no indefinite hang.
     // The flag is flipped by the manual Stop command or the watchdog timeout.
@@ -779,7 +865,8 @@ fn run_whisper(
             speaker_label: "S1".to_string(),
             text,
         };
-        on_segment(out.clone());
+        // NOTE: live emission happens in the new-segment callback above (streamed as decoded);
+        // here we only collect the authoritative Vec for storage, so we DON'T re-emit.
         segments.push(out);
     }
     Ok(segments)
@@ -791,8 +878,12 @@ fn run_whisper(
 struct AsrProgress {
     interview_id: String,
     status: String,        // 'transcribing' | 'transcribed' | 'error'
-    progress: i32,         // 0..100
-    segment_text: Option<String>, // most-recent segment (for a live preview), if any
+    progress: i32,         // 0..100, or -1 on a live segment tick
+    segment_text: Option<String>, // most-recent segment text (live preview), if any
+    // The full live segment (timing + text) emitted as whisper decodes it, so a watcher (the
+    // open transcript editor) can accumulate the transcript in real time — not just the last
+    // line. None on percent/terminal ticks. Carries the placeholder "S1" until diarization.
+    segment: Option<Segment>,
     error: Option<String>,
 }
 
@@ -805,14 +896,17 @@ struct ModelProgress {
     error: Option<String>,
 }
 
-fn emit_asr(app: &tauri::AppHandle, interview_id: &str, status: &str, progress: i32, segment_text: Option<String>, error: Option<String>) {
+fn emit_asr(app: &tauri::AppHandle, interview_id: &str, status: &str, progress: i32, segment: Option<Segment>, error: Option<String>) {
     let _ = app.emit(
         ASR_PROGRESS_EVENT,
         AsrProgress {
             interview_id: interview_id.to_string(),
             status: status.to_string(),
             progress,
-            segment_text,
+            // Keep segment_text populated from the live segment for back-compat with any
+            // text-only consumer; new consumers read the full `segment`.
+            segment_text: segment.as_ref().map(|s| s.text.clone()),
+            segment,
             error,
         },
     );
@@ -982,6 +1076,242 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
     result
 }
 
+// 16 kHz mono → 16 samples per millisecond (our prepared wav is always 16k mono).
+const SAMPLES_PER_MS: usize = 16;
+
+// Run whisper over an interview's audio (optionally just a time SLICE) under the cancel
+// flag + watchdog, streaming live progress/segment events and accumulating the decoded
+// segments into `sink` for the checkpoint writer. Returns the segments with timestamps
+// already offset into the FULL-audio timeline (so a slice's output splices back cleanly).
+//
+// This is the shared engine behind the full transcription, the resume tail, and the
+// per-range re-transcribe — they differ only in which [start,end] slice they run and what
+// they splice the result into. `range_ms = None` means the whole file (offset 0).
+#[allow(clippy::too_many_arguments)]
+async fn run_guarded_whisper(
+    app: &tauri::AppHandle,
+    interview_id: &str,
+    model: PathBuf,
+    audio_path: PathBuf,
+    range_ms: Option<(i64, i64)>,
+    language: Option<String>,
+    initial_prompt: String,
+    use_gpu: bool,
+    budget: std::time::Duration,
+    // Shared live buffer (offset-adjusted segments) the checkpoint writer snapshots.
+    sink: Arc<StdMutex<Vec<Segment>>>,
+) -> Result<Vec<Segment>, String> {
+    let cancel = register_cancel(interview_id);
+
+    let app_for_cb = app.clone();
+    let iv_for_cb = interview_id.to_string();
+    let cancel_for_run = cancel.clone();
+    let offset_ms = range_ms.map(|(s, _)| s.max(0)).unwrap_or(0);
+
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let all = read_wav_16k_mono(&audio_path)?;
+        // Slice to the requested range (clamped to bounds); None → the whole file.
+        let samples: Vec<f32> = match range_ms {
+            Some((s, e)) => {
+                let a = (s.max(0) as usize * SAMPLES_PER_MS).min(all.len());
+                let b = (e.max(0) as usize * SAMPLES_PER_MS).min(all.len());
+                all[a..b.max(a)].to_vec()
+            }
+            None => all,
+        };
+        let segs = run_whisper(
+            &model,
+            &samples,
+            language.as_deref(),
+            Some(initial_prompt.as_str()),
+            use_gpu,
+            Some(cancel_for_run),
+            // progress callback → throttled event
+            {
+                let app = app_for_cb.clone();
+                let iv = iv_for_cb.clone();
+                move |p: i32| emit_asr(&app, &iv, STATUS_TRANSCRIBING, p, None, None)
+            },
+            // segment callback → offset into the full timeline, emit live + feed the checkpoint buffer
+            {
+                let app = app_for_cb.clone();
+                let iv = iv_for_cb.clone();
+                let sink = sink.clone();
+                move |mut seg: Segment| {
+                    seg.start_ms += offset_ms;
+                    seg.end_ms += offset_ms;
+                    if let Ok(mut g) = sink.lock() {
+                        g.push(seg.clone());
+                    }
+                    emit_asr(&app, &iv, STATUS_TRANSCRIBING, -1, Some(seg), None);
+                }
+            },
+        )?;
+        // Offset the authoritative returned Vec the same way the live ticks were.
+        Ok::<Vec<Segment>, String>(
+            segs.into_iter()
+                .map(|mut s| {
+                    s.start_ms += offset_ms;
+                    s.end_ms += offset_ms;
+                    s
+                })
+                .collect(),
+        )
+    });
+
+    // Watchdog: bound wall-time. On elapse flip the cancel flag (whisper's abort_callback
+    // unwinds) and AWAIT the now-aborting task so it can't outlive us (concurrency=1 honesty).
+    let mut task = task;
+    let run: Result<Vec<Segment>, String> = match tokio::time::timeout(budget, &mut task).await {
+        Ok(join) => join.map_err(|_| "transcription task panicked".to_string())?,
+        Err(_) => {
+            log::error!(
+                target: "interviewlab::asr",
+                "[E-ASR-TIMEOUT] transcribe: interview='{interview_id}': watchdog fired after {}s — aborting",
+                budget.as_secs()
+            );
+            cancel.store(true, Ordering::SeqCst);
+            let _ = task.await;
+            Err(format!(
+                "transcription watchdog timed out after {}s — aborted (possible audio with no speech / a runaway segment)",
+                budget.as_secs()
+            ))
+        }
+    };
+
+    unregister_cancel(interview_id);
+    run
+}
+
+// Spawn a periodic checkpoint writer for an in-flight run. Every few seconds it snapshots
+// `base_prefix ++ sink` (the already-saved prefix plus the live-decoded tail) into the
+// checkpoint table, so a crash/kill loses at most a few seconds. Returns the task handle —
+// the caller MUST abort it once the run finishes (then write the final state itself).
+fn spawn_checkpoint_writer(
+    pool: SqlitePool,
+    interview_id: String,
+    sink: Arc<StdMutex<Vec<Segment>>>,
+    base_prefix: Vec<Segment>,
+    total_ms: Option<i64>,
+    model_id: String,
+    language: Option<String>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let tail = sink.lock().map(|g| g.clone()).unwrap_or_default();
+            let mut all = base_prefix.clone();
+            all.extend(tail);
+            let processed = all.last().map(|s| s.end_ms).unwrap_or(0);
+            let json = match serde_json::to_string(&all) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            let _ = upsert_checkpoint_db(
+                &pool, &interview_id, processed, total_ms, &model_id,
+                language.as_deref().filter(|s| *s != "auto"), &json,
+            )
+            .await;
+        }
+    })
+}
+
+// The shared tail for every transcription path: diarize the WHOLE audio (so speaker labels
+// are globally consistent even after a resume/range-splice), store the raw transcript, flip
+// the interview to `transcribed`, clear the checkpoint, and emit the terminal event. Returns
+// the new transcript id. Diarization is best-effort (an enrichment, never a gate).
+async fn diarize_and_store(
+    app: &tauri::AppHandle,
+    pool: &SqlitePool,
+    interview_id: &str,
+    mut segments: Vec<Segment>,
+    base_engine: String,
+    language: Option<String>,
+    expected_speakers: Option<i32>,
+    duration_ms: Option<i64>,
+    audio_path: PathBuf,
+) -> Result<String, String> {
+    let diar_dir = crate::diarize::diarization_dir(app)?;
+    let mut engine = base_engine;
+    if crate::diarize::models_present(&diar_dir) {
+        emit_diar(app, interview_id, "diarizing", 0, None);
+        let seg_model = diar_dir.join(crate::diarize::SEGMENTATION_FILE);
+        let emb_model = diar_dir.join(crate::diarize::EMBEDDING_FILE);
+        let diar_task = tauri::async_runtime::spawn_blocking(move || {
+            let samples = read_wav_16k_mono(&audio_path)?;
+            crate::diarize::diarize_samples(&seg_model, &emb_model, &samples, 16000, expected_speakers)
+        });
+        let diar_budget = std::time::Duration::from_millis(
+            (duration_ms.unwrap_or(0).max(0) as u64).saturating_mul(8).max(180_000),
+        );
+        let diar = match tokio::time::timeout(diar_budget, diar_task).await {
+            Ok(join) => join.map_err(|_| "diarization task panicked".to_string())?,
+            Err(_) => Err(format!(
+                "diarization timed out after {}s — keeping single speaker",
+                diar_budget.as_secs()
+            )),
+        };
+        match diar {
+            Ok(turns) => {
+                crate::diarize::assign_speakers(&mut segments, &turns);
+                let n_spk = turns.iter().map(|t| t.speaker).collect::<std::collections::BTreeSet<_>>().len();
+                engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
+                emit_diar(app, interview_id, "done", 100, Some(n_spk as i32));
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "interviewlab::asr",
+                    "[E-ASR-DIARIZE] transcribe: interview='{interview_id}': diarization FAILED, keeping single speaker (S1): {e}"
+                );
+                emit_diar(app, interview_id, "error", 0, None);
+            }
+        }
+    }
+
+    let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
+    let lang_label = language.as_deref().filter(|s| *s != "auto");
+    let tid = store_raw_transcript_db(pool, interview_id, lang_label, &engine, &segments_json)
+        .await
+        .map_err(|e| {
+            log::error!(target: "interviewlab::asr", "[E-ASR-STORE] transcribe: interview='{interview_id}': transcribed OK but STORING failed: {e}");
+            format!("store transcript: {e}")
+        })?;
+    // The stored transcript is now authoritative — the run's checkpoint is no longer needed.
+    let _ = clear_checkpoint_db(pool, interview_id).await;
+    set_status_db(pool, interview_id, STATUS_TRANSCRIBED)
+        .await
+        .map_err(|e| format!("set transcribed: {e}"))?;
+    emit_asr(app, interview_id, STATUS_TRANSCRIBED, 100, None, None);
+    log::info!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': DONE — {} segments, engine='{engine}', id={tid}", segments.len());
+    Ok(tid)
+}
+
+// Resolve an interview's prepared 16k wav path, erroring clearly if it's missing on disk.
+async fn resolve_audio_path(pool: &SqlitePool, interview_id: &str) -> Result<PathBuf, String> {
+    let audio = audio_path_db(pool, interview_id)
+        .await
+        .map_err(|e| format!("lookup audio: {e}"))?
+        .ok_or("no prepared audio for this interview (re-run ingest)")?;
+    let p = PathBuf::from(&audio);
+    if !p.exists() {
+        return Err(format!("audio file missing on disk: {audio}"));
+    }
+    Ok(p)
+}
+
+// Build whisper's initial_prompt (glossary canonical terms + product context) for an
+// interview — shared by every transcription path. Best-effort: a missing product/glossary
+// just yields a shorter (or empty) prompt.
+async fn initial_prompt_for_interview(pool: &SqlitePool, interview_id: &str) -> String {
+    let product_ctx = product_context_for_interview_db(pool, interview_id)
+        .await
+        .unwrap_or_default();
+    let glossary = crate::glossary::glossary_for_interview_db(pool, interview_id)
+        .await
+        .unwrap_or_default();
+    build_initial_prompt(&glossary, &product_ctx)
+}
+
 // Transcribe one interview's prepared 16k wav with the given model + language.
 // Lifecycle: status → transcribing, run whisper (progress events), store raw
 // transcript, status → transcribed | error. Concurrency = 1 via ASR_LOCK.
@@ -1011,22 +1341,10 @@ pub async fn transcribe_interview(
     }
 
     // Resolve the prepared audio.
-    let audio = audio_path_db(&db.pool, &interview_id)
-        .await
-        .map_err(|e| {
-            log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': DB lookup of audio_path failed: {e}");
-            format!("lookup audio: {e}")
-        })?
-        .ok_or_else(|| {
-            log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': no prepared audio (recording row missing audio_path — re-run ingest)");
-            "no prepared audio for this interview (re-run ingest)".to_string()
-        })?;
-    let audio_path = PathBuf::from(&audio);
-    if !audio_path.exists() {
-        let msg = format!("audio file missing on disk: {audio}");
-        log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': {msg} (the prepared 16k wav was deleted or moved)");
-        return Err(msg);
-    }
+    let audio_path = resolve_audio_path(&db.pool, &interview_id).await.map_err(|e| {
+        log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': {e}");
+        e
+    })?;
 
     let device = detect_device();
     // Record the ACTUAL device (metal | cuda | cpu) — not a hardcoded "cuda" — so the engine
@@ -1038,20 +1356,9 @@ pub async fn transcribe_interview(
     let duration_ms = duration_ms_db(&db.pool, &interview_id).await.unwrap_or(None);
     let budget = std::time::Duration::from_millis(watchdog_budget_ms(duration_ms) as u64);
 
-    // Product context + GLOSSARY → whisper `initial_prompt` (Products library / req #2;
-    // docs/transcription-terminology.md). We feed whisper an entity hint so brand / product /
-    // technical terms transcribe correctly. The curated glossary's CANONICAL spellings go FIRST
-    // (the highest-value entity list — biasing the ASR up-front recovers terms far better than
-    // fixing them after), then the product prose. run_whisper sanitizes + hard-caps the result.
-    // Best-effort throughout — a missing cycle/product/glossary just means a shorter (or empty)
-    // prompt (unchanged behavior).
-    let product_ctx = product_context_for_interview_db(&db.pool, &interview_id)
-        .await
-        .unwrap_or_default();
-    let glossary = crate::glossary::glossary_for_interview_db(&db.pool, &interview_id)
-        .await
-        .unwrap_or_default();
-    let initial_prompt = build_initial_prompt(&glossary, &product_ctx);
+    // Product context + GLOSSARY → whisper `initial_prompt` (Products library / req #2): an
+    // entity hint so brand / product / technical terms transcribe correctly.
+    let initial_prompt = initial_prompt_for_interview(&db.pool, &interview_id).await;
 
     // Serialize ASR runs (concurrency = 1). Held across the whole transcription.
     let _guard = asr_lock().lock().await;
@@ -1061,156 +1368,47 @@ pub async fn transcribe_interview(
         .map_err(|e| format!("set transcribing: {e}"))?;
     emit_asr(&app, &interview_id, STATUS_TRANSCRIBING, 0, None, None);
 
-    // Register the cancel flag (#1/#5) so both manual Stop and the watchdog can abort.
-    let cancel = register_cancel(&interview_id);
+    // Whole-file run (range None, offset 0). The live buffer feeds the periodic checkpoint
+    // writer so a crash/kill mid-run loses at most a few seconds — and the editor can resume.
+    let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
+    let ckpt = spawn_checkpoint_writer(
+        db.pool.clone(), interview_id.clone(), sink.clone(),
+        Vec::new(), duration_ms, model_id.clone(), language.clone(),
+    );
 
-    // Run the whole compute (wav read + whisper) on a blocking task.
-    let app_for_cb = app.clone();
-    let iv_for_cb = interview_id.clone();
-    let lang_opt = language.clone();
-    let use_gpu = device.use_gpu;
-    let model_for_run = model.clone();
-    // Keep the wav path for the diarization pass (the closure moves its own copy).
-    let audio_for_diar = audio_path.clone();
-    let cancel_for_run = cancel.clone();
-    // Move the product context into the blocking task as whisper's initial_prompt (req #2).
-    let prompt_for_run = initial_prompt.clone();
-
-    let task = tauri::async_runtime::spawn_blocking(move || {
-        let samples = read_wav_16k_mono(&audio_path)?;
-        run_whisper(
-            &model_for_run,
-            &samples,
-            lang_opt.as_deref(),
-            Some(prompt_for_run.as_str()),
-            use_gpu,
-            Some(cancel_for_run),
-            // progress callback → throttled event
-            {
-                let app = app_for_cb.clone();
-                let iv = iv_for_cb.clone();
-                move |p: i32| emit_asr(&app, &iv, STATUS_TRANSCRIBING, p, None, None)
-            },
-            // segment callback → live preview event
-            {
-                let app = app_for_cb.clone();
-                let iv = iv_for_cb.clone();
-                move |seg: Segment| emit_asr(&app, &iv, STATUS_TRANSCRIBING, -1, Some(seg.text.clone()), None)
-            },
-        )
-    });
-
-    // Watchdog (#1): bound the wall-time. If the run exceeds the budget, flip the SAME
-    // cancel flag (the abort_callback then unwinds whisper) and surface a timeout error so
-    // the interview goes to `error` and the concurrency=1 queue frees — it can't hang forever.
-    // tokio::time::timeout drops the JoinHandle on elapse but the blocking thread keeps
-    // running until the abort_callback is next polled, so we DON'T just drop it: on timeout we
-    // flip the flag and then AWAIT the task to full completion before releasing the ASR lock.
-    // That guarantees the aborting whisper thread has exited before the next queued run can
-    // start (concurrency=1 stays honest). The abort unwinds in ~one compute step (sub-second
-    // to a couple seconds), so the extra wait is tiny.
-    let mut task = task;
-    let run: Result<Vec<Segment>, String> = match tokio::time::timeout(budget, &mut task).await {
-        Ok(join) => join.map_err(|_| "transcription task panicked".to_string())?,
-        Err(_) => {
-            // Timed out: signal abort, then await the (now-aborting) task so it can't outlive us.
-            log::error!(
-                target: "interviewlab::asr",
-                "[E-ASR-TIMEOUT] transcribe: interview='{interview_id}': watchdog fired after {}s — aborting (audio with no speech / a runaway segment?)",
-                budget.as_secs()
-            );
-            cancel.store(true, Ordering::SeqCst);
-            let _ = task.await; // discard the aborted run's result; we report a timeout below.
-            Err(format!(
-                "transcription watchdog timed out after {}s — aborted (possible audio with no speech / a runaway segment)",
-                budget.as_secs()
-            ))
-        }
-    };
-
-    // The run is over (done / errored / timed out) — free the cancel slot.
-    unregister_cancel(&interview_id);
+    let run = run_guarded_whisper(
+        &app, &interview_id, model.clone(), audio_path.clone(), None,
+        language.clone(), initial_prompt, device.use_gpu, budget, sink.clone(),
+    )
+    .await;
+    ckpt.abort();
 
     match run {
-        Ok(mut segments) => {
-            // --- diarization pass (feature-diarization.md §4): assign real S1/S2/… by max
-            // time-overlap. Runs on CPU on the SAME 16k wav, AFTER whisper. Best-effort: if
-            // the diar models aren't present or diar fails, we keep the (single-S1) raw
-            // transcript rather than failing the whole transcription — diarization is an
-            // enrichment, not a gate. The engine string records what actually ran.
-            let diar_dir = crate::diarize::diarization_dir(&app)?;
-            let mut engine = engine; // augment below when diarization ran.
-            if crate::diarize::models_present(&diar_dir) {
-                emit_diar(&app, &interview_id, "diarizing", 0, None);
-                let seg_model = diar_dir.join(crate::diarize::SEGMENTATION_FILE);
-                let emb_model = diar_dir.join(crate::diarize::EMBEDDING_FILE);
-                let diar_task = tauri::async_runtime::spawn_blocking(move || {
-                    let samples = read_wav_16k_mono(&audio_for_diar)?;
-                    crate::diarize::diarize_samples(&seg_model, &emb_model, &samples, 16000, expected_speakers)
-                });
-                // sherpa's `process` is one opaque, non-abortable call, so bound it with a
-                // timeout: on a pathologically slow CPU run we SKIP diarization (keep the raw
-                // single-speaker labels) instead of leaving the row wedged forever. Generous
-                // budget — 8× audio, floor 3min. (Speed itself is addressed in diarize.rs by
-                // multi-threading the ONNX sessions; this is just the safety ceiling.)
-                let diar_budget = std::time::Duration::from_millis(
-                    (duration_ms.unwrap_or(0).max(0) as u64).saturating_mul(8).max(180_000),
-                );
-                let diar = match tokio::time::timeout(diar_budget, diar_task).await {
-                    Ok(join) => join.map_err(|_| "diarization task panicked".to_string())?,
-                    Err(_) => Err(format!(
-                        "diarization timed out after {}s — keeping single speaker",
-                        diar_budget.as_secs()
-                    )),
-                };
-                match diar {
-                    Ok(turns) => {
-                        crate::diarize::assign_speakers(&mut segments, &turns);
-                        let n_spk = turns.iter().map(|t| t.speaker).collect::<std::collections::BTreeSet<_>>().len();
-                        engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
-                        emit_diar(&app, &interview_id, "done", 100, Some(n_spk as i32));
-                    }
-                    Err(e) => {
-                        // Non-fatal: log + surface a warning event, keep the raw single-speaker labels.
-                        log::warn!(
-                            target: "interviewlab::asr",
-                            "[E-ASR-DIARIZE] transcribe: interview='{interview_id}': diarization FAILED, keeping single speaker (S1): {e}. \
-                             hint: diarization is an enrichment, not a gate — the transcript is still usable; \
-                             retry via 're-diarize' once the cause (slow CPU / missing models) is addressed."
-                        );
-                        emit_diar(&app, &interview_id, "error", 0, None);
-                    }
-                }
-            }
-
-            // Store the plain Vec<Segment> array — UNCHANGED top-level shape, so the editor /
-            // cleanup / synthesis (all parse segments_json as a segment array) keep working;
-            // diarization only changed each segment's speaker_label. We deliberately do NOT
-            // wrap it in an envelope with diar_turns (re-diarize re-runs the models, which is
-            // ~real-time on CPU — cheaper than rippling an envelope change through every consumer).
-            let segments_json = serde_json::to_string(&segments).map_err(|e| {
-                log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': serialize {} segments failed: {e}", segments.len());
-                format!("serialize segments: {e}")
-            })?;
-            // Persist the detected/forced language label on the transcript row.
-            let lang_label = language.as_deref().filter(|s| *s != "auto");
-            let tid = store_raw_transcript_db(&db.pool, &interview_id, lang_label, &engine, &segments_json)
-                .await
-                .map_err(|e| {
-                    log::error!(target: "interviewlab::asr", "[E-ASR-STORE] transcribe: interview='{interview_id}': transcribed OK but STORING the raw transcript failed: {e}");
-                    format!("store transcript: {e}")
-                })?;
-            set_status_db(&db.pool, &interview_id, STATUS_TRANSCRIBED)
-                .await
-                .map_err(|e| format!("set transcribed: {e}"))?;
-            emit_asr(&app, &interview_id, STATUS_TRANSCRIBED, 100, None, None);
-            log::info!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': DONE — {} segments, engine='{engine}', transcript id={tid}", segments.len());
-            Ok(tid)
+        Ok(segments) => {
+            diarize_and_store(
+                &app, &db.pool, &interview_id, segments, engine, language,
+                expected_speakers, duration_ms, audio_path,
+            )
+            .await
         }
         Err(e) => {
-            // The whole transcription failed (whisper decode error, watchdog timeout, or a
-            // manual Stop). The interview goes to `error` so the user can retry.
-            log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': FAILED → status=error: {e}");
+            // Failed (whisper decode error, watchdog timeout, or manual Stop). Persist a FINAL
+            // checkpoint snapshot of whatever decoded so the user can resume from there, then
+            // mark the interview `error`.
+            let partial = sink.lock().map(|g| g.clone()).unwrap_or_default();
+            if !partial.is_empty() {
+                let processed = partial.last().map(|s| s.end_ms).unwrap_or(0);
+                if let Ok(json) = serde_json::to_string(&partial) {
+                    let _ = upsert_checkpoint_db(
+                        &db.pool, &interview_id, processed, duration_ms, &model_id,
+                        language.as_deref().filter(|s| *s != "auto"), &json,
+                    )
+                    .await;
+                }
+                log::warn!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': FAILED with {} partial segments saved (resumable): {e}", partial.len());
+            } else {
+                log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': FAILED → status=error: {e}");
+            }
             set_status_db(&db.pool, &interview_id, STATUS_ERROR).await.ok();
             emit_asr(&app, &interview_id, STATUS_ERROR, 0, None, Some(e.clone()));
             Err(e)
@@ -1362,6 +1560,208 @@ pub async fn rediarize_interview(
     Ok(n_spk)
 }
 
+// --- partial re-transcription + crash resume (range primitive) ----------------
+
+// Merge freshly-transcribed `incoming` segments into `base`, replacing anything that
+// overlaps the [start_ms, end_ms] window, and return the result sorted by start time. Used
+// by both the per-range re-transcribe (base = the stored transcript) and resume (base = the
+// saved prefix, where the window is the un-decoded tail so nothing is replaced — it appends).
+fn splice_segments(base: &[Segment], incoming: Vec<Segment>, start_ms: i64, end_ms: i64) -> Vec<Segment> {
+    let mut out: Vec<Segment> = base
+        .iter()
+        // Keep segments that lie wholly OUTSIDE the re-done window (overlap is replaced).
+        .filter(|s| s.end_ms <= start_ms || s.start_ms >= end_ms)
+        .cloned()
+        .collect();
+    out.extend(incoming);
+    out.sort_by_key(|s| s.start_ms);
+    out
+}
+
+// Re-transcribe + re-diarize a TIME RANGE of an interview's audio (feature: "redo a chunk
+// that came out wrong"). Runs whisper on just [start_ms, end_ms], splices the result over the
+// stored transcript's segments in that window, then re-diarizes the WHOLE audio so speaker
+// labels stay globally consistent. Streams live progress like a normal run. Concurrency = 1.
+#[tauri::command]
+pub async fn retranscribe_range(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    interview_id: String,
+    start_ms: i64,
+    end_ms: i64,
+    model_id: String,
+    language: Option<String>,
+    expected_speakers: Option<i32>,
+) -> Result<String, String> {
+    log::info!(target: "interviewlab::asr", "retranscribe_range: interview='{interview_id}' [{start_ms}..{end_ms}]ms model='{model_id}'");
+    if end_ms <= start_ms {
+        return Err("invalid range (end must be after start)".to_string());
+    }
+    let entry = catalog_entry(&model_id).ok_or_else(|| format!("unknown model id: {model_id}"))?;
+    let model = model_path(&app, &model_id)?;
+    if !model.exists() {
+        return Err(format!("model not downloaded: {} (download it in Settings)", entry.label));
+    }
+    let audio_path = resolve_audio_path(&db.pool, &interview_id).await?;
+
+    // The transcript we splice into (the segments currently shown in the editor).
+    let raw = get_raw_transcript_db(&db.pool, &interview_id)
+        .await
+        .map_err(|e| format!("lookup transcript: {e}"))?
+        .ok_or("no transcript to re-transcribe (transcribe the whole interview first)")?;
+    let base: Vec<Segment> = serde_json::from_str(&raw.segments_json)
+        .map_err(|e| format!("parse stored segments: {e}"))?;
+
+    let device = detect_device();
+    let engine = format!("whisper.cpp:{}@{}", model_id, device.device);
+    let duration_ms = duration_ms_db(&db.pool, &interview_id).await.unwrap_or(None);
+    // Watchdog scaled to the SLICE length (not the whole file), with the usual floor/ceiling.
+    let budget = std::time::Duration::from_millis(watchdog_budget_ms(Some(end_ms - start_ms)) as u64);
+    let initial_prompt = initial_prompt_for_interview(&db.pool, &interview_id).await;
+
+    let _guard = asr_lock().lock().await;
+    set_status_db(&db.pool, &interview_id, STATUS_TRANSCRIBING)
+        .await
+        .map_err(|e| format!("set transcribing: {e}"))?;
+    emit_asr(&app, &interview_id, STATUS_TRANSCRIBING, 0, None, None);
+
+    // No checkpoint writer here: a range redo is short and the ORIGINAL transcript stays
+    // intact on failure (we only store on success), so there's nothing to resume.
+    let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
+    let run = run_guarded_whisper(
+        &app, &interview_id, model, audio_path.clone(), Some((start_ms, end_ms)),
+        language.clone(), initial_prompt, device.use_gpu, budget, sink,
+    )
+    .await;
+
+    match run {
+        Ok(incoming) => {
+            let merged = splice_segments(&base, incoming, start_ms, end_ms);
+            let lang = raw.language.clone().or_else(|| language.clone());
+            diarize_and_store(
+                &app, &db.pool, &interview_id, merged, engine, lang,
+                expected_speakers, duration_ms, audio_path,
+            )
+            .await
+        }
+        Err(e) => {
+            // The stored transcript is untouched — restore the prior status so the editor
+            // keeps showing it (don't strand the interview in `transcribing`/`error`).
+            log::error!(target: "interviewlab::asr", "retranscribe_range: interview='{interview_id}': FAILED, keeping existing transcript: {e}");
+            set_status_db(&db.pool, &interview_id, STATUS_TRANSCRIBED).await.ok();
+            emit_asr(&app, &interview_id, STATUS_ERROR, 0, None, Some(e.clone()));
+            Err(e)
+        }
+    }
+}
+
+// Resume a transcription that failed/crashed partway, continuing from its checkpoint instead
+// of starting over (crash-safety feature). Re-transcribes only the remaining tail
+// [processed_ms, total_ms], appends it to the saved prefix, then diarizes the whole audio.
+#[tauri::command]
+pub async fn resume_transcription(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    interview_id: String,
+    language: Option<String>,
+    expected_speakers: Option<i32>,
+) -> Result<String, String> {
+    let ckpt = get_checkpoint_db(&db.pool, &interview_id)
+        .await
+        .map_err(|e| format!("lookup checkpoint: {e}"))?
+        .ok_or("nothing to resume (no saved progress for this interview)")?;
+    log::info!(target: "interviewlab::asr", "resume: interview='{interview_id}' from {}ms (model='{}')", ckpt.processed_ms, ckpt.model_id);
+
+    let model = model_path(&app, &ckpt.model_id)?;
+    if !model.exists() {
+        return Err(format!("model '{}' not downloaded (download it in Settings)", ckpt.model_id));
+    }
+    let audio_path = resolve_audio_path(&db.pool, &interview_id).await?;
+    let prefix: Vec<Segment> = serde_json::from_str(&ckpt.segments_json)
+        .map_err(|e| format!("parse checkpoint segments: {e}"))?;
+
+    // Resume end = the audio duration; if unknown, fall back to the checkpoint's total.
+    let duration_ms = duration_ms_db(&db.pool, &interview_id).await.unwrap_or(None).or(ckpt.total_ms);
+    let total_ms = duration_ms.ok_or("unknown audio duration — cannot resume")?;
+    let start_ms = ckpt.processed_ms.max(0);
+    if total_ms <= start_ms {
+        return Err("already at the end — nothing left to transcribe".to_string());
+    }
+
+    // Resume uses the language the run was started with (checkpoint), unless the caller overrides.
+    let lang = language.clone().or_else(|| ckpt.language.clone());
+    let device = detect_device();
+    let engine = format!("whisper.cpp:{}@{}", ckpt.model_id, device.device);
+    let budget = std::time::Duration::from_millis(watchdog_budget_ms(Some(total_ms - start_ms)) as u64);
+    let initial_prompt = initial_prompt_for_interview(&db.pool, &interview_id).await;
+
+    let _guard = asr_lock().lock().await;
+    set_status_db(&db.pool, &interview_id, STATUS_TRANSCRIBING)
+        .await
+        .map_err(|e| format!("set transcribing: {e}"))?;
+    // Replay the saved prefix so the editor's live view shows it immediately, then continue.
+    for seg in &prefix {
+        emit_asr(&app, &interview_id, STATUS_TRANSCRIBING, -1, Some(seg.clone()), None);
+    }
+
+    // Keep checkpointing during the resume too (prefix + the new tail), so a SECOND crash is
+    // also recoverable.
+    let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
+    let ckpt_task = spawn_checkpoint_writer(
+        db.pool.clone(), interview_id.clone(), sink.clone(),
+        prefix.clone(), Some(total_ms), ckpt.model_id.clone(), lang.clone(),
+    );
+
+    let run = run_guarded_whisper(
+        &app, &interview_id, model, audio_path.clone(), Some((start_ms, total_ms)),
+        lang.clone(), initial_prompt, device.use_gpu, budget, sink.clone(),
+    )
+    .await;
+    ckpt_task.abort();
+
+    match run {
+        Ok(tail) => {
+            // Append the newly-decoded tail to the saved prefix (prefix ends at start_ms, tail
+            // begins there → splice with an empty replace window just concatenates + sorts).
+            let merged = splice_segments(&prefix, tail, start_ms, total_ms);
+            diarize_and_store(
+                &app, &db.pool, &interview_id, merged, engine, lang,
+                expected_speakers, duration_ms, audio_path,
+            )
+            .await
+        }
+        Err(e) => {
+            // Persist the extended prefix so a further resume continues from the new point.
+            let tail = sink.lock().map(|g| g.clone()).unwrap_or_default();
+            let mut all = prefix.clone();
+            all.extend(tail);
+            if let Ok(json) = serde_json::to_string(&all) {
+                let processed = all.last().map(|s| s.end_ms).unwrap_or(start_ms);
+                let _ = upsert_checkpoint_db(
+                    &db.pool, &interview_id, processed, Some(total_ms), &ckpt.model_id,
+                    lang.as_deref().filter(|s| *s != "auto"), &json,
+                )
+                .await;
+            }
+            set_status_db(&db.pool, &interview_id, STATUS_ERROR).await.ok();
+            emit_asr(&app, &interview_id, STATUS_ERROR, 0, None, Some(e.clone()));
+            Err(e)
+        }
+    }
+}
+
+// Read the saved transcription checkpoint for an interview (drives the editor's "resume from
+// M:SS" banner). None when there's no recoverable partial run.
+#[tauri::command]
+pub async fn get_transcribe_checkpoint(
+    db: tauri::State<'_, Db>,
+    interview_id: String,
+) -> Result<Option<Checkpoint>, String> {
+    get_checkpoint_db(&db.pool, &interview_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,6 +1770,38 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    fn seg_at(start_ms: i64, end_ms: i64, text: &str) -> Segment {
+        Segment { start_ms, end_ms, speaker_label: "S1".into(), text: text.into() }
+    }
+
+    // splice_segments replaces the overlapping window with the freshly-decoded segments and
+    // keeps the rest, sorted — the core of both range-retranscribe and resume.
+    #[test]
+    fn splice_replaces_overlap_keeps_rest() {
+        let base = vec![
+            seg_at(0, 1000, "a"),
+            seg_at(1000, 2000, "bad"),
+            seg_at(2000, 3000, "also bad"),
+            seg_at(3000, 4000, "d"),
+        ];
+        // Redo [1000,3000): the two middle segments are dropped, replaced by the new ones.
+        let incoming = vec![seg_at(1000, 2000, "fixed1"), seg_at(2000, 3000, "fixed2")];
+        let out = splice_segments(&base, incoming, 1000, 3000);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "fixed1", "fixed2", "d"]);
+    }
+
+    // Resume case: the window is the un-decoded tail, base has nothing there → pure append.
+    #[test]
+    fn splice_resume_appends_tail() {
+        let prefix = vec![seg_at(0, 1000, "p1"), seg_at(1000, 2000, "p2")];
+        let tail = vec![seg_at(2000, 3000, "t1"), seg_at(3000, 4000, "t2")];
+        let out = splice_segments(&prefix, tail, 2000, 4000);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["p1", "p2", "t1", "t2"]);
+        assert!(out.windows(2).all(|w| w[0].start_ms <= w[1].start_ms), "result stays sorted");
     }
 
     async fn make_interview(pool: &SqlitePool) -> String {
@@ -1744,7 +2176,12 @@ mod tests {
         let samples = read_wav_16k_mono(&wav).expect("read wav");
         assert!(samples.len() > 16000, "expected >1s of audio samples, got {}", samples.len());
 
-        let mut got_segments: Vec<Segment> = Vec::new();
+        // The live segment callback now fires DURING decode (whisper.cpp new-segment callback)
+        // and is handed to the C side, so it must be 'static — collect through shared ownership
+        // (Rc<RefCell>) rather than a borrowing closure.
+        let got_segments: std::rc::Rc<std::cell::RefCell<Vec<Segment>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let got_for_cb = got_segments.clone();
         let segs = run_whisper(
             &model,
             &samples,
@@ -1753,12 +2190,12 @@ mod tests {
             false, // CPU
             None,  // no cancellation in the test path
             |p| { if p % 25 == 0 { println!("progress {p}%"); } },
-            |s| got_segments.push(s),
+            move |s| got_for_cb.borrow_mut().push(s),
         )
         .expect("run_whisper");
 
         assert!(!segs.is_empty(), "whisper returned no segments");
-        assert_eq!(segs.len(), got_segments.len(), "segment callback count must match returned count");
+        assert_eq!(segs.len(), got_segments.borrow().len(), "segment callback count must match returned count");
         let text = segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ").to_lowercase();
         println!("spoken:     the quick brown fox jumps over the lazy dog");
         println!("recognized: {text}");

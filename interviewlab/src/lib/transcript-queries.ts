@@ -5,7 +5,9 @@ import {
 } from "@tanstack/react-query";
 import {
   cleanTranscript,
+  getTranscribeCheckpoint,
   getTranscriptVersion,
+  IN_TAURI,
   listParticipants,
   listTranscriptVersions,
   saveEditedTranscript,
@@ -21,7 +23,19 @@ export const transcriptKeys = {
     ["transcript", "version", interviewId, kind] as const,
   participants: (interviewId: string) =>
     ["participants", interviewId] as const,
+  checkpoint: (interviewId: string) =>
+    ["transcribe-checkpoint", interviewId] as const,
 };
+
+// The saved transcription checkpoint, if any (drives the editor's "resume from M:SS" banner).
+// Browser mock never checkpoints, so it's disabled outside Tauri.
+export function useTranscribeCheckpoint(interviewId: string | undefined) {
+  return useQuery({
+    queryKey: transcriptKeys.checkpoint(interviewId ?? ""),
+    queryFn: () => getTranscribeCheckpoint(interviewId as string),
+    enabled: !!interviewId && IN_TAURI,
+  });
+}
 
 // The list of transcript versions that exist (drives the version Select).
 export function useTranscriptVersions(interviewId: string | undefined) {

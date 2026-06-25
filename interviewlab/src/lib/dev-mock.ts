@@ -1596,7 +1596,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
         iv.status = "transcribing";
         iv.updated_at = Date.now();
       }
-      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 0, segment_text: null, error: null });
+      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 0, segment_text: null, segment: null, error: null });
       // Stream percent, then a couple of fake segments, then finish. Diarization now yields
       // REAL alternating speaker labels (S1 interviewer / S2 respondent), so the mock segments
       // alternate too — the editor groups them into one S1 turn + one S2 turn.
@@ -1608,7 +1608,12 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       const step = () => {
         p += 25;
         if (p < 100) {
-          emitAsr({ interview_id: interviewId, status: "transcribing", progress: p, segment_text: null, error: null });
+          emitAsr({ interview_id: interviewId, status: "transcribing", progress: p, segment_text: null, segment: null, error: null });
+          // Also stream the demo segments as live ticks so the browser preview exercises the
+          // editor's live view (one segment per percent step).
+          const seg = segs[p / 25 - 1];
+          if (seg)
+            emitAsr({ interview_id: interviewId, status: "transcribing", progress: -1, segment_text: seg.text, segment: seg, error: null });
           setTimeout(step, 250);
         } else {
           const tid = uuid();
@@ -1626,7 +1631,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
             iv.status = "transcribed";
             iv.updated_at = Date.now();
           }
-          emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, error: null });
+          emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, segment: null, error: null });
         }
       };
       setTimeout(step, 250);
@@ -1695,6 +1700,32 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
         emitDiar({ interview_id: interviewId, status: "done", progress: 100, speakers: detected });
       }, 600);
       return Promise.resolve(detected as T);
+    }
+
+    // --- partial re-transcribe + crash resume (browser preview) --------------
+    // The real engine work is in Rust; the preview just emits a short live run so the editor's
+    // live view + progress are demonstrable, then resolves with a fake transcript id.
+    case "retranscribe_range":
+    case "resume_transcription": {
+      const interviewId = String(a.interviewId);
+      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 10, segment_text: null, segment: null, error: null });
+      const seg = { start_ms: Number(a.startMs ?? 0), end_ms: Number(a.endMs ?? 2000), speaker_label: "S1", text: "Перетранскрибированный фрагмент (preview)." };
+      setTimeout(() => {
+        emitAsr({ interview_id: interviewId, status: "transcribing", progress: -1, segment_text: seg.text, segment: seg, error: null });
+      }, 200);
+      setTimeout(() => {
+        emitDiar({ interview_id: interviewId, status: "diarizing", progress: 50, speakers: null });
+      }, 400);
+      setTimeout(() => {
+        emitDiar({ interview_id: interviewId, status: "done", progress: 100, speakers: 2 });
+        emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, segment: null, error: null });
+      }, 700);
+      return Promise.resolve(uuid() as T);
+    }
+
+    case "get_transcribe_checkpoint": {
+      // No saved partial run in the browser preview.
+      return Promise.resolve(null as T);
     }
 
     // --- M5 transcript editor ------------------------------------------------

@@ -11,6 +11,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { useUiStore } from "@/lib/ui-store";
+import { useLiveAsr } from "@/lib/use-live-asr";
 import { cn } from "@/lib/utils";
 
 // React Router shell (M2): App is the layout; nested routes render in <Outlet />.
@@ -137,6 +138,10 @@ function Header({ cycleId }: { cycleId: string | null }) {
 
 function App() {
   const cycleId = useCurrentCycleId();
+
+  // Capture live transcription/diarization progress globally so opening an interview
+  // mid-run shows it filling in (and the editor swaps to the stored transcript on finish).
+  useLiveAsr();
 
   // Chat state lives at the shell now (lifted from cycle-detail) so the panel docks on
   // ANY cycle screen, incl. the transcript editor. Open/width persist per cycle.
