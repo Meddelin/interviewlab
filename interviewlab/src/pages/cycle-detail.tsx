@@ -21,6 +21,7 @@ import { MarkdownEditor } from "@/components/markdown-editor";
 import { InterviewsTab } from "@/components/interviews-tab";
 import { SynthesisTab } from "@/components/synthesis-tab";
 import { DiffTab } from "@/components/diff-tab";
+import { InterviewProgressProvider } from "@/lib/interview-progress";
 import { absoluteDate } from "@/lib/format";
 
 // Sentinel for "no previous cycle" — radix Select forbids an empty-string item value.
@@ -314,27 +315,37 @@ export function CycleDetailPage() {
   // persist on EVERY cycle screen incl. the transcript editor. This page is now just the
   // cycle's tabs; the shell docks the panel against the whole content area.
   return (
-    <div className="flex h-full min-h-0 flex-col gap-5">
-      <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1 gap-5">
-        <TabsList variant="line" className="border-b border-border pb-0">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="interviews">Interviews</TabsTrigger>
-          <TabsTrigger value="synthesis">Synthesis</TabsTrigger>
-          <TabsTrigger value="diff">Diff</TabsTrigger>
-        </TabsList>
-        <TabsContent value="overview">
-          <OverviewTab cycleId={id} />
-        </TabsContent>
-        <TabsContent value="interviews">
-          <InterviewsTab cycleId={id} />
-        </TabsContent>
-        <TabsContent value="synthesis">
-          <SynthesisTab cycleId={id} />
-        </TabsContent>
-        <TabsContent value="diff">
-          <DiffTab cycleId={id} />
-        </TabsContent>
-      </Tabs>
-    </div>
+    // Provider OUTSIDE the Tabs so the live ASR/diarization/cleanup subscriptions persist
+    // across tab switches — Radix unmounts inactive TabsContent, so listeners kept inside the
+    // Interviews tab would be torn down on switch and miss progress while the (still-running)
+    // backend task transcribes. Mounted here, the percent keeps ticking on whichever tab.
+    <InterviewProgressProvider cycleId={id}>
+      <div className="flex h-full min-h-0 flex-col gap-5">
+        <Tabs
+          value={tab}
+          onValueChange={setTab}
+          className="min-h-0 flex-1 gap-5"
+        >
+          <TabsList variant="line" className="border-b border-border pb-0">
+            <TabsTrigger value="overview">Overview</TabsTrigger>
+            <TabsTrigger value="interviews">Interviews</TabsTrigger>
+            <TabsTrigger value="synthesis">Synthesis</TabsTrigger>
+            <TabsTrigger value="diff">Diff</TabsTrigger>
+          </TabsList>
+          <TabsContent value="overview">
+            <OverviewTab cycleId={id} />
+          </TabsContent>
+          <TabsContent value="interviews">
+            <InterviewsTab cycleId={id} />
+          </TabsContent>
+          <TabsContent value="synthesis">
+            <SynthesisTab cycleId={id} />
+          </TabsContent>
+          <TabsContent value="diff">
+            <DiffTab cycleId={id} />
+          </TabsContent>
+        </Tabs>
+      </div>
+    </InterviewProgressProvider>
   );
 }
