@@ -351,6 +351,11 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       row.status === "transcribed" ||
       row.status === "cleaned" ||
       row.status === "edited" ||
+      // Open WHILE transcribing too: a slow (e.g. Mac CPU) run is exactly when you want to
+      // get into the window and watch the transcript + diarization fill in live. The editor
+      // detects the in-flight run and shows its live view instead of an empty transcript.
+      row.status === "transcribing" ||
+      asrProgress[row.id] != null ||
       // Also open `error` rows: a failed cleanup (or other post-transcription step) must never
       // lock the user out of a good transcript. The editor loads whatever versions exist and
       // shows a graceful empty state if there genuinely is none, so this is always safe.

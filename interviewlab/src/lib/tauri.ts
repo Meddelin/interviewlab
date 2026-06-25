@@ -158,12 +158,15 @@ export type TranscriptRow = {
 };
 
 // Payload of the `asr://progress` event (Rust `AsrProgress`). progress < 0 means a
-// live segment-text update (no percent); status drives the interview row badge.
+// live segment update (no percent); status drives the interview row badge. `segment`
+// carries the full live segment (timing + text) as whisper decodes it, so a watching
+// editor can accumulate the transcript in real time — `segment_text` is its text alone.
 export type AsrProgress = {
   interview_id: string;
   status: string; // 'transcribing' | 'transcribed' | 'error'
-  progress: number; // 0..100, or -1 for a segment-text tick
+  progress: number; // 0..100, or -1 for a live segment tick
   segment_text: string | null;
+  segment: Segment | null;
   error: string | null;
 };
 

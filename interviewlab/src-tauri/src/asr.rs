@@ -595,7 +595,9 @@ fn run_whisper(
     // whisper-rs 0.16's set_progress_callback_safe requires a 'static callback (it's
     // handed to the C side), so on_progress must own its captures.
     mut on_progress: impl FnMut(i32) + 'static,
-    mut on_segment: impl FnMut(Segment),
+    // Live per-segment callback, fired as each segment is DECODED (not after the run) via
+    // whisper.cpp's new-segment callback — hence the 'static bound (handed to the C side).
+    mut on_segment: impl FnMut(Segment) + 'static,
 ) -> Result<Vec<Segment>, String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -715,6 +717,24 @@ fn run_whisper(
     // Progress 0..100 (spec §3.3 "Progress bar streams percent").
     params.set_progress_callback_safe(move |p: i32| on_progress(p));
 
+    // Live segment streaming (Mac slow-run observability): whisper.cpp fires its new-segment
+    // callback as EACH segment is decoded, so a watcher can accumulate the transcript in real
+    // time instead of waiting for the whole run. We deliberately use this (not the post-run
+    // get_segment loop below) for the live signal — state.full() only returns once the WHOLE
+    // decode is done, so the post-loop is a burst, not a stream. The post-loop still builds the
+    // authoritative Vec for storage; this callback only emits the live ticks. Live segments carry
+    // the placeholder "S1" — real diarization relabels them in the final stored transcript.
+    // whisper-rs 0.16's `set_segment_callback_safe` takes a 'static FnMut(SegmentCallbackData);
+    // timestamps are centiseconds → ms (same scale as get_segment below).
+    params.set_segment_callback_safe(move |data: whisper_rs::SegmentCallbackData| {
+        on_segment(Segment {
+            start_ms: data.start_timestamp * 10,
+            end_ms: data.end_timestamp * 10,
+            speaker_label: "S1".to_string(),
+            text: data.text.trim().to_string(),
+        });
+    });
+
     // Abort callback (bug #1/#5): polled by whisper.cpp between compute steps. Returning
     // true aborts the run mid-flight → state.full returns an error → no indefinite hang.
     // The flag is flipped by the manual Stop command or the watchdog timeout.
@@ -779,7 +799,8 @@ fn run_whisper(
             speaker_label: "S1".to_string(),
             text,
         };
-        on_segment(out.clone());
+        // NOTE: live emission happens in the new-segment callback above (streamed as decoded);
+        // here we only collect the authoritative Vec for storage, so we DON'T re-emit.
         segments.push(out);
     }
     Ok(segments)
@@ -791,8 +812,12 @@ fn run_whisper(
 struct AsrProgress {
     interview_id: String,
     status: String,        // 'transcribing' | 'transcribed' | 'error'
-    progress: i32,         // 0..100
-    segment_text: Option<String>, // most-recent segment (for a live preview), if any
+    progress: i32,         // 0..100, or -1 on a live segment tick
+    segment_text: Option<String>, // most-recent segment text (live preview), if any
+    // The full live segment (timing + text) emitted as whisper decodes it, so a watcher (the
+    // open transcript editor) can accumulate the transcript in real time — not just the last
+    // line. None on percent/terminal ticks. Carries the placeholder "S1" until diarization.
+    segment: Option<Segment>,
     error: Option<String>,
 }
 
@@ -805,14 +830,17 @@ struct ModelProgress {
     error: Option<String>,
 }
 
-fn emit_asr(app: &tauri::AppHandle, interview_id: &str, status: &str, progress: i32, segment_text: Option<String>, error: Option<String>) {
+fn emit_asr(app: &tauri::AppHandle, interview_id: &str, status: &str, progress: i32, segment: Option<Segment>, error: Option<String>) {
     let _ = app.emit(
         ASR_PROGRESS_EVENT,
         AsrProgress {
             interview_id: interview_id.to_string(),
             status: status.to_string(),
             progress,
-            segment_text,
+            // Keep segment_text populated from the live segment for back-compat with any
+            // text-only consumer; new consumers read the full `segment`.
+            segment_text: segment.as_ref().map(|s| s.text.clone()),
+            segment,
             error,
         },
     );
@@ -1091,11 +1119,11 @@ pub async fn transcribe_interview(
                 let iv = iv_for_cb.clone();
                 move |p: i32| emit_asr(&app, &iv, STATUS_TRANSCRIBING, p, None, None)
             },
-            // segment callback → live preview event
+            // segment callback → live transcript tick (full segment: timing + text)
             {
                 let app = app_for_cb.clone();
                 let iv = iv_for_cb.clone();
-                move |seg: Segment| emit_asr(&app, &iv, STATUS_TRANSCRIBING, -1, Some(seg.text.clone()), None)
+                move |seg: Segment| emit_asr(&app, &iv, STATUS_TRANSCRIBING, -1, Some(seg), None)
             },
         )
     });
@@ -1744,7 +1772,12 @@ mod tests {
         let samples = read_wav_16k_mono(&wav).expect("read wav");
         assert!(samples.len() > 16000, "expected >1s of audio samples, got {}", samples.len());
 
-        let mut got_segments: Vec<Segment> = Vec::new();
+        // The live segment callback now fires DURING decode (whisper.cpp new-segment callback)
+        // and is handed to the C side, so it must be 'static — collect through shared ownership
+        // (Rc<RefCell>) rather than a borrowing closure.
+        let got_segments: std::rc::Rc<std::cell::RefCell<Vec<Segment>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let got_for_cb = got_segments.clone();
         let segs = run_whisper(
             &model,
             &samples,
@@ -1753,12 +1786,12 @@ mod tests {
             false, // CPU
             None,  // no cancellation in the test path
             |p| { if p % 25 == 0 { println!("progress {p}%"); } },
-            |s| got_segments.push(s),
+            move |s| got_for_cb.borrow_mut().push(s),
         )
         .expect("run_whisper");
 
         assert!(!segs.is_empty(), "whisper returned no segments");
-        assert_eq!(segs.len(), got_segments.len(), "segment callback count must match returned count");
+        assert_eq!(segs.len(), got_segments.borrow().len(), "segment callback count must match returned count");
         let text = segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ").to_lowercase();
         println!("spoken:     the quick brown fox jumps over the lazy dog");
         println!("recognized: {text}");

@@ -1596,7 +1596,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
         iv.status = "transcribing";
         iv.updated_at = Date.now();
       }
-      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 0, segment_text: null, error: null });
+      emitAsr({ interview_id: interviewId, status: "transcribing", progress: 0, segment_text: null, segment: null, error: null });
       // Stream percent, then a couple of fake segments, then finish. Diarization now yields
       // REAL alternating speaker labels (S1 interviewer / S2 respondent), so the mock segments
       // alternate too — the editor groups them into one S1 turn + one S2 turn.
@@ -1608,7 +1608,12 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       const step = () => {
         p += 25;
         if (p < 100) {
-          emitAsr({ interview_id: interviewId, status: "transcribing", progress: p, segment_text: null, error: null });
+          emitAsr({ interview_id: interviewId, status: "transcribing", progress: p, segment_text: null, segment: null, error: null });
+          // Also stream the demo segments as live ticks so the browser preview exercises the
+          // editor's live view (one segment per percent step).
+          const seg = segs[p / 25 - 1];
+          if (seg)
+            emitAsr({ interview_id: interviewId, status: "transcribing", progress: -1, segment_text: seg.text, segment: seg, error: null });
           setTimeout(step, 250);
         } else {
           const tid = uuid();
@@ -1626,7 +1631,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
             iv.status = "transcribed";
             iv.updated_at = Date.now();
           }
-          emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, error: null });
+          emitAsr({ interview_id: interviewId, status: "transcribed", progress: 100, segment_text: null, segment: null, error: null });
         }
       };
       setTimeout(step, 250);

@@ -73,7 +73,9 @@ import type {
   ParticipantInput,
   Segment,
 } from "@/lib/tauri";
-import { IN_TAURI, rewriteSegment } from "@/lib/tauri";
+import { cancelTranscription, IN_TAURI, rewriteSegment } from "@/lib/tauri";
+import { EMPTY_LIVE_ASR, useLiveAsrStore } from "@/lib/live-asr-store";
+import { LiveTranscriptView } from "@/components/live-transcript-view";
 import { mockAudioSrc } from "@/lib/dev-mock";
 import { formatTimecode } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -673,6 +675,34 @@ export function TranscriptEditorPage() {
   const roles = useMemo(() => rolesData ?? [], [rolesData]);
   const saveMutation = useSaveEditedTranscript(interviewId ?? "");
 
+  // ── Live transcription/diarization (watch a slow run fill in) ──
+  // The global listener (App) feeds this store from a run's first event, so opening the
+  // interview mid-run shows it streaming. `isLive` is true while a run is in flight; the
+  // editor then renders the read-only live view instead of the (empty) stored transcript.
+  const live = useLiveAsrStore(
+    (s) => s.byInterview[interviewId ?? ""] ?? EMPTY_LIVE_ASR,
+  );
+  const resetLive = useLiveAsrStore((s) => s.reset);
+  const isLive =
+    live.status === "transcribing" ||
+    (interview?.status === "transcribing" &&
+      live.status !== "transcribed" &&
+      live.status !== "error");
+
+  // Once a run finishes AND the stored transcript + refreshed row have landed, drop the live
+  // buffer — the editable, diarized version takes over. Gating on the row no longer being
+  // `transcribing` avoids a flicker back into live mode from a momentarily-stale row status.
+  useEffect(() => {
+    if (!interviewId) return;
+    if (
+      live.status === "transcribed" &&
+      version &&
+      interview?.status !== "transcribing"
+    ) {
+      resetLive(interviewId);
+    }
+  }, [live.status, version, interview?.status, interviewId, resetLive]);
+
   // ── Local editable buffers (edits are local until Save, spec §4.5). ──
   const [segments, setSegments] = useState<Segment[]>([]);
   const [participants, setParticipants] = useState<DraftParticipant[]>([]);
@@ -1045,9 +1075,18 @@ export function TranscriptEditorPage() {
               as plain text. The `cleaned` version + clean_transcript command still exist in the
               backend; they're simply no longer driven from the editor. */}
 
+          {/* A run is in flight → the live view owns its own status + Stop; hide the
+              version Select + Save until the stored transcript is ready. */}
+          {pane === "transcript" && isLive && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
+              <Loader2 className="size-3.5 animate-spin" />
+              <span>{live.diarActive ? "Diarizing…" : "Transcribing…"}</span>
+            </span>
+          )}
+
           {/* Version Select + Save are transcript-only; the Summary view owns its own
               Run/Save controls inside the panel (M10b). */}
-          {pane === "transcript" && (
+          {pane === "transcript" && !isLive && (
             <>
               {/* Version Select (raw / cleaned / edited). */}
               <Select value={activeKind} onValueChange={setActiveKind}>
@@ -1142,6 +1181,18 @@ export function TranscriptEditorPage() {
         <ResizablePanel defaultSize={66} minSize={40}>
           {pane === "summary" ? (
             <InterviewSummaryPanel interviewId={interviewId ?? ""} />
+          ) : isLive ? (
+            <LiveTranscriptView
+              segments={live.segments}
+              progress={live.progress}
+              diarActive={live.diarActive}
+              diarStartedAt={live.diarStartedAt}
+              speakers={live.speakers}
+              durationMs={interview?.duration_ms ?? null}
+              onStop={() => {
+                if (interviewId) cancelTranscription(interviewId).catch(() => {});
+              }}
+            />
           ) : (
           <div className="relative flex h-full min-h-0 flex-col">
             {/* ponytail: dropped the cryptic "shift-click a row…" hint — the per-row
