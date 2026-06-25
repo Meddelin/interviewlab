@@ -192,17 +192,27 @@ pub fn diarize_samples(
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let n_threads = (cores / 2).clamp(2, 6) as i32;
 
+    // ONNX Runtime execution provider. On Apple Silicon ask for CoreML (Apple Neural Engine /
+    // GPU) — it offloads the segmentation + embedding forward passes (the pipeline's slow pole)
+    // off the CPU. ORT silently falls back to CPU for any op CoreML doesn't support, and a
+    // missing CoreML EP just fails session-create (which diarize_and_store already treats as
+    // best-effort → single speaker), so this can never break transcription. Everywhere else:
+    // CPU (the sherpa default). // ponytail: flip to "cpu" if CoreML regresses on a real Mac.
+    let provider = if cfg!(target_os = "macos") { "coreml" } else { "cpu" };
+
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
                 model: Some(seg_model.to_string_lossy().into_owned()),
             },
             num_threads: n_threads,
+            provider: Some(provider.to_string()),
             ..Default::default()
         },
         embedding: SpeakerEmbeddingExtractorConfig {
             model: Some(emb_model.to_string_lossy().into_owned()),
             num_threads: n_threads,
+            provider: Some(provider.to_string()),
             ..Default::default()
         },
         clustering: FastClusteringConfig {

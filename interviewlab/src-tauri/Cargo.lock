@@ -2044,6 +2044,7 @@ dependencies = [
  "ureq 3.3.0",
  "uuid",
  "whisper-rs",
+ "zip",
 ]
 
 [[package]]

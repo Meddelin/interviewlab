@@ -715,14 +715,18 @@ fn run_whisper(
     let mut state = ctx.create_state().map_err(|e| format!("whisper state: {e}"))?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    // Decode threads. whisper-rs defaults to min(4, cores). On the GPU backends the encode/decode
-    // runs on the GPU, but the log-mel front-end + token sampling are CPU-side, so give them a few
-    // more cores on a bigger machine (e.g. an M3 Pro). Clamp [4, 8]: past that it's contention, not
-    // speed. ponytail: tunable knob.
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 8) as i32;
+    // Decode threads — backend-aware (single source of truth; do NOT re-set below).
+    // On a GPU build (Metal/CUDA) whisper offloads encode+decode to the GPU, leaving only the
+    // log-mel front-end + token sampling on the CPU; those stop scaling past ~8 threads (more is
+    // contention, not speed — see mac-build.md), so clamp [4, 8]. On a CPU build the whole decode
+    // is on the CPU and wants every core, so use all-but-one (keeps the UI thread responsive).
+    // ponytail: tunable knob.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n_threads = if use_gpu {
+        cores.clamp(4, 8) as i32
+    } else {
+        (cores as i32 - 1).max(1)
+    };
     params.set_n_threads(n_threads);
     // Quiet the C++ side; we surface progress/segments through callbacks instead.
     params.set_print_special(false);
@@ -776,9 +780,6 @@ fn run_whisper(
             params.set_initial_prompt(&cleaned);
         }
     }
-    // Use all but one core for CPU runs so the UI thread stays responsive.
-    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i32 - 1).max(1);
-    params.set_n_threads(threads);
 
     // Progress 0..100 (spec §3.3 "Progress bar streams percent").
     params.set_progress_callback_safe(move |p: i32| on_progress(p));
@@ -1003,9 +1004,80 @@ pub async fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, String
     Ok(out)
 }
 
+// --- macOS Core ML / ANE encoder artifact (whisper `coreml` feature) --------------------
+//
+// When built with `--features metal,coreml`, whisper.cpp runs the heavy ENCODER on the Apple
+// Neural Engine — but only if a compiled CoreML bundle `ggml-<id>-encoder.mlmodelc` sits next
+// to the ggml `.bin`. Hugging Face ships it as a `.zip`; we fetch + unzip it best-effort right
+// after the `.bin` lands, so the ANE path engages with no manual placement. It is purely an
+// enhancement: a missing/failed artifact just makes whisper.cpp log a notice and fall back to
+// the Metal encoder, so this NEVER gates ASR. Compiled to a no-op off the macOS+coreml build.
+
+// The encoder bundle dir name for a model: `ggml-large-v3.bin` → `ggml-large-v3-encoder.mlmodelc`.
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn coreml_encoder_name(entry: &CatalogEntry) -> String {
+    format!("{}-encoder.mlmodelc", entry.file.trim_end_matches(".bin"))
+}
+
+// Fetch + extract the CoreML encoder bundle into `dir` (best-effort; idempotent). Blocking I/O
+// (ureq + zip) → callers run it on a spawn_blocking task.
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn fetch_coreml_encoder(dir: &std::path::Path, entry: &CatalogEntry) -> Result<(), String> {
+    use std::io::Read as _;
+    let name = coreml_encoder_name(entry);
+    let dest = dir.join(&name);
+    if dest.exists() {
+        return Ok(()); // already have the bundle
+    }
+    let url = format!("{HF_BASE}/{name}.zip");
+    let resp = ureq::get(&url).call().map_err(|e| format!("request coreml encoder: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read coreml encoder zip: {e}"))?;
+    // Extract into a staging sibling, then atomically move the bundle into place so a partial
+    // unzip never looks complete.
+    let staging = dir.join(format!("{name}.part"));
+    let _ = std::fs::remove_dir_all(&staging);
+    zip::ZipArchive::new(std::io::Cursor::new(buf))
+        .map_err(|e| format!("open coreml encoder zip: {e}"))?
+        .extract(&staging)
+        .map_err(|e| format!("extract coreml encoder zip: {e}"))?;
+    // The archive usually wraps the files in a top-level `<name>/` dir; tolerate both layouts.
+    let inner = staging.join(&name);
+    let src = if inner.is_dir() { inner } else { staging.clone() };
+    std::fs::rename(&src, &dest).map_err(|e| format!("finalize coreml encoder: {e}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+// Best-effort: fetch the CoreML encoder for `entry` into `dir`, logging the outcome. Never
+// errors out of band — the ggml `.bin` alone is enough to transcribe (Metal-encoder fallback).
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+fn ensure_coreml_encoder(dir: &std::path::Path, entry: &CatalogEntry) {
+    match fetch_coreml_encoder(dir, entry) {
+        Ok(()) => log::info!(
+            target: "interviewlab::asr",
+            "coreml encoder ready next to {} ({} ANE path)", entry.file, coreml_encoder_name(entry)
+        ),
+        Err(e) => log::warn!(
+            target: "interviewlab::asr",
+            "coreml encoder for '{}' not fetched ({e}); whisper.cpp will use the Metal encoder \
+             (slower but fine). hint: check network/proxy + that HF has {}.zip",
+            entry.id, coreml_encoder_name(entry)
+        ),
+    }
+}
+
+// No-op off the macOS+coreml build (other platforms have no CoreML framework).
+#[cfg(not(all(target_os = "macos", feature = "coreml")))]
+fn ensure_coreml_encoder(_dir: &std::path::Path, _entry: &CatalogEntry) {}
+
 // Download a ggml model into models/ with byte-progress events (spec §6.4). Streams to
 // a .part file then renames, so an interrupted download never leaves a half file that
-// looks complete. Runs the blocking HTTP read on a spawn_blocking task.
+// looks complete. Runs the blocking HTTP read on a spawn_blocking task. On the macOS+coreml
+// build it then fetches the matching CoreML encoder bundle so the ANE path engages.
 #[tauri::command]
 pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
     let entry = catalog_entry(&model_id).ok_or_else(|| format!("unknown model id: {model_id}"))?;
@@ -1013,8 +1085,12 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
     std::fs::create_dir_all(&dir).map_err(|e| format!("create models dir: {e}"))?;
     let dest = dir.join(entry.file);
     if dest.exists() {
+        // Have the weights already — still ensure the CoreML encoder bundle is present (e.g.
+        // after upgrading to a coreml build). Best-effort, off-thread; a no-op on other builds.
+        let dir2 = dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || ensure_coreml_encoder(&dir2, entry)).await;
         emit_model(&app, &model_id, 1, 1, true, None);
-        return Ok(()); // already have it
+        return Ok(()); // already have the weights
     }
     let url = format!("{HF_BASE}/{}", entry.file);
     let part = dest.with_extension("part");
@@ -1072,6 +1148,10 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
         emit_model(&app, &model_id, 0, 0, true, Some(e.clone()));
     } else {
         log::info!(target: "interviewlab::asr", "model download OK: '{model_id}' ({}) into {}", entry.file, dir.display());
+        // Weights are in place — fetch the matching CoreML encoder so the ANE path engages.
+        // Best-effort, off-thread; a no-op off the macOS+coreml build.
+        let dir2 = dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || ensure_coreml_encoder(&dir2, entry)).await;
     }
     result
 }
@@ -1267,6 +1347,21 @@ async fn diarize_and_store(
             }
         }
     }
+
+    // Coalesce whisper's over-fragmentation into sentence-level segments. whisper's timestamp
+    // boundaries get progressively finer on harder audio (quieter speech, cross-talk, lower
+    // decoder confidence late in a long interview), so a single sentence can arrive as several
+    // 1-2 word fragments — sometimes a lone pronoun. This folds runs of consecutive SAME-SPEAKER
+    // fragments back into one segment (see merge_short_segments). Runs AFTER diarization so it
+    // never merges across a speaker turn, and only here at raw-transcript creation (no evidence /
+    // edits exist yet, and timing is preserved), so every downstream contract stays intact.
+    let pre_merge = segments.len();
+    segments = merge_short_segments(segments);
+    log::info!(
+        target: "interviewlab::asr",
+        "transcribe: interview='{interview_id}': coalesced {pre_merge} whisper segments → {} sentence-level segments",
+        segments.len()
+    );
 
     let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
     let lang_label = language.as_deref().filter(|s| *s != "auto");
@@ -1578,6 +1673,69 @@ fn splice_segments(base: &[Segment], incoming: Vec<Segment>, start_ms: i64, end_
     out
 }
 
+// --- sentence-level coalescing (fixes progressive over-fragmentation) ----------
+
+// Max same-speaker gap (ms) that still reads as one continuing sentence: below it we glue
+// adjacent fragments, at/above it a real pause breaks the segment. Same spirit as the editor's
+// display-side COALESCE_GAP_MS (transcript-editor.tsx) but a touch tighter, since we ALSO break
+// on sentence-final punctuation. // ponytail: tunable knob.
+const SENTENCE_MERGE_GAP_MS: i64 = 1200;
+// Hard ceiling on a merged segment's span, so a long punctuation-free monologue can't fold into
+// one giant block (keeps edit boxes + evidence quotes a sane size). // ponytail: tunable knob.
+const SENTENCE_MERGE_MAX_SPAN_MS: i64 = 30_000;
+
+// Coalesce whisper's over-fragmented output into sentence-level segments.
+//
+// Whisper splits on the timestamp tokens it emits, and on harder audio it emits them ever more
+// frequently — so late in a long interview a single sentence can come back as several 1-2 word
+// segments (the "shorter and shorter, ending in a lone pronoun" symptom). This folds a run of
+// consecutive SAME-SPEAKER fragments back into one segment, stopping at: a sentence-final mark,
+// a real pause (>= SENTENCE_MERGE_GAP_MS), the span cap, or a speaker change. Must run AFTER
+// diarization (so speaker_label is authoritative and turns never merge together). Timing is
+// preserved exactly (merged span = first.start .. last.end) — only the GRANULARITY changes —
+// so media-sync, the timing-immutability invariant, cleanup's by-index alignment, and evidence
+// refs all stay intact (raw segments are brand-new here; nothing references them yet).
+fn merge_short_segments(segments: Vec<Segment>) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        match out.last_mut() {
+            // Continue the current sentence: same speaker, no real pause, under the span cap,
+            // and the running text hasn't hit a sentence boundary yet.
+            Some(prev)
+                if prev.speaker_label == seg.speaker_label
+                    && seg.start_ms - prev.end_ms <= SENTENCE_MERGE_GAP_MS
+                    && seg.end_ms - prev.start_ms <= SENTENCE_MERGE_MAX_SPAN_MS
+                    && !ends_sentence(&prev.text) =>
+            {
+                prev.end_ms = seg.end_ms;
+                let t = seg.text.trim();
+                if !t.is_empty() {
+                    if !prev.text.is_empty() {
+                        prev.text.push(' ');
+                    }
+                    prev.text.push_str(t);
+                }
+            }
+            // Start a fresh segment (first one, speaker change, pause, span cap, or sentence end).
+            _ => out.push(Segment { text: seg.text.trim().to_string(), ..seg }),
+        }
+    }
+    out
+}
+
+// True when `text` ends with sentence-final punctuation (Latin + the Russian set), i.e. a
+// natural place to break a segment. Trailing closing quotes/brackets after the mark are
+// tolerated (e.g. `сказал он.»`).
+fn ends_sentence(text: &str) -> bool {
+    let trimmed = text
+        .trim_end()
+        .trim_end_matches(|c| matches!(c, '"' | '»' | '”' | '«' | ')' | ']' | '\''));
+    matches!(
+        trimmed.chars().next_back(),
+        Some('.') | Some('!') | Some('?') | Some('…')
+    )
+}
+
 // Re-transcribe + re-diarize a TIME RANGE of an interview's audio (feature: "redo a chunk
 // that came out wrong"). Runs whisper on just [start_ms, end_ms], splices the result over the
 // stored transcript's segments in that window, then re-diarizes the WHOLE audio so speaker
@@ -1802,6 +1960,64 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(out.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), vec!["p1", "p2", "t1", "t2"]);
         assert!(out.windows(2).all(|w| w[0].start_ms <= w[1].start_ms), "result stays sorted");
+    }
+
+    // merge_short_segments folds a run of same-speaker fragments into one sentence, breaking at
+    // the sentence-final mark — the core fix for whisper's progressive over-fragmentation.
+    #[test]
+    fn merge_coalesces_same_speaker_fragments_until_sentence_end() {
+        let segs = vec![
+            seg_at(0, 1500, "Это"),
+            seg_at(1500, 3000, "целое"),
+            seg_at(3000, 4200, "предложение."),
+            seg_at(4300, 5000, "Новое"),
+        ];
+        let out = merge_short_segments(segs);
+        assert_eq!(out.len(), 2, "three fragments glue, the period breaks before 'Новое'");
+        assert_eq!(out[0].text, "Это целое предложение.");
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 4200, "merged span = first.start .. last.end (timing preserved)");
+        assert_eq!(out[1].text, "Новое");
+    }
+
+    // A speaker change OR a real pause breaks the run even with no punctuation.
+    #[test]
+    fn merge_never_crosses_speaker_or_pause() {
+        // Different speaker → never merged (diarization turn boundary).
+        let mut second = seg_at(1600, 3000, "мир");
+        second.speaker_label = "S2".into();
+        let out = merge_short_segments(vec![seg_at(0, 1500, "Привет"), second]);
+        assert_eq!(out.len(), 2);
+        // Same speaker but a pause longer than the gap → still breaks.
+        let gapped = seg_at(1500 + SENTENCE_MERGE_GAP_MS + 1, 3000, "мир");
+        let out = merge_short_segments(vec![seg_at(0, 1500, "Привет"), gapped]);
+        assert_eq!(out.len(), 2);
+    }
+
+    // A punctuation-free run still breaks at the span ceiling (no runaway mega-segment).
+    #[test]
+    fn merge_respects_span_cap() {
+        let mut segs = Vec::new();
+        let mut t = 0;
+        while t < SENTENCE_MERGE_MAX_SPAN_MS + 10_000 {
+            segs.push(seg_at(t, t + 2000, "ещё")); // no terminal punctuation, tiny gaps
+            t += 2000;
+        }
+        let out = merge_short_segments(segs);
+        assert!(out.len() >= 2, "span cap forces at least one break");
+        assert!(out.iter().all(|s| s.end_ms - s.start_ms <= SENTENCE_MERGE_MAX_SPAN_MS));
+    }
+
+    // ends_sentence recognises the Latin + Russian sentence-final marks, tolerating trailing
+    // quotes/brackets, and rejects bare words.
+    #[test]
+    fn ends_sentence_handles_russian_and_quotes() {
+        for s in ["Да.", "Что?", "Стоп!", "Подожди…", "«Привет.»", "(готово.)"] {
+            assert!(ends_sentence(s), "{s:?} should count as a sentence end");
+        }
+        for s in ["просто слова", "местоимение", "он сказал что"] {
+            assert!(!ends_sentence(s), "{s:?} should NOT count as a sentence end");
+        }
     }
 
     async fn make_interview(pool: &SqlitePool) -> String {
