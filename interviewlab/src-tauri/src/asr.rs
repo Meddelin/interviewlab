@@ -715,14 +715,18 @@ fn run_whisper(
     let mut state = ctx.create_state().map_err(|e| format!("whisper state: {e}"))?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    // Decode threads. whisper-rs defaults to min(4, cores). On the GPU backends the encode/decode
-    // runs on the GPU, but the log-mel front-end + token sampling are CPU-side, so give them a few
-    // more cores on a bigger machine (e.g. an M3 Pro). Clamp [4, 8]: past that it's contention, not
-    // speed. ponytail: tunable knob.
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 8) as i32;
+    // Decode threads — backend-aware (single source of truth; do NOT re-set below).
+    // On a GPU build (Metal/CUDA) whisper offloads encode+decode to the GPU, leaving only the
+    // log-mel front-end + token sampling on the CPU; those stop scaling past ~8 threads (more is
+    // contention, not speed — see mac-build.md), so clamp [4, 8]. On a CPU build the whole decode
+    // is on the CPU and wants every core, so use all-but-one (keeps the UI thread responsive).
+    // ponytail: tunable knob.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n_threads = if use_gpu {
+        cores.clamp(4, 8) as i32
+    } else {
+        (cores as i32 - 1).max(1)
+    };
     params.set_n_threads(n_threads);
     // Quiet the C++ side; we surface progress/segments through callbacks instead.
     params.set_print_special(false);
@@ -776,9 +780,6 @@ fn run_whisper(
             params.set_initial_prompt(&cleaned);
         }
     }
-    // Use all but one core for CPU runs so the UI thread stays responsive.
-    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i32 - 1).max(1);
-    params.set_n_threads(threads);
 
     // Progress 0..100 (spec §3.3 "Progress bar streams percent").
     params.set_progress_callback_safe(move |p: i32| on_progress(p));
