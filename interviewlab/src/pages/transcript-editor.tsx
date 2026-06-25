@@ -7,7 +7,6 @@ import {
 } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ArrowLeft,
   Check,
@@ -19,7 +18,6 @@ import {
   Play,
   Plus,
   Save,
-  Sparkles,
   Trash2,
   Users,
   Wand2,
@@ -64,21 +62,19 @@ import {
 } from "@/components/waveform-player";
 import { useInterviews } from "@/lib/interview-queries";
 import {
-  useCleanTranscript,
   useParticipants,
   useSaveEditedTranscript,
   useTranscriptVersion,
   useTranscriptVersions,
 } from "@/lib/transcript-queries";
 import type {
-  CleanupProgress,
   InterviewRow,
   Participant,
   ParticipantInput,
   Segment,
 } from "@/lib/tauri";
-import { CLEANUP_PROGRESS_EVENT, IN_TAURI, rewriteSegment } from "@/lib/tauri";
-import { mockAudioSrc, mockOnCleanupProgress } from "@/lib/dev-mock";
+import { IN_TAURI, rewriteSegment } from "@/lib/tauri";
+import { mockAudioSrc } from "@/lib/dev-mock";
 import { formatTimecode } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -486,33 +482,6 @@ function SegmentLine({
           )}
           {formatTimecode(segment.start_ms)}
         </button>
-
-        {/* Per-segment rewrite ("хуйня, переписывай"): re-clean JUST this segment via the CLI
-            and swap in the plain-text result. The antidote to whole-transcript hallucination —
-            one segment in, one clean string out. Quiet at rest, brightens on row hover; shows a
-            spinner while its own request is in flight. Disabled when no editable version is open. */}
-        {canRewrite && (
-          <button
-            type="button"
-            onClick={onRewrite}
-            disabled={rewriting}
-            title="хуйня, переписывай — переписать этот сегмент"
-            aria-label={`Rewrite segment ${index + 1}`}
-            className={cn(
-              "group/rw flex w-fit items-center gap-1 rounded-md px-1 py-0.5 -ml-1 text-[11px] transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
-              rewriting
-                ? "text-primary"
-                : "text-muted-foreground/50 opacity-60 group-hover/seg:opacity-100 hover:bg-secondary/60 hover:text-primary focus-visible:text-primary",
-            )}
-          >
-            {rewriting ? (
-              <Loader2 className="size-3 shrink-0 animate-spin" />
-            ) : (
-              <Wand2 className="size-3 shrink-0" />
-            )}
-            <span>{rewriting ? "Переписываю…" : "Переписать"}</span>
-          </button>
-        )}
       </div>
 
       {/* Editable text. ponytail: pencil icon REMOVED — instead the field itself clearly
@@ -537,6 +506,34 @@ function SegmentLine({
             "focus:border-ring focus:bg-background/80 focus:text-foreground focus:ring-2 focus:ring-ring/40",
           )}
         />
+
+        {/* Per-segment rewrite — the "Хуйня, переписывай" button. Re-cleans JUST this segment
+            via the CLI (plain text in, plain text out) and swaps the result into the field. This
+            is the per-segment replacement for whole-transcript cleanup: one segment in isolation,
+            so the model has nothing to drift across and hallucinates far less. A visible label on
+            every row (subtle at rest, accent on hover); a spinner while its own request runs. */}
+        {canRewrite && (
+          <button
+            type="button"
+            onClick={onRewrite}
+            disabled={rewriting}
+            title="Переписать этот сегмент через модель"
+            aria-label={`Хуйня, переписывай — переписать сегмент ${index + 1}`}
+            className={cn(
+              "mt-1 flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
+              rewriting
+                ? "border-primary/40 bg-primary/10 text-primary"
+                : "border-transparent text-muted-foreground/70 hover:border-border hover:bg-secondary/60 hover:text-primary focus-visible:border-border focus-visible:text-primary",
+            )}
+          >
+            {rewriting ? (
+              <Loader2 className="size-3 shrink-0 animate-spin" />
+            ) : (
+              <Wand2 className="size-3 shrink-0" />
+            )}
+            {rewriting ? "Переписываю…" : "Хуйня, переписывай"}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -675,46 +672,6 @@ export function TranscriptEditorPage() {
   const { data: rolesData } = useRoles();
   const roles = useMemo(() => rolesData ?? [], [rolesData]);
   const saveMutation = useSaveEditedTranscript(interviewId ?? "");
-  const cleanMutation = useCleanTranscript(interviewId ?? "");
-
-  // Live batch progress for the "Clean transcript" pass (cleanup://progress). null when
-  // not running; a 0..100 percent while batches stream.
-  const [cleanPct, setCleanPct] = useState<number | null>(null);
-  useEffect(() => {
-    if (!interviewId) return;
-    function onCleanup(p: CleanupProgress) {
-      if (p.interview_id !== interviewId) return;
-      if (p.status === "cleaning") setCleanPct(p.progress);
-      else setCleanPct(null); // cleaned | error → clear
-    }
-    if (!IN_TAURI) {
-      return mockOnCleanupProgress(onCleanup);
-    }
-    const unlisten = getCurrentWebview().listen<CleanupProgress>(
-      CLEANUP_PROGRESS_EVENT,
-      (e) => onCleanup(e.payload),
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [interviewId]);
-
-  // Run the cleanup pass: stores the `cleaned` version, then switches the Select to it.
-  const cleaning = cleanMutation.isPending || cleanPct != null;
-  const doClean = useCallback(async () => {
-    if (!interviewId || cleaning) return;
-    setCleanPct(0);
-    try {
-      await cleanMutation.mutateAsync();
-      setActiveKind("cleaned");
-      toast.success("Transcript cleaned");
-    } catch (e) {
-      toast.error(`Couldn't clean the transcript. ${String(e)}`);
-    } finally {
-      setCleanPct(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interviewId, cleaning, cleanMutation]);
 
   // ── Local editable buffers (edits are local until Save, spec §4.5). ──
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -1082,30 +1039,11 @@ export function TranscriptEditorPage() {
             </button>
           </div>
 
-          {/* Clean transcript ("no grammar errors" pass, spec §6.7). Available once a
-              raw transcript exists; stores the `cleaned` version + switches to it. */}
-          {pane === "transcript" && availableKinds.includes("raw") && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={doClean}
-              disabled={cleaning}
-              title="Fix grammar, punctuation and filler — timing and speakers are preserved"
-            >
-              {cleaning ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="size-3.5" />
-              )}
-              {cleaning
-                ? cleanPct != null
-                  ? `Cleaning… ${cleanPct}%`
-                  : "Cleaning…"
-                : availableKinds.includes("cleaned")
-                  ? "Re-clean"
-                  : "Clean transcript"}
-            </Button>
-          )}
+          {/* Whole-transcript cleanup was removed: cleaning the entire interview in one
+              JSON-echo pass is exactly where the hallucinations crept in. The fix now lives
+              per-segment — each row's "Хуйня, переписывай" button re-cleans just that segment
+              as plain text. The `cleaned` version + clean_transcript command still exist in the
+              backend; they're simply no longer driven from the editor. */}
 
           {/* Version Select + Save are transcript-only; the Summary view owns its own
               Run/Save controls inside the panel (M10b). */}
