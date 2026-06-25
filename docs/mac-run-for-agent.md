@@ -16,6 +16,8 @@ clearly. A human will then drive the end‑to‑end test (upload a real intervie
 So you know what to aim for. The human will do these clicks; you make each step **reachable** and report failures:
 
 1. Create a **Product** (markdown description) and a **Guide** (research goals) in the libraries.
+   The product editor also has a **Glossary** panel (see the note below) — optionally add a few
+   terms (e.g. `API`, `Figma`, `дедлайн`) before transcribing.
 2. Create a **Cycle**, link the product + guide.
 3. **Upload a real interview** audio file (30+ min, any common format).
 4. **Transcribe** it: pick a local Whisper model, language, `expected speakers = 2`.
@@ -24,10 +26,13 @@ So you know what to aim for. The human will do these clicks; you make each step 
    has a **"Хуйня, переписывай"** button — clicking it re‑cleans **just that one segment** through the
    local CLI and swaps in the result. (There is **no** whole‑transcript "Clean" button anymore — see the
    note below.) Save writes the `edited` version.
-7. **Assign roles** to the speakers (interviewer / respondent).
-8. **Synthesis** → findings grouped by goal + by role.
-9. (Optional) a second cycle → **Diff** vs the previous wave.
-10. **Chat** about the cycle (streaming, grounded answers).
+7. **Build the glossary** (optional but recommended): on the **Interviews** tab each transcribed row has
+   a **"Glossary"** button → suggest terms **From the transcript** or **From my edits**, review the
+   candidates, and accept them into the product glossary (see the note below).
+8. **Assign roles** to the speakers (interviewer / respondent).
+9. **Synthesis** → findings grouped by goal + by role.
+10. (Optional) a second cycle → **Diff** vs the previous wave.
+11. **Chat** about the cycle (streaming, grounded answers).
 
 Everything is **local**: ASR (whisper.cpp) and diarization (sherpa‑onnx) run on‑device, no cloud, no Python.
 Only the LLM steps (cleanup / synthesis / diff / chat) go through a **local AI CLI you configure** (§5) —
@@ -45,6 +50,19 @@ whatever your environment provides. **Claude is not available here**; no specifi
 > changes** (a `json_schema_arg: false` plugin like Nessy works too — the rewrite ignores schema regardless).
 > The backend `clean_transcript` command + the `cleaned` transcript version still exist (nothing depends on
 > them being driven from the editor); they're simply no longer wired to a button.
+
+> **Glossary (anglicisms / technical terms / local product names).** Russian product/tech interviews are
+> full of English terms the ASR mangles (renders phonetically in Cyrillic, inconsistently). The fix is a
+> per‑**product** **Glossary**: each entry is a `canonical` spelling + the garbled `aliases` the ASR
+> produces. It feeds two places: the **whisper `initial_prompt`** (the canonical terms lead the prompt, so
+> the ASR is biased to get them right up‑front) and **every cleanup / per‑segment‑rewrite prompt** (the
+> glossary is the authority for term spellings). Manage terms in the **product editor's Glossary panel**;
+> auto‑fill them from the **Interviews tab → "Glossary"** button, which mines candidates either **from the
+> transcript** or **from your own raw→edited corrections** (so the glossary learns from manual fixes) and
+> lets you review before accepting. For your CLI this means **one extra batch task, `glossary-extract`** —
+> see §5. A plugin that doesn't declare it still works (the app falls back to `cycle-synthesis-extract`),
+> and the glossary itself is fully optional — an empty glossary just means the prompts carry no term list,
+> exactly as before.
 
 ---
 
@@ -205,14 +223,20 @@ is tolerant-parsed (JSONL/array + markdown-fence stripping). This is config-only
     "cycle-synthesis":         { "args_template": ["-p","{prompt}","--output-format","json"] },
     "cycle-synthesis-extract": { "args_template": ["-p","{prompt}","--output-format","json"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p","{prompt}","--output-format","json"] },
+    "glossary-extract":        { "args_template": ["-p","{prompt}","--output-format","json"] },
     "cycle-diff":              { "args_template": ["-p","{prompt}","--output-format","json"] }
   },
   "models": { "flag": "--model", "available": [
     {"id":"tgpt/qwen35-397b-a17b-fp8","label":"Qwen 35 (smart)"},
     {"id":"tgpt/qwen36-35b-a3b-fp8","label":"Qwen 36 (fast)"}],
-    "tasks": {"transcript-cleanup":"tgpt/qwen36-35b-a3b-fp8","cycle-synthesis-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-synthesis-reduce":"tgpt/qwen35-397b-a17b-fp8","cycle-diff":"tgpt/qwen35-397b-a17b-fp8"} }
+    "tasks": {"transcript-cleanup":"tgpt/qwen36-35b-a3b-fp8","cycle-synthesis-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-synthesis-reduce":"tgpt/qwen35-397b-a17b-fp8","glossary-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-diff":"tgpt/qwen35-397b-a17b-fp8"} }
 }
 ```
+> **`glossary-extract`** (new) powers the glossary auto‑suggest (§0 note). It's a plain batch task like
+> the synthesis ones — same `--output-format json` shape, same `json_schema_arg: false` handling — so the
+> line above is all it needs. It's **optional**: omit it and the app falls back to `cycle-synthesis-extract`
+> for suggestions; the term list itself is optional too. Share the Synthesis "Task models" bucket (so the
+> `models.tasks` entry above is what sets its model).
 The optional **`models`** block is what lets you pick Nessy's models per task: `flag` is the CLI's
 model flag (`--model`), `available` populates the **Settings → AI CLI → "Task models"** picker (Cleanup /
 Synthesis / Diff), and `tasks` sets each task's default model. **If you OMIT `models` entirely, the app injects
