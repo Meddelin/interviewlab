@@ -197,6 +197,7 @@ pub fn run() {
             adapter::adapter_meta_instructions,
             adapter::plugin_manifest_schema,
             cleanup::clean_transcript,
+            cleanup::rewrite_segment,
             synthesis::get_synthesis,
             synthesis::cycle_goals,
             synthesis::run_synthesis,

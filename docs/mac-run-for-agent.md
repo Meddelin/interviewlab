@@ -20,7 +20,10 @@ So you know what to aim for. The human will do these clicks; you make each step 
 3. **Upload a real interview** audio file (30+ min, any common format).
 4. **Transcribe** it: pick a local Whisper model, language, `expected speakers = 2`.
 5. Confirm **speaker separation** (S1 / S2 turns) and that segments read as **merged paragraphs**.
-6. **Clean up** the transcript (runs through the local CLI).
+6. **Fix garbled segments** with the **per‑segment rewrite**: in the transcript editor each segment row
+   has a **"Хуйня, переписывай"** button — clicking it re‑cleans **just that one segment** through the
+   local CLI and swaps in the result. (There is **no** whole‑transcript "Clean" button anymore — see the
+   note below.) Save writes the `edited` version.
 7. **Assign roles** to the speakers (interviewer / respondent).
 8. **Synthesis** → findings grouped by goal + by role.
 9. (Optional) a second cycle → **Diff** vs the previous wave.
@@ -29,6 +32,19 @@ So you know what to aim for. The human will do these clicks; you make each step 
 Everything is **local**: ASR (whisper.cpp) and diarization (sherpa‑onnx) run on‑device, no cloud, no Python.
 Only the LLM steps (cleanup / synthesis / diff / chat) go through a **local AI CLI you configure** (§5) —
 whatever your environment provides. **Claude is not available here**; no specific vendor is required.
+
+> **Transcript cleanup is now per‑segment (not whole‑interview).** The old "Clean transcript" button cleaned
+> the entire interview in one CLI call that forced the model to re‑emit an `{id, text}` JSON object for *every*
+> segment — and that JSON‑echo contract is exactly where the model started hallucinating (drifting, inventing,
+> "tidying" spans it shouldn't). It's been **removed from the UI**. Cleanup now happens **one segment at a
+> time**: the editor's per‑row **"Хуйня, переписывай"** button sends **just that segment's text** and accepts a
+> plain‑text reply (the `rewrite_segment` command → `run_cli_task_text`). For your CLI this means: the rewrite
+> reuses the **`transcript-cleanup`** task's `args_template` from your manifest, but **never** injects
+> `--json-schema` and **never** expects `structured_output` — it just reads the envelope's `result` text. So
+> any manifest whose `transcript-cleanup` task emits the normal `--output-format json` envelope works with **no
+> changes** (a `json_schema_arg: false` plugin like Nessy works too — the rewrite ignores schema regardless).
+> The backend `clean_transcript` command + the `cleaned` transcript version still exist (nothing depends on
+> them being driven from the editor); they're simply no longer wired to a button.
 
 ---
 
@@ -218,11 +234,14 @@ Then: Settings → AI CLI → **Rescan** → select **Nessy** active → **Test 
   real stream matches that, add a `chat.stream` block with **`"parse": "claude-stream-json"`** plus
   `capabilities` `streaming` + `multi-turn` — **no new parser needed**. If the stream shape differs, a new
   named parser is a **source change** (§6B) — report the actual stream format rather than guessing.
-- **Residual risk — cleanup id-alignment:** without `--json-schema`, the model holds the "echo EVERY segment
-  id exactly once" contract by prompt only. It's guarded by a per-batch retry + a hard alignment check, but a
-  weaker model may trip it more often (you'll see a cleanup error; the transcript stays intact and re-runnable).
-  If it fails repeatedly, that's a prompt tweak (generic, not Nessy-specific) — report it, don't hand-parse the
-  output (parsing speaker-labelled prose back to segments by order silently corrupts the transcript).
+- **Residual risk — cleanup id-alignment:** this applies only to the **whole-transcript** `clean_transcript`
+  command, which is **no longer driven from the UI** (cleanup is per-segment now — see the note in §0). If you
+  somehow invoke that batch path: without `--json-schema`, the model holds the "echo EVERY segment id exactly
+  once" contract by prompt only. It's guarded by a per-batch retry + a hard alignment check, but a weaker model
+  may trip it more often (you'll see a cleanup error; the transcript stays intact and re-runnable). If it fails
+  repeatedly, that's a prompt tweak (generic, not Nessy-specific) — report it, don't hand-parse the output
+  (parsing speaker-labelled prose back to segments by order silently corrupts the transcript). **The per-segment
+  rewrite ("Хуйня, переписывай") sidesteps this entirely** — one segment, plain text in/out, no ids to align.
 
 **Reference templates** are written to the plugins folder on first run — `claude-code`, `qwen-code`,
 `antigravity`. **Copy whichever is closest to your CLI's I/O shape and adapt it** (command, args, auth,

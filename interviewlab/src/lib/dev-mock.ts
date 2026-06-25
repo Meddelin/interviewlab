@@ -1846,6 +1846,19 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       });
     }
 
+    case "rewrite_segment": {
+      // Per-segment rewrite ("хуйня, переписывай"): the real backend sends ONE segment's text to
+      // the CLI and gets back plain text. The browser preview has no CLI, so reuse the toy
+      // mockCleanText after a short delay to demonstrate the loading → replace flow for review.
+      const original = String(a.text ?? "");
+      return new Promise<T>((resolve) => {
+        setTimeout(() => {
+          const cleaned = mockCleanText(original);
+          resolve((cleaned.trim() ? cleaned : original) as T);
+        }, 600);
+      });
+    }
+
     // --- M6/M11 CLI plugin layer ------------------------------------------
     case "list_adapters":
     case "rescan_plugins": {
