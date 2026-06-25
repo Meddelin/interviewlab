@@ -255,9 +255,21 @@ fn transcode_and_probe(src: &Path, dst: &Path) -> Result<i64, String> {
     }
 
     if !dst.exists() {
-        return Err(last_error.unwrap_or_else(|| "ffmpeg produced no output file".to_string()));
+        let msg = last_error.unwrap_or_else(|| "ffmpeg produced no output file".to_string());
+        log::error!(
+            target: "interviewlab::interview",
+            "[E-INGEST-TRANSCODE] transcode FAILED: '{}' → '{}' (mono 16kHz wav): {msg}. \
+             hint: the source may be corrupt, a non-media file, or an unsupported codec.",
+            src.display(), dst.display()
+        );
+        return Err(msg);
     }
 
+    log::debug!(
+        target: "interviewlab::interview",
+        "transcode OK: '{}' → '{}' ({:.1}s)",
+        src.display(), dst.display(), duration_secs
+    );
     Ok((duration_secs * 1000.0).round() as i64)
 }
 
@@ -310,6 +322,11 @@ pub async fn add_interview_files(
             ext.clone().unwrap_or_else(|| "bin".to_string())
         ));
         if let Err(e) = std::fs::copy(&src, &copied) {
+            log::error!(
+                target: "interviewlab::interview",
+                "[E-INGEST-COPY] ingest: copying source '{src}' → '{}' failed: {e} (kind: {:?})",
+                copied.display(), e.kind()
+            );
             mark_error_db(&db.pool, &interview_id).await.ok();
             emit_progress(&app, &cycle_id, &interview_id, STATUS_ERROR, None, None, Some(format!("copy failed: {e}")));
             // Still return the row so the UI shows the error state.
@@ -367,6 +384,7 @@ pub async fn add_interview_files(
                     emit_progress(&app2, &cycle2, &iv, STATUS_READY, Some(audio), Some(duration_ms), None);
                 }
                 Err(msg) => {
+                    log::error!(target: "interviewlab::interview", "[E-INGEST-TRANSCODE] ingest: interview='{iv}': audio preparation FAILED → status=error: {msg}");
                     mark_error_db(&pool, &iv).await.ok();
                     emit_progress(&app2, &cycle2, &iv, STATUS_ERROR, None, None, Some(msg));
                 }

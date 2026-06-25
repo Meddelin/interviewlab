@@ -13,6 +13,7 @@ mod diarize;
 mod diff;
 mod guides;
 mod interview;
+mod logging;
 mod product;
 mod roles;
 mod synthesis;
@@ -48,15 +49,36 @@ async fn db_health(db: tauri::State<'_, Db>) -> Result<DbHealth, String> {
     })
 }
 
+// The active log file path, for the Settings UI / an "open logs" action. Returns the
+// resolved <app-log-dir>/interviewlab.log when the file sink is attached, else None.
+#[tauri::command]
+fn log_file_path() -> Option<String> {
+    logging::log_file_path().map(|p| p.to_string_lossy().into_owned())
+}
+
 // Ensure %APPDATA%/InterviewLab/ exists, open interviewlab.db, run migrations, return the pool.
+// Every fallible step is logged with full context BEFORE the `?` propagates it, so a launch
+// failure (the one place a bad error is fatal) leaves a precise breadcrumb in the log file —
+// not just the generic `.expect("failed to initialize database")` panic message.
 async fn init_db(app: &tauri::AppHandle) -> Result<Db, Box<dyn std::error::Error>> {
     // Tauri's resolved app-data dir (spec §2.3). Resolves to %APPDATA%/<bundle identifier>
     // on Windows, i.e. %APPDATA%/com.interviewlab.app. ponytail: using Tauri's resolved
     // dir as the spec says rather than hard-coding "InterviewLab".
-    let app_dir = app.path().app_data_dir()?;
-    fs::create_dir_all(&app_dir)?;
+    let app_dir = app.path().app_data_dir().map_err(|e| {
+        log::error!("[E-DB-INIT] init_db: could not resolve app_data_dir (Tauri path API): {e}");
+        e
+    })?;
+    fs::create_dir_all(&app_dir).map_err(|e| {
+        log::error!(
+            "init_db: could not create app-data dir {}: {e} (kind: {:?})",
+            app_dir.display(),
+            e.kind()
+        );
+        e
+    })?;
 
     let db_path = app_dir.join("interviewlab.db");
+    log::info!("init_db: opening SQLite at {}", db_path.display());
 
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
@@ -64,11 +86,28 @@ async fn init_db(app: &tauri::AppHandle) -> Result<Db, Box<dyn std::error::Error
         .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
-    let pool = SqlitePoolOptions::new().connect_with(options).await?;
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .map_err(|e| {
+            log::error!(
+                "init_db: failed to open the SQLite pool at {} (WAL, foreign_keys on): {e}",
+                db_path.display()
+            );
+            e
+        })?;
 
     // Runs every .sql in ./migrations (relative to this crate) once each, tracked in _sqlx_migrations.
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations").run(&pool).await.map_err(|e| {
+        log::error!(
+            "init_db: database migrations failed against {} — the schema may be partially \
+             applied or corrupt: {e}",
+            db_path.display()
+        );
+        e
+    })?;
 
+    log::info!("init_db: database ready at {}", db_path.display());
     Ok(Db {
         pool,
         path: db_path.to_string_lossy().into_owned(),
@@ -77,27 +116,54 @@ async fn init_db(app: &tauri::AppHandle) -> Result<Db, Box<dyn std::error::Error
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install the global logger as the VERY FIRST thing, before any fallible work, so
+    // every error from here on is captured (to stderr immediately; to the log file once
+    // `attach_file` runs a few lines below).
+    logging::init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // block_on the async db init so the pool is in state before any command runs.
             let handle = app.handle().clone();
-            let db = tauri::async_runtime::block_on(init_db(&handle))
-                .expect("failed to initialize database");
+
+            // Point the file sink at the OS app-log dir (e.g. %APPDATA%/com.interviewlab.app/logs
+            // on Windows, ~/Library/Logs/… on macOS). Best-effort — a failure here only means we
+            // log to stderr only; it must not block launch.
+            match handle.path().app_log_dir() {
+                Ok(dir) => {
+                    if let Err(e) = logging::attach_file(&dir) {
+                        log::warn!("could not attach the log file (stderr logging only): {e}");
+                    }
+                }
+                Err(e) => log::warn!("could not resolve app_log_dir (stderr logging only): {e}"),
+            }
+
+            // block_on the async db init so the pool is in state before any command runs.
+            let db = tauri::async_runtime::block_on(init_db(&handle)).unwrap_or_else(|e| {
+                // This is genuinely fatal (no DB = no app). We've already logged the precise
+                // failing step inside init_db; log the fatal verdict too, then panic.
+                log::error!("[E-DB-INIT] FATAL: database initialization failed, aborting launch: {e}");
+                panic!("failed to initialize database: {e}");
+            });
             // Startup recovery (bug #1): reset any interview left in a mid-flight status
             // (transcribing / cleaning) by a crash or force-kill — no task is running for it,
             // so it's a zombie. Best-effort: a failure here must not block launch.
             match tauri::async_runtime::block_on(asr::recover_stuck_interviews(&db.pool)) {
-                Ok(n) if n > 0 => eprintln!("startup recovery: reset {n} stuck interview(s) → error"),
-                Ok(_) => {}
-                Err(e) => eprintln!("startup recovery failed (non-fatal): {e}"),
+                Ok(n) if n > 0 => {
+                    log::warn!("startup recovery: reset {n} stuck interview(s) (transcribing/cleaning → error)")
+                }
+                Ok(_) => log::debug!("startup recovery: no stuck interviews to reset"),
+                Err(e) => log::error!(
+                    "startup recovery failed (non-fatal — zombie interviews may remain mid-flight): {e}"
+                ),
             }
             app.manage(db);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db_health,
+            log_file_path,
             cycle::list_cycles,
             cycle::get_cycle,
             cycle::create_cycle,

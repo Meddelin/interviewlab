@@ -745,7 +745,15 @@ fn discover_plugins(app: &tauri::AppHandle) -> Vec<LoadedPlugin> {
         let builtin = bundled_ids.iter().any(|b| b == &id);
         let entry = match parsed {
             Ok(adapter) => LoadedPlugin { id: id.clone(), adapter: Some(adapter), builtin, source, error: None },
-            Err(e) => LoadedPlugin { id: id.clone(), adapter: None, builtin, source, error: Some(e) },
+            Err(e) => {
+                // A malformed manifest is non-fatal (the UI lists it with the error), but log it
+                // so the failure is captured even when the user never opens Settings.
+                log::warn!(
+                    target: "interviewlab::adapter",
+                    "[E-CLI-PLUGIN] plugin '{id}' from '{source}' is INVALID and was skipped: {e}"
+                );
+                LoadedPlugin { id: id.clone(), adapter: None, builtin, source, error: Some(e) }
+            }
         };
         if let Some(slot) = out.iter_mut().find(|p| p.id == id) {
             *slot = entry;
@@ -1206,9 +1214,37 @@ async fn spawn_once(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| TaskError::new("spawn", format!("could not start `{}`: {e}", adapter.command)))?;
+    log::debug!(
+        target: "interviewlab::adapter",
+        "spawn: adapter='{}' command='{}' args={} payload_via={} payload_bytes={} timeout={}s cwd={}",
+        adapter.id,
+        adapter.command,
+        args.len(),
+        io.payload_via,
+        payload.len(),
+        io.timeout_sec,
+        neutral_cwd().display()
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        // The single most common CLI failure: the binary isn't on PATH. Spell it out —
+        // command, OS error kind, and the exact io error — so the cause is unambiguous.
+        let err = TaskError::new(
+            "spawn",
+            format!(
+                "could not start `{}` (is the CLI installed and on PATH?): {e} [os error kind: {:?}]",
+                adapter.command,
+                e.kind()
+            ),
+        );
+        log::error!(
+            target: "interviewlab::adapter",
+            "[E-CLI-SPAWN] spawn FAILED: adapter='{}' command='{}': {err}",
+            adapter.id,
+            adapter.command
+        );
+        err
+    })?;
 
     // Write the payload to stdin (when the descriptor pipes it there), then close it.
     if io.payload_via == "stdin" {
@@ -1230,12 +1266,31 @@ async fn spawn_once(
     let timeout = Duration::from_secs(io.timeout_sec.max(1));
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(TaskError::new("spawn", format!("wait: {e}"))),
+        Ok(Err(e)) => {
+            let err = TaskError::new("spawn", format!("waiting for `{}` to exit failed: {e}", adapter.command));
+            log::error!(target: "interviewlab::adapter", "wait FAILED: adapter='{}': {err}", adapter.id);
+            return Err(err);
+        }
         Err(_) => {
-            return Err(TaskError::new(
+            // A timeout means the watchdog gave up; the child is dropped (killed) here.
+            let err = TaskError::new(
                 "timeout",
-                format!("CLI did not finish within {}s", io.timeout_sec),
-            ))
+                format!(
+                    "`{}` did not finish within {}s and was killed — the model may be \
+                     overloaded, the payload too large, or the CLI stuck awaiting input",
+                    adapter.command, io.timeout_sec
+                ),
+            );
+            log::error!(
+                target: "interviewlab::adapter",
+                "[E-CLI-TIMEOUT] adapter='{}' command='{}' after {}s (args={}, payload_bytes={})",
+                adapter.id,
+                adapter.command,
+                io.timeout_sec,
+                args.len(),
+                payload.len()
+            );
+            return Err(err);
         }
     };
 
@@ -1243,12 +1298,36 @@ async fn spawn_once(
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     if !output.status.success() {
-        return Err(TaskError::with_stderr(
+        // Non-zero exit. Log the status code/signal AND the FULL stderr (the real
+        // diagnostic), plus a truncated stdout in case the CLI wrote its error there.
+        let err = TaskError::with_stderr(
             "exit",
-            format!("CLI exited with status {}", output.status),
-            if stderr.trim().is_empty() { stdout.clone() } else { stderr },
-        ));
+            format!(
+                "`{}` exited with {} — see stderr for the CLI's own error message",
+                adapter.command, output.status
+            ),
+            if stderr.trim().is_empty() { stdout.clone() } else { stderr.clone() },
+        );
+        log::error!(
+            target: "interviewlab::adapter",
+            "[E-CLI-EXIT] adapter='{}' command='{}' status={} code={:?}\n  stderr: {}\n  stdout(head): {}",
+            adapter.id,
+            adapter.command,
+            output.status,
+            output.status.code(),
+            if stderr.trim().is_empty() { "<empty>".into() } else { crate::logging::truncate(stderr.trim(), 4000) },
+            crate::logging::truncate(stdout.trim(), 1000)
+        );
+        return Err(err);
     }
+    log::debug!(
+        target: "interviewlab::adapter",
+        "spawn OK: adapter='{}' command='{}' stdout_bytes={} stderr_bytes={}",
+        adapter.id,
+        adapter.command,
+        stdout.len(),
+        stderr.len()
+    );
     Ok((stdout, stderr))
 }
 
@@ -1303,26 +1382,78 @@ pub async fn run_cli_task_model(
     let inject_schema = adapter.io.as_ref().map(|io| io.json_schema_arg).unwrap_or(true);
     let args = build_args(spec, &prompt, output_schema, model.as_deref(), &model_flag, inject_schema);
     let used_schema = args_have_json_schema(&args);
-    let payload = serde_json::to_vec(input_json)
-        .map_err(|e| TaskError::new("config", format!("serialize input: {e}")))?;
+    let payload = serde_json::to_vec(input_json).map_err(|e| {
+        let err = TaskError::new(
+            "config",
+            format!("could not serialize the `{task_name}` input JSON to send to the CLI: {e}"),
+        );
+        log::error!(target: "interviewlab::adapter", "task='{task_name}' adapter='{}': {err}", adapter.id);
+        err
+    })?;
+
+    log::info!(
+        target: "interviewlab::adapter",
+        "run task='{task_name}' adapter='{}' model={} schema={} payload_bytes={}",
+        adapter.id,
+        model.as_deref().unwrap_or("<cli-default>"),
+        if used_schema { "json-schema" } else { "prompt-only" },
+        payload.len()
+    );
 
     // Up to two attempts: a clean exit with unparseable output gets one retry; a hard
     // failure (spawn/exit/timeout) is returned immediately (no point retrying those).
     let mut last_parse_err: Option<String> = None;
     for attempt in 0..2 {
-        let (stdout, stderr) = spawn_once(adapter, &args, &payload).await?;
+        let (stdout, stderr) = spawn_once(adapter, &args, &payload).await.map_err(|e| {
+            // spawn/exit/timeout already logged inside spawn_once with full context; add the
+            // task-level frame so the chain reads task → command failure.
+            log::error!(
+                target: "interviewlab::adapter",
+                "task='{task_name}' adapter='{}' aborted on attempt {}/2 ({} error): {}",
+                adapter.id, attempt + 1, e.kind, e.message
+            );
+            e
+        })?;
         match extract_result(adapter, &stdout, used_schema) {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                if attempt > 0 {
+                    log::info!(
+                        target: "interviewlab::adapter",
+                        "task='{task_name}' adapter='{}' parsed OK on retry", adapter.id
+                    );
+                }
+                return Ok(v);
+            }
             Err(e) => {
-                last_parse_err = Some(e);
+                last_parse_err = Some(e.clone());
                 if attempt == 0 {
+                    // First parse failure: the model wrapped/garbled the JSON. Log what we got
+                    // (truncated) before retrying — this is the classic "LLM added prose" case.
+                    log::warn!(
+                        target: "interviewlab::adapter",
+                        "task='{task_name}' adapter='{}' could not parse CLI output ({e}); retrying once.\n  stdout(head): {}",
+                        adapter.id,
+                        crate::logging::truncate(stdout.trim(), 2000)
+                    );
                     continue; // retry once
                 }
-                return Err(TaskError::with_stderr(
+                // Second failure: give up. Log the full picture — the parse error plus the raw
+                // stdout (this is the data we failed to make sense of).
+                let err = TaskError::with_stderr(
                     "parse",
-                    last_parse_err.unwrap_or_else(|| "parse failed".into()),
-                    if stderr.trim().is_empty() { stdout } else { stderr },
-                ));
+                    format!(
+                        "the `{task_name}` CLI output could not be parsed as the expected JSON after a retry: {e}"
+                    ),
+                    if stderr.trim().is_empty() { stdout.clone() } else { stderr.clone() },
+                );
+                log::error!(
+                    target: "interviewlab::adapter",
+                    "[E-CLI-PARSE] task='{task_name}' adapter='{}': {e}\n  stdout: {}\n  stderr: {}",
+                    adapter.id,
+                    crate::logging::truncate(stdout.trim(), 4000),
+                    if stderr.trim().is_empty() { "<empty>".into() } else { crate::logging::truncate(stderr.trim(), 2000) }
+                );
+                return Err(err);
             }
         }
     }
@@ -1382,10 +1513,19 @@ async fn probe_version(adapter: &Adapter) -> Result<String, TaskError> {
 // The two-step probe (spec §7.2): `--version` (installed?) then a tiny `-p` round-trip
 // through the runner's "ping" task (logged in?). Returns the status enum.
 pub async fn probe_cli(adapter: &Adapter) -> ProbeResult {
+    log::info!(
+        target: "interviewlab::adapter",
+        "Test CLI: probing adapter='{}' command='{}'", adapter.id, adapter.command
+    );
     // Step 1: installed?
     let version = match probe_version(adapter).await {
         Ok(v) => v,
         Err(e) if e.kind == "spawn" => {
+            log::warn!(
+                target: "interviewlab::adapter",
+                "[E-CLI-SPAWN] Test CLI: adapter='{}' NOT FOUND — `{}` failed to spawn: {}",
+                adapter.id, adapter.command, e.message
+            );
             return ProbeResult {
                 status: ProbeStatus::NotFound,
                 detail: format!("`{}` is not installed or not on PATH.", adapter.command),
@@ -1393,6 +1533,12 @@ pub async fn probe_cli(adapter: &Adapter) -> ProbeResult {
             };
         }
         Err(e) => {
+            log::error!(
+                target: "interviewlab::adapter",
+                "[E-CLI-EXIT] Test CLI: adapter='{}' version probe ERROR: {} (stderr: {})",
+                adapter.id, e.message,
+                e.stderr.as_deref().unwrap_or("<none>")
+            );
             return ProbeResult {
                 status: ProbeStatus::Error,
                 detail: format!("Version probe failed: {e}"),
@@ -1400,6 +1546,7 @@ pub async fn probe_cli(adapter: &Adapter) -> ProbeResult {
             };
         }
     };
+    log::debug!(target: "interviewlab::adapter", "Test CLI: adapter='{}' installed, version='{version}'", adapter.id);
 
     // Step 2: logged in? A minimal round-trip through the runner's `ping` task: pipe
     // {} on stdin + a trivial prompt; the round-trip both proves auth and exercises the
@@ -1455,12 +1602,24 @@ fn classify_roundtrip_error(e: &TaskError, version: String) -> ProbeResult {
         || blob.contains("credential")
         || blob.contains("session expired");
     if looks_auth {
+        log::warn!(
+            target: "interviewlab::adapter",
+            "[E-CLI-AUTH] Test CLI: round-trip looks like an AUTH failure (not logged in): {} (stderr: {})",
+            e.message,
+            e.stderr.as_deref().unwrap_or("<none>")
+        );
         ProbeResult {
             status: ProbeStatus::NotLoggedIn,
             detail: "Installed, but not logged in. Run `claude login` once, then retry.".into(),
             version: Some(version),
         }
     } else {
+        log::error!(
+            target: "interviewlab::adapter",
+            "[E-CLI-EXIT] Test CLI: round-trip FAILED (not an auth error): [{}] {} (stderr: {})",
+            e.kind, e.message,
+            e.stderr.as_deref().unwrap_or("<none>")
+        );
         ProbeResult {
             status: ProbeStatus::Error,
             detail: format!("Round-trip failed: {e}"),

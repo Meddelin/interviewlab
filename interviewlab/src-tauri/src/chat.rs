@@ -583,6 +583,14 @@ async fn run_turn(
     resume_session_id: Option<String>,
 ) {
     let evt = chat_event_name(&thread_id);
+    log::info!(
+        target: "interviewlab::chat",
+        "chat turn: thread='{thread_id}' adapter='{}' resume={} prompt_chars={} context_chars={}",
+        adapter.id,
+        resume_session_id.is_some(),
+        prompt.len(),
+        context_pack.len()
+    );
 
     // Write the context pack to a temp file for --append-system-prompt-file (sidesteps
     // arg-length + the 10 MB stdin cap; §4.2). Cleaned up after the turn.
@@ -693,6 +701,15 @@ async fn run_turn(
 
     let exit_ok = status.map(|s| s.success()).unwrap_or(false);
     if !exit_ok && full.trim().is_empty() {
+        // The CLI produced no usable answer. Log the FULL stderr + exit status (the real
+        // diagnostic) before the user-facing emit_error trims it.
+        log::error!(
+            target: "interviewlab::chat",
+            "[E-CHAT-NO-ANSWER] chat turn (thread='{thread_id}'): CLI '{}' exited {:?} with no answer.\n  stderr: {}",
+            adapter.command,
+            status.map(|s| s.to_string()).unwrap_or_else(|| "<no status>".into()),
+            if stderr_text.trim().is_empty() { "<empty>".into() } else { crate::logging::truncate(stderr_text.trim(), 4000) }
+        );
         let detail = if stderr_text.trim().is_empty() {
             "the assistant did not return a response".to_string()
         } else {
@@ -745,6 +762,16 @@ async fn run_turn(
 }
 
 fn emit_error(app: &tauri::AppHandle, evt: &str, thread_id: &str, message: String) {
+    // Central chat-error surface: every failure path routes here, so log here once. A
+    // user-initiated "cancelled" is expected (debug), everything else is a real error.
+    if message == "cancelled" {
+        log::debug!(target: "interviewlab::chat", "chat turn cancelled (thread='{thread_id}')");
+    } else {
+        // Tag the central chat-failure line so an agent can grep '[E-CHAT-' for every failed
+        // turn. The spawn-not-started message gets the more specific E-CHAT-SPAWN code.
+        let code = if message.starts_with("could not start") { "E-CHAT-SPAWN" } else { "E-CHAT-TURN" };
+        log::error!(target: "interviewlab::chat", "[{code}] chat turn FAILED (thread='{thread_id}'): {message}");
+    }
     let _ = app.emit(evt, ChatEvent::Error { thread_id: thread_id.to_string(), message });
 }
 

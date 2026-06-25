@@ -512,6 +512,18 @@ async fn clean_one_batch(
             Ok(output) => match align_batch(ids, raw, &output) {
                 Ok(cleaned) => return Ok(cleaned),
                 Err(align_err) => {
+                    // The model returned valid JSON but broke an invariant (wrong segment
+                    // count or id set). Log the SPECIFICS (the AlignError spells out the
+                    // missing/extra ids) plus the id range, so a recurring drift is diagnosable.
+                    log::warn!(
+                        target: "interviewlab::cleanup",
+                        "[E-CLEAN-ALIGN] cleanup batch alignment FAILED (attempt {}/{}): {align_err} — ids {}..={} ({} segments). {}",
+                        attempt + 1, attempts,
+                        ids.first().copied().unwrap_or(0),
+                        ids.last().copied().unwrap_or(0),
+                        ids.len(),
+                        if attempt + 1 < attempts { "retrying." } else { "no attempts left." }
+                    );
                     last_err = Some(format!("{align_err}"));
                     if attempt + 1 < attempts {
                         continue; // retry (spec §9 M7) — only when attempts remain
@@ -519,6 +531,13 @@ async fn clean_one_batch(
                 }
             },
             Err(parse_err) => {
+                // The CLI returned JSON, but not the {segments:[{id,text}]} shape we need.
+                log::warn!(
+                    target: "interviewlab::cleanup",
+                    "[E-CLEAN-SHAPE] cleanup batch output had the wrong shape (attempt {}/{}): {parse_err}. Got: {}",
+                    attempt + 1, attempts,
+                    crate::logging::truncate(&value.to_string(), 1500)
+                );
                 last_err = Some(format!("cleanup output shape invalid: {parse_err}; got {value}"));
                 if attempt + 1 < attempts {
                     continue;
@@ -526,10 +545,18 @@ async fn clean_one_batch(
             }
         }
     }
-    Err(format!(
+    let msg = format!(
         "transcript-cleanup failed the segment invariants after a retry: {}",
         last_err.unwrap_or_else(|| "unknown".into())
-    ))
+    );
+    log::error!(
+        target: "interviewlab::cleanup",
+        "[E-CLEAN-GIVEUP] cleanup batch GAVE UP (ids {}..={}, {} segments): {msg}",
+        ids.first().copied().unwrap_or(0),
+        ids.last().copied().unwrap_or(0),
+        ids.len()
+    );
+    Err(msg)
 }
 
 // Clean a whole transcript: chunk into batches, clean each, stitch in order, enforcing
@@ -575,7 +602,11 @@ async fn clean_segments(
                 return Ok(cleaned);
             }
             Err(e) => {
-                eprintln!("cleanup: single-shot failed ({e}); falling back to batched cleanup");
+                log::warn!(
+                    target: "interviewlab::cleanup",
+                    "interview '{interview_id}': single-shot cleanup of {total} segments failed \
+                     ({e}); falling back to batched cleanup (BATCH_SIZE={BATCH_SIZE})"
+                );
             }
         }
     }
@@ -623,24 +654,37 @@ async fn clean_segments(
         // Reassemble: the batches array is in order, and join_all_ordered preserves it, so
         // extending in iteration order keeps the transcript in ORIGINAL order.
         for (b, res) in wave_results {
-            let batch_cleaned = res.map_err(|e| format!("batch {}/{total_batches}: {e}", b + 1))?;
+            let batch_cleaned = res.map_err(|e| {
+                let msg = format!("batch {}/{total_batches}: {e}", b + 1);
+                log::error!(
+                    target: "interviewlab::cleanup",
+                    "interview '{interview_id}': cleanup aborted on {msg}"
+                );
+                msg
+            })?;
             cleaned.extend(batch_cleaned);
         }
     }
 
     // Final whole-transcript invariant check (defensive; each batch already enforced it).
     if cleaned.len() != raw.len() {
-        return Err(format!(
+        let msg = format!(
             "internal: stitched cleaned count {} != raw count {}",
             cleaned.len(),
             raw.len()
-        ));
+        );
+        log::error!(target: "interviewlab::cleanup", "[E-CLEAN-INVARIANT] interview '{interview_id}': {msg} — refusing to store a corrupted transcript");
+        return Err(msg);
     }
     for (i, (c, r)) in cleaned.iter().zip(raw.iter()).enumerate() {
         if c.start_ms != r.start_ms || c.end_ms != r.end_ms || c.speaker_label != r.speaker_label {
-            return Err(format!(
-                "internal: segment {i} timing/label drifted from raw after cleanup"
-            ));
+            let msg = format!("internal: segment {i} timing/label drifted from raw after cleanup");
+            log::error!(
+                target: "interviewlab::cleanup",
+                "[E-CLEAN-INVARIANT] interview '{interview_id}': {msg} (raw {}ms..{}ms/{} vs cleaned {}ms..{}ms/{})",
+                r.start_ms, r.end_ms, r.speaker_label, c.start_ms, c.end_ms, c.speaker_label
+            );
+            return Err(msg);
         }
     }
     Ok(cleaned)
@@ -708,11 +752,22 @@ pub async fn clean_transcript(
     interview_id: String,
     adapter_id: Option<String>,
 ) -> Result<String, String> {
+    log::info!(target: "interviewlab::cleanup", "clean_transcript: starting for interview '{interview_id}' (adapter override: {adapter_id:?})");
+
     // Resolve the raw source first (clear error if there's nothing to clean).
     let (language, raw) = raw_source_db(&db.pool, &interview_id)
-        .await?
-        .ok_or("no raw transcript to clean (transcribe the interview first)")?;
+        .await
+        .map_err(|e| {
+            log::error!(target: "interviewlab::cleanup", "clean_transcript: reading raw transcript for '{interview_id}' failed: {e}");
+            e
+        })?
+        .ok_or_else(|| {
+            let msg = "no raw transcript to clean (transcribe the interview first)".to_string();
+            log::warn!(target: "interviewlab::cleanup", "clean_transcript: interview '{interview_id}': {msg}");
+            msg
+        })?;
     if raw.is_empty() {
+        log::warn!(target: "interviewlab::cleanup", "clean_transcript: interview '{interview_id}' has a raw transcript with zero segments");
         return Err("the raw transcript has no segments".into());
     }
 
@@ -721,15 +776,25 @@ pub async fn clean_transcript(
         Some(id) => id,
         None => crate::adapter::active_adapter_id(&db.pool).await?,
     };
-    let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id))?;
+    let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id)).map_err(|e| {
+        log::error!(target: "interviewlab::cleanup", "clean_transcript: could not resolve adapter '{id}' for interview '{interview_id}': {e}");
+        e
+    })?;
 
     // Product context (Products library / req #2): source the interview's cycle product
     // (linked product → product.content_md, falling back to inline product_desc) so the
     // cleanup prompt normalizes product/brand terms. Best-effort: a missing cycle/product
     // just yields no context (empty), never blocks cleanup.
-    let product_desc = product_context_for_interview_db(&db.pool, &interview_id)
-        .await
-        .unwrap_or_default();
+    let product_desc = match product_context_for_interview_db(&db.pool, &interview_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!(
+                target: "interviewlab::cleanup",
+                "clean_transcript: interview '{interview_id}': product context lookup failed (continuing without it): {e}"
+            );
+            String::new()
+        }
+    };
 
     // Capture the status BEFORE we flip to `cleaning`, so a failed cleanup can restore it. The
     // raw/cleaned transcript is intact — cleanup is an enrichment, not the interview's terminal
@@ -748,20 +813,39 @@ pub async fn clean_transcript(
     // The user's per-bucket model override (None → the plugin's manifest default — for
     // Claude Code, `haiku`, preserving today's behavior).
     let model_override = crate::adapter::task_model_override(&db.pool, "transcript-cleanup").await;
+    log::info!(
+        target: "interviewlab::cleanup",
+        "clean_transcript: interview '{interview_id}': cleaning {} segments (lang={}, model={}, adapter='{}')",
+        raw.len(),
+        lang.unwrap_or("auto"),
+        model_override.as_deref().unwrap_or("<plugin-default>"),
+        adapter.id
+    );
     match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &raw, model_override.as_deref()).await {
         Ok(cleaned) => {
-            let tid = store_cleaned_db(&db.pool, &interview_id, lang, &cleaned).await?;
+            let tid = store_cleaned_db(&db.pool, &interview_id, lang, &cleaned).await.map_err(|e| {
+                log::error!(target: "interviewlab::cleanup", "[E-CLEAN-STORE] clean_transcript: interview '{interview_id}': cleaned OK but STORING failed: {e}");
+                e
+            })?;
             set_status_db(&db.pool, &interview_id, STATUS_CLEANED)
                 .await
-                .map_err(|e| format!("set cleaned: {e}"))?;
+                .map_err(|e| {
+                    log::error!(target: "interviewlab::cleanup", "clean_transcript: interview '{interview_id}': set status=cleaned failed: {e}");
+                    format!("set cleaned: {e}")
+                })?;
             let total_batches = raw.len().div_ceil(BATCH_SIZE);
             emit_cleanup(&app, &interview_id, STATUS_CLEANED, total_batches, total_batches, None);
+            log::info!(target: "interviewlab::cleanup", "clean_transcript: interview '{interview_id}': DONE (cleaned transcript id={tid})");
             Ok(tid)
         }
         Err(e) => {
             // Don't store anything. RESTORE the prior status (transcribed/cleaned/edited) — the
             // transcript is intact, so the interview stays openable + the user can retry cleanup.
             // We still surface the failure via the event (error toast) + the returned Err.
+            log::error!(
+                target: "interviewlab::cleanup",
+                "clean_transcript: interview '{interview_id}': FAILED — {e}. Restoring status to '{prior_status}' (transcript left intact, cleanup is retryable)."
+            );
             set_status_db(&db.pool, &interview_id, &prior_status).await.ok();
             emit_cleanup(&app, &interview_id, STATUS_ERROR, 0, 0, Some(e.clone()));
             Err(e)

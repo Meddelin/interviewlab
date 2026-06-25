@@ -614,10 +614,20 @@ fn run_whisper(
         Ok(c) => c,
         Err(e) if use_gpu => {
             // GPU init failed → CPU fallback (spec §6.3).
-            eprintln!("ASR: GPU init failed ({e}); falling back to CPU");
-            build_ctx(false)?
+            log::warn!(
+                target: "interviewlab::asr",
+                "GPU whisper context init FAILED ({e}); falling back to CPU. \
+                 hint: check the CUDA/Metal build + driver; transcription will be slower on CPU."
+            );
+            build_ctx(false).map_err(|e2| {
+                log::error!(target: "interviewlab::asr", "CPU whisper context init ALSO failed after GPU fallback: {e2}");
+                e2
+            })?
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            log::error!(target: "interviewlab::asr", "whisper context init failed (model='{model_str}', gpu={use_gpu}): {e}");
+            return Err(e);
+        }
     };
 
     let mut state = ctx.create_state().map_err(|e| format!("whisper state: {e}"))?;
@@ -714,7 +724,21 @@ fn run_whisper(
         }
     }
 
-    let result = state.full(params, samples).map_err(|e| format!("whisper full: {e}"));
+    let result = state.full(params, samples).map_err(|e| {
+        // whisper.cpp's decode failed or was aborted (Stop/watchdog flips the abort flag →
+        // "failed to encode"/error -6 here). Distinguish so the cause is obvious in the log.
+        let aborted = _abort_keepalive
+            .as_ref()
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let msg = format!("whisper full: {e}");
+        if aborted {
+            log::warn!(target: "interviewlab::asr", "whisper decode aborted by Stop/watchdog ({samples_len} samples): {e}", samples_len = samples.len());
+        } else {
+            log::error!(target: "interviewlab::asr", "[E-ASR-DECODE] whisper decode FAILED ({samples_len} samples, gpu={use_gpu}): {e}", samples_len = samples.len());
+        }
+        msg
+    });
     // _abort_keepalive (and thus the AtomicBool the C callback read) is dropped only here,
     // after state.full has fully returned — no dangling pointer during the run.
     drop(_abort_keepalive);
@@ -930,8 +954,16 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
 
     if let Err(e) = &result {
         // Clean up the partial + tell the UI.
+        log::error!(
+            target: "interviewlab::asr",
+            "[E-ASR-DOWNLOAD] model download FAILED for '{model_id}' from {HF_BASE}/{}: {e}. \
+             hint: check network/proxy + free disk (~{} MB needed); the partial file was removed.",
+            entry.file, entry.approx_mb
+        );
         let _ = std::fs::remove_file(&part_for_cleanup);
         emit_model(&app, &model_id, 0, 0, true, Some(e.clone()));
+    } else {
+        log::info!(target: "interviewlab::asr", "model download OK: '{model_id}' ({}) into {}", entry.file, dir.display());
     }
     result
 }
@@ -950,20 +982,36 @@ pub async fn transcribe_interview(
     // force exactly n. Default 2 is applied by the caller/UI; None here means auto.
     expected_speakers: Option<i32>,
 ) -> Result<String, String> {
-    let entry = catalog_entry(&model_id).ok_or_else(|| format!("unknown model id: {model_id}"))?;
+    log::info!(target: "interviewlab::asr", "transcribe: starting interview='{interview_id}' model='{model_id}' lang={language:?} expected_speakers={expected_speakers:?}");
+
+    let entry = catalog_entry(&model_id).ok_or_else(|| {
+        let msg = format!("unknown model id: {model_id}");
+        log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': {msg}");
+        msg
+    })?;
     let model = model_path(&app, &model_id)?;
     if !model.exists() {
-        return Err(format!("model not downloaded: {} (download it in Settings)", entry.label));
+        let msg = format!("model not downloaded: {} (download it in Settings)", entry.label);
+        log::error!(target: "interviewlab::asr", "[E-ASR-MODEL-MISSING] transcribe: interview='{interview_id}': model file missing at {} — {msg}", model.display());
+        return Err(msg);
     }
 
     // Resolve the prepared audio.
     let audio = audio_path_db(&db.pool, &interview_id)
         .await
-        .map_err(|e| format!("lookup audio: {e}"))?
-        .ok_or("no prepared audio for this interview (re-run ingest)")?;
+        .map_err(|e| {
+            log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': DB lookup of audio_path failed: {e}");
+            format!("lookup audio: {e}")
+        })?
+        .ok_or_else(|| {
+            log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': no prepared audio (recording row missing audio_path — re-run ingest)");
+            "no prepared audio for this interview (re-run ingest)".to_string()
+        })?;
     let audio_path = PathBuf::from(&audio);
     if !audio_path.exists() {
-        return Err(format!("audio file missing on disk: {audio}"));
+        let msg = format!("audio file missing on disk: {audio}");
+        log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': {msg} (the prepared 16k wav was deleted or moved)");
+        return Err(msg);
     }
 
     let device = detect_device();
@@ -1045,6 +1093,11 @@ pub async fn transcribe_interview(
         Ok(join) => join.map_err(|_| "transcription task panicked".to_string())?,
         Err(_) => {
             // Timed out: signal abort, then await the (now-aborting) task so it can't outlive us.
+            log::error!(
+                target: "interviewlab::asr",
+                "[E-ASR-TIMEOUT] transcribe: interview='{interview_id}': watchdog fired after {}s — aborting (audio with no speech / a runaway segment?)",
+                budget.as_secs()
+            );
             cancel.store(true, Ordering::SeqCst);
             let _ = task.await; // discard the aborted run's result; we report a timeout below.
             Err(format!(
@@ -1098,7 +1151,12 @@ pub async fn transcribe_interview(
                     }
                     Err(e) => {
                         // Non-fatal: log + surface a warning event, keep the raw single-speaker labels.
-                        eprintln!("diarization failed (keeping single speaker): {e}");
+                        log::warn!(
+                            target: "interviewlab::asr",
+                            "[E-ASR-DIARIZE] transcribe: interview='{interview_id}': diarization FAILED, keeping single speaker (S1): {e}. \
+                             hint: diarization is an enrichment, not a gate — the transcript is still usable; \
+                             retry via 're-diarize' once the cause (slow CPU / missing models) is addressed."
+                        );
                         emit_diar(&app, &interview_id, "error", 0, None);
                     }
                 }
@@ -1109,19 +1167,29 @@ pub async fn transcribe_interview(
             // diarization only changed each segment's speaker_label. We deliberately do NOT
             // wrap it in an envelope with diar_turns (re-diarize re-runs the models, which is
             // ~real-time on CPU — cheaper than rippling an envelope change through every consumer).
-            let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
+            let segments_json = serde_json::to_string(&segments).map_err(|e| {
+                log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': serialize {} segments failed: {e}", segments.len());
+                format!("serialize segments: {e}")
+            })?;
             // Persist the detected/forced language label on the transcript row.
             let lang_label = language.as_deref().filter(|s| *s != "auto");
             let tid = store_raw_transcript_db(&db.pool, &interview_id, lang_label, &engine, &segments_json)
                 .await
-                .map_err(|e| format!("store transcript: {e}"))?;
+                .map_err(|e| {
+                    log::error!(target: "interviewlab::asr", "[E-ASR-STORE] transcribe: interview='{interview_id}': transcribed OK but STORING the raw transcript failed: {e}");
+                    format!("store transcript: {e}")
+                })?;
             set_status_db(&db.pool, &interview_id, STATUS_TRANSCRIBED)
                 .await
                 .map_err(|e| format!("set transcribed: {e}"))?;
             emit_asr(&app, &interview_id, STATUS_TRANSCRIBED, 100, None, None);
+            log::info!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': DONE — {} segments, engine='{engine}', transcript id={tid}", segments.len());
             Ok(tid)
         }
         Err(e) => {
+            // The whole transcription failed (whisper decode error, watchdog timeout, or a
+            // manual Stop). The interview goes to `error` so the user can retry.
+            log::error!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': FAILED → status=error: {e}");
             set_status_db(&db.pool, &interview_id, STATUS_ERROR).await.ok();
             emit_asr(&app, &interview_id, STATUS_ERROR, 0, None, Some(e.clone()));
             Err(e)
@@ -1143,9 +1211,12 @@ pub async fn cancel_transcription(
 ) -> Result<(), String> {
     let signalled = signal_cancel(&interview_id);
     if signalled {
+        log::info!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': manual Stop requested — abort flag set");
         // Best-effort immediate UI feedback; the run's Err arm will also land on `error`.
         set_status_db(&db.pool, &interview_id, STATUS_ERROR).await.ok();
         emit_asr(&app, &interview_id, STATUS_ERROR, 0, None, Some("cancelled".to_string()));
+    } else {
+        log::debug!(target: "interviewlab::asr", "transcribe: interview='{interview_id}': Stop requested but no run was in flight (no-op)");
     }
     Ok(())
 }
@@ -1180,7 +1251,14 @@ pub async fn download_diarization_models(app: tauri::AppHandle) -> Result<(), St
     .map_err(|_| "diarization-model download task panicked".to_string())?;
 
     if let Err(e) = &result {
+        log::error!(
+            target: "interviewlab::asr",
+            "[E-ASR-DOWNLOAD] diarization-model download FAILED: {e}. hint: check network/proxy + disk; \
+             without these models every transcription keeps a single speaker (S1)."
+        );
         emit_diar_model(&app, 0, 2, "error", true, Some(e.clone()));
+    } else {
+        log::info!(target: "interviewlab::asr", "diarization models downloaded OK");
     }
     result
 }
@@ -1198,9 +1276,11 @@ pub async fn rediarize_interview(
     interview_id: String,
     expected_speakers: Option<i32>,
 ) -> Result<i32, String> {
+    log::info!(target: "interviewlab::asr", "rediarize: interview='{interview_id}' expected_speakers={expected_speakers:?}");
     // Models must be present (a clear error beats a silent no-op).
     let diar_dir = crate::diarize::diarization_dir(&app)?;
     if !crate::diarize::models_present(&diar_dir) {
+        log::error!(target: "interviewlab::asr", "rediarize: interview='{interview_id}': diarization models missing in {}", diar_dir.display());
         return Err("diarization models not downloaded (download them in Settings)".to_string());
     }
 
@@ -1232,8 +1312,12 @@ pub async fn rediarize_interview(
         crate::diarize::diarize_samples(&seg_model, &emb_model, &samples, 16000, expected_speakers)
     })
     .await
-    .map_err(|_| "diarization task panicked".to_string())?
+    .map_err(|_| {
+        log::error!(target: "interviewlab::asr", "rediarize: interview='{interview_id}': diarization blocking task panicked");
+        "diarization task panicked".to_string()
+    })?
     .map_err(|e| {
+        log::error!(target: "interviewlab::asr", "rediarize: interview='{interview_id}': diarization FAILED: {e}");
         emit_diar(&app, &interview_id, "error", 0, None);
         e
     })?;

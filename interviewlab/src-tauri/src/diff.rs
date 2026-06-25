@@ -690,10 +690,19 @@ pub async fn run_diff(
 
     // The user's diff-bucket model override (None → the plugin's manifest default).
     let model_override = crate::adapter::task_model_override(&db.pool, "cycle-diff").await;
+    log::info!(
+        target: "interviewlab::diff",
+        "run_diff: cycle='{cycle_id}' vs prev='{prev_id}' — {} current / {} previous finding(s), adapter='{}'",
+        current.doc.findings.len(), previous.doc.findings.len(), adapter.id
+    );
     match diff_syntheses(&current.doc, &previous.doc, &adapter, model_override.as_deref()).await {
         Ok(doc) => {
-            let row_id = store_diff_db(&db.pool, &cycle_id, &prev_id, &doc).await?;
+            let row_id = store_diff_db(&db.pool, &cycle_id, &prev_id, &doc).await.map_err(|e| {
+                log::error!(target: "interviewlab::diff", "[E-DIFF-STORE] run_diff: cycle='{cycle_id}': diff produced but STORING it failed: {e}");
+                e
+            })?;
             emit_progress(&app, &cycle_id, "done", 100, None);
+            log::info!(target: "interviewlab::diff", "run_diff: cycle='{cycle_id}': DONE (row id={row_id})");
             Ok(DiffRow {
                 id: row_id,
                 cycle_id,
@@ -703,6 +712,7 @@ pub async fn run_diff(
             })
         }
         Err(e) => {
+            log::error!(target: "interviewlab::diff", "[E-DIFF-RUN] run_diff: cycle='{cycle_id}' vs prev='{prev_id}': FAILED: {e}");
             emit_progress(&app, &cycle_id, "error", 0, Some(e.clone()));
             Err(e)
         }
