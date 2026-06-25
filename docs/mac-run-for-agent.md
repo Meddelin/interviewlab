@@ -20,19 +20,24 @@ So you know what to aim for. The human will do these clicks; you make each step 
    terms (e.g. `API`, `Figma`, `дедлайн`) before transcribing.
 2. Create a **Cycle**, link the product + guide.
 3. **Upload a real interview** audio file (30+ min, any common format).
-4. **Transcribe** it: pick a local Whisper model, language, `expected speakers = 2`.
+4. **Transcribe** it: pick a local Whisper model, language, `expected speakers = 2`. On Apple
+   Silicon CPU a long file can be slow — while it runs you can **open the interview to watch the
+   transcript stream in live**, percent and all, then a distinct **"Diarizing…"** phase (see §4.1).
 5. Confirm **speaker separation** (S1 / S2 turns) and that segments read as **merged paragraphs**.
 6. **Fix garbled segments** with the **per‑segment rewrite**: in the transcript editor each segment row
    has a **"Хуйня, переписывай"** button — clicking it re‑cleans **just that one segment** through the
    local CLI and swaps in the result. (There is **no** whole‑transcript "Clean" button anymore — see the
    note below.) Save writes the `edited` version.
-7. **Build the glossary** (optional but recommended): on the **Interviews** tab each transcribed row has
+7. **Re‑do a bad chunk (optional):** if a span came out wrong (mis‑segmented, wrong speaker, garbled
+   audio), **select those segment rows** and click **"Перетранскрибировать"** — whisper re‑runs on just
+   that time span and the whole file re‑diarizes so speakers stay consistent (see §4.1).
+8. **Build the glossary** (optional but recommended): on the **Interviews** tab each transcribed row has
    a **"Glossary"** button → suggest terms **From the transcript** or **From my edits**, review the
    candidates, and accept them into the product glossary (see the note below).
-8. **Assign roles** to the speakers (interviewer / respondent).
-9. **Synthesis** → findings grouped by goal + by role.
-10. (Optional) a second cycle → **Diff** vs the previous wave.
-11. **Chat** about the cycle (streaming, grounded answers).
+9. **Assign roles** to the speakers (interviewer / respondent).
+10. **Synthesis** → findings grouped by goal + by role.
+11. (Optional) a second cycle → **Diff** vs the previous wave.
+12. **Chat** about the cycle (streaming, grounded answers).
 
 Everything is **local**: ASR (whisper.cpp) and diarization (sherpa‑onnx) run on‑device, no cloud, no Python.
 Only the LLM steps (cleanup / synthesis / diff / chat) go through a **local AI CLI you configure** (§5) —
@@ -141,7 +146,9 @@ These tune the **same** model (large‑v3) — same weights, accuracy unchanged:
 - **If transcription is still slow:** confirm Metal actually engaged — after a transcription, the transcript's
   engine string should read `@metal`, not `@cpu`. `@cpu` means the `metal` feature/init didn't kick in (a
   **source** issue per §6B — report it). Diarization is separate (CPU, now multi‑threaded) and on a long
-  interview can take a while; that's expected.
+  interview can take a while; that's expected. Even when a run is slow you don't have to wait blind: you can
+  **open the interview and watch it stream live**, and a failed/killed run is **resumable from a checkpoint**
+  (no re‑doing the whole file) — see **§4.1**.
 - **Quality:** accuracy is set by the model + decoder, not the platform — Metal/CoreML give near‑identical text
   to CPU (GPU float ordering differs, so not byte‑for‑byte, but word accuracy is the same). The one real
   accuracy knob is beam search (slower); the speed the GPU/ANE buys back makes it affordable if you ever want it
@@ -157,6 +164,32 @@ These tune the **same** model (large‑v3) — same weights, accuracy unchanged:
   3D‑Speaker embedding) on first use / via a "download diarization models" action. CPU, ~real‑time, no Python.
 
 App data dir on macOS: `~/Library/Application Support/com.interviewlab.app/`
+
+### 4.1 Watching a slow run, re‑doing a chunk, resuming after a crash
+
+Because Apple‑Silicon **CPU** transcription (no Metal, or `@cpu` fallback) of a long interview can take a
+while, the run is **observable and recoverable** — you don't have to stare at a frozen row or start over:
+
+- **Watch it live.** Open the interview **while it's transcribing** (click the row / "Open editor" — it's
+  reachable now, not only after it finishes). The editor shows a progress header with whisper's real
+  percent and the transcript **streaming in segment by segment**, then a separate **"Diarizing…"** phase
+  (speaker separation runs after ASR). A **Stop** button is right there. The transcript text streams from
+  whisper's new‑segment callback; speakers are placeholder **S1** until the diarization phase relabels them.
+- **Re‑transcribe just a chunk.** In the editor, select the bad segment rows → **"Перетранскрибировать"**.
+  Whisper re‑runs on **only** that `[start, end]` span, splices the fresh segments over the old ones, then
+  re‑diarizes the **whole** audio (so S1/S2 stay globally consistent — a slice diarized alone would get
+  inconsistent labels). The run streams live like a normal transcription.
+- **Resume after a failure/crash.** During every run the partial transcript is **checkpointed to SQLite
+  every few seconds**. If transcription errors out, or the app is killed mid‑run, the interview shows a
+  **"Транскрипция прервалась на M:SS — продолжить"** banner: clicking it re‑transcribes **only the
+  remaining tail** `[checkpoint, end]` and appends it to the saved prefix (then diarizes the whole file) —
+  it does **not** re‑do the part that already succeeded. On a clean success the checkpoint is cleared.
+
+For an agent, the practical upshot: a slow or flaky transcription is **not** a dead end — surface the live
+view, and if a run dies tell the human it's **resumable** (the banner). These are all **first‑class
+features in the current build**, not workarounds. If any of them misbehaves (live view never updates, the
+resume banner never appears after a kill, a chunk re‑transcribe corrupts timing), that's a **source‑side**
+issue — report per §6B (subsystem: `src-tauri/src/asr.rs` + the live‑progress UI in `src/`).
 
 ---
 
@@ -298,6 +331,12 @@ These require editing the Rust/TS source and a rebuild — they are for the main
   linking, anything that stops `cargo`/`tauri` from compiling. (Source: `src-tauri/Cargo.toml`, `src-tauri/src/*`.)
 - **GPU / device detection** — wrong device reported, Metal not selected, a CPU/Metal branch issue.
   (Source: `src-tauri/src/asr.rs`.)
+- **Live progress / checkpoint / resume / chunk re‑transcribe** — the live transcript stream never updates,
+  the "Diarizing…" phase never shows, the **resume** banner never appears after a kill, or a chunk
+  **re‑transcribe** mis‑splices timing. (Source: `src-tauri/src/asr.rs` — commands `transcribe_interview`,
+  `resume_transcription`, `retranscribe_range`, `get_transcribe_checkpoint`; the `transcribe_checkpoint`
+  table in `migrations/0007_*`; and the live‑progress UI under `src/` — `live-asr-store.ts`,
+  `use-live-asr.ts`, `live-transcript-view.tsx`, `pages/transcript-editor.tsx`.)
 - **Native library loading at runtime** — sherpa‑onnx / onnxruntime **dylib not found** when transcribing or
   diarizing, especially in a packaged `.app` (dev mode loads them from the build dir; bundling them into the
   `.app` is a known TODO). (Source: `src-tauri/tauri.conf.json` + `src-tauri`.)

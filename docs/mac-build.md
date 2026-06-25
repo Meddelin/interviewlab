@@ -19,6 +19,32 @@ choice: add a Settings **"Transcription mode: Speed | Accuracy"** preference, th
 and pick the `SamplingStrategy` in `run_whisper` accordingly (Speed = greedy as today; Accuracy = beam search).
 This is a code change (backend + a Settings control), not a build flag — implement on request.
 
+## Observability & resilience for slow runs (live progress, resume, chunk re-transcribe) — what's wired
+Apple-Silicon **CPU** transcription of a long interview is slow, so the run is now observable + recoverable
+(all in `asr.rs` + the editor UI; no model/accuracy change). This is the macOS-motivated work — a slow `@cpu`
+run is no longer a black box:
+- **Live transcript streaming.** whisper.cpp's **new-segment callback** (`set_segment_callback_safe`) emits
+  each segment **as it's decoded** — `state.full()` only returns once the whole file is done, so the post-run
+  loop is a burst, not a stream. The callback feeds Tauri's `asr://progress` event (now carrying the full
+  `segment`, not just text). The editor can be opened **mid-run** and shows the transcript filling in + the
+  real whisper percent, then a distinct **"Diarizing…"** phase (diarization is a separate post-ASR pass; its
+  sherpa `process()` is one opaque call, so the editor shows an honest elapsed/estimate, not a fake inner %).
+- **Crash-safe checkpoint + resume.** New migration **`0007_transcribe_checkpoint.sql`** (table
+  `transcribe_checkpoint`, one row per interview). A background writer snapshots decoded segments **every few
+  seconds**; cleared on success, kept on error/crash. `recover_stuck_interviews` (startup) flips a killed
+  `transcribing` row to `error`, but the checkpoint survives → the editor offers **resume**.
+  `resume_transcription` re-runs whisper on **only** the remaining tail `[processed_ms, total_ms]`, appends to
+  the saved prefix, then diarizes the whole file — no re-doing completed work.
+- **Per-range re-transcribe.** `retranscribe_range(start_ms, end_ms)` runs whisper on a **time slice**
+  (16 samples/ms), splices the result over the existing segments in that window, and re-diarizes the **whole**
+  audio for globally consistent speakers (a slice diarized alone gets inconsistent cluster labels). Driven from
+  the editor by selecting segment rows → "Перетранскрибировать".
+- **Shared engine.** The three paths (full / resume / range) share `run_guarded_whisper` (cancel flag +
+  watchdog + live-stream + checkpoint buffer) and `diarize_and_store` (whole-audio diarize → store → finalize),
+  so the watchdog/cancel/concurrency-1 semantics are identical everywhere. Pure splice/merge logic is unit-tested
+  (`splice_*` in `asr.rs`); the whisper paths are validated by `cargo check` (the live-segment callback is an
+  `#[ignore]`d real-engine test).
+
 ## Cross-platform audit (current state)
 - **whisper.cpp (`whisper-rs 0.16`):** Windows uses the `cuda` feature. Apple Silicon → the **`metal`** feature (`whisper-rs/metal`) for GPU, plus the opt-in **`coreml`** feature (ANE encoder) — see the levers section above; CPU fallback works without either.
 - **Diarization (`sherpa-onnx 1.13.3`, `shared`):** cross-platform ONNX Runtime; macOS-arm64 prebuilt is shipped by the crate. Optionally enable the **CoreML** execution provider on Apple Silicon (else CPU ~real-time — fine). The `shared` (DLL/dylib) choice was made to dodge a Windows CRT conflict; it's also correct on macOS.
