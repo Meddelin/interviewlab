@@ -950,13 +950,24 @@ export function TranscriptEditorPage() {
     () => (baselineVersion ? coalesceSegments(baselineVersion.segments) : []),
     [baselineVersion],
   );
-  // Original text per displayed segment (indexed like `segments`), matched by MAXIMUM time
-  // overlap. Timing is immutable (spec §4.5), so overlap is a stable anchor that survives
-  // coalescing-granularity differences and any boundary shift — far more robust than matching
-  // by exact start. Falls back to the nearest paragraph when spans don't overlap. null when
-  // there's no original to compare against.
+  // Original text per displayed segment (indexed like `segments`). null when there's no
+  // original to compare against.
+  //
+  // The working copy and the original are coalesced the SAME way from the same underlying
+  // segments, so in the common case — no edits at all, or edits that didn't change the speaker
+  // grouping — they have the same paragraph count and align 1:1 BY INDEX. We use that directly:
+  // it's exact, and it avoids the false "changed" matches that fuzzy time-overlap produces when
+  // segment boundaries touch (end==start) or imported timestamps overlap/tie, which would
+  // otherwise pair a segment with a neighbour and diff it against the wrong original text.
+  //
+  // Only when the counts diverge (a turn was genuinely re-split or merged) do we fall back to
+  // matching by maximum time-overlap — timing is immutable (spec §4.5), so overlap is a stable
+  // anchor there.
   const baselines = useMemo<(string | null)[]>(() => {
     if (baselineSegs.length === 0) return segments.map(() => null);
+    if (baselineSegs.length === segments.length) {
+      return segments.map((_, i) => baselineSegs[i].text.trim());
+    }
     return segments.map((seg) => {
       let bestText: string | null = null;
       let bestOverlap = -Infinity;
