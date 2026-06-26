@@ -248,6 +248,251 @@ fn split_explicit_id(text: &str) -> Option<(String, String)> {
     Some((id, rest))
 }
 
+// --- structured guide template (the 5 fixed blocks) ---------------------------
+//
+// The templated guide (req: "шаблонизировать гайд"). A guide is now optionally a STRUCTURED
+// document with five fixed blocks the user fills by clicking "+ add":
+//   1. hypotheses          — гипотезы, которые надо провалидировать (ids H1, H2, …)
+//   2. tasks               — задачи, которые должны решаться интервью (ids G1, G2, … — these
+//                            ARE the synthesis "goals", the stable spine the diff aligns on)
+//   3. qualifying_questions— квалифицирующие вопросы (question ids Q1, Q2, …)
+//   4. main_blocks         — основная часть: question blocks grouped by theme (each block has
+//                            a title + its own questions; questions share the global Q counter)
+//   5. hypothesis_questions— вопросы по гипотезам (question ids continue the global Q counter)
+//
+// The template is stored as JSON on the guide (guide.template_json) and is the source the
+// structured editor binds to. On every write the backend RENDERS a canonical content_md from
+// it (render_template_md) so everything that reads the guide as markdown — derive_goals, the
+// chat context pack, back-compat — keeps working unchanged. Ids are STABLE (re-stamped
+// positionally on each save, exactly like derive_goals), so the same template across waves
+// yields the same H/G/Q ids → the diff can align hypotheses + findings wave-over-wave.
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TemplateItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+// One themed block of main questions ("основная часть" sub-block). Title is the theme;
+// questions carry global Q ids so per-question synthesis answers stay unambiguous.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct QuestionBlock {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub questions: Vec<TemplateItem>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GuideTemplate {
+    #[serde(default)]
+    pub hypotheses: Vec<TemplateItem>,
+    #[serde(default)]
+    pub tasks: Vec<TemplateItem>,
+    #[serde(default)]
+    pub qualifying_questions: Vec<TemplateItem>,
+    #[serde(default)]
+    pub main_blocks: Vec<QuestionBlock>,
+    #[serde(default)]
+    pub hypothesis_questions: Vec<TemplateItem>,
+}
+
+// One question handed to the model with its section context so it knows WHERE in the guide
+// it sits (a qualifying screen vs a main-theme probe vs a hypothesis check). The synthesis
+// must answer EVERY one of these, directly or indirectly.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GuideQuestion {
+    pub id: String,
+    pub text: String,
+    pub section: String, // "qualifying" | "main" | "hypothesis"
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub block: String, // the main-block theme (only for section == "main")
+}
+
+impl GuideTemplate {
+    // Parse a stored template_json; a blank/invalid blob is an empty template (legacy guide).
+    pub fn parse(json: &str) -> GuideTemplate {
+        let t = json.trim();
+        if t.is_empty() {
+            return GuideTemplate::default();
+        }
+        serde_json::from_str(t).unwrap_or_default()
+    }
+
+    // True when the guide carries no structured template (a legacy / free-markdown guide).
+    pub fn is_empty(&self) -> bool {
+        self.hypotheses.is_empty()
+            && self.tasks.is_empty()
+            && self.qualifying_questions.is_empty()
+            && self.main_blocks.iter().all(|b| b.questions.is_empty() && b.title.trim().is_empty())
+            && self.hypothesis_questions.is_empty()
+    }
+
+    // Re-stamp stable ids + trim/drop blanks. Hypotheses → H1.., tasks → G1.. (the goal ids),
+    // and EVERY question (qualifying, then each main block in order, then hypothesis questions)
+    // shares one global Q counter so each has a unique, stable Qn. Mirrors derive_goals'
+    // positional id discipline: the SAME template always yields the SAME ids.
+    pub fn normalized(&self) -> GuideTemplate {
+        let stamp = |items: &[TemplateItem], prefix: &str, start: usize| -> (Vec<TemplateItem>, usize) {
+            let mut out = Vec::new();
+            let mut n = start;
+            for it in items {
+                let text = it.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                out.push(TemplateItem { id: format!("{prefix}{n}"), text: text.to_string() });
+                n += 1;
+            }
+            (out, n)
+        };
+
+        let (hypotheses, _) = stamp(&self.hypotheses, "H", 1);
+        let (tasks, _) = stamp(&self.tasks, "G", 1);
+
+        let mut q = 1usize;
+        let (qualifying_questions, next) = stamp(&self.qualifying_questions, "Q", q);
+        q = next;
+
+        let mut main_blocks: Vec<QuestionBlock> = Vec::new();
+        for block in &self.main_blocks {
+            let (questions, next) = stamp(&block.questions, "Q", q);
+            q = next;
+            let title = block.title.trim().to_string();
+            // Drop a block that is entirely empty (no title, no questions); keep a titled
+            // block even if it has no questions yet (the user may be drafting it).
+            if title.is_empty() && questions.is_empty() {
+                continue;
+            }
+            main_blocks.push(QuestionBlock { title, questions });
+        }
+
+        let (hypothesis_questions, _) = stamp(&self.hypothesis_questions, "Q", q);
+
+        GuideTemplate {
+            hypotheses,
+            tasks,
+            qualifying_questions,
+            main_blocks,
+            hypothesis_questions,
+        }
+    }
+
+    // The synthesis "goals" derived from the template's TASKS (ids already G1..). This is the
+    // stable spine the cycle synthesis + diff align on when a template is present.
+    pub fn goals(&self) -> Vec<Goal> {
+        self.tasks
+            .iter()
+            .map(|t| Goal { id: t.id.clone(), text: t.text.clone() })
+            .collect()
+    }
+
+    // Every guide question flattened with its section context, in document order. The
+    // synthesis must produce an answer for each (direct or indirect).
+    pub fn questions(&self) -> Vec<GuideQuestion> {
+        let mut out: Vec<GuideQuestion> = Vec::new();
+        for it in &self.qualifying_questions {
+            out.push(GuideQuestion { id: it.id.clone(), text: it.text.clone(), section: "qualifying".into(), block: String::new() });
+        }
+        for block in &self.main_blocks {
+            for it in &block.questions {
+                out.push(GuideQuestion { id: it.id.clone(), text: it.text.clone(), section: "main".into(), block: block.title.clone() });
+            }
+        }
+        for it in &self.hypothesis_questions {
+            out.push(GuideQuestion { id: it.id.clone(), text: it.text.clone(), section: "hypothesis".into(), block: String::new() });
+        }
+        out
+    }
+}
+
+// Render the structured template into a canonical markdown guide. Tasks go under a "## Goals"
+// heading with explicit "Gn:" tags so derive_goals reads back IDENTICAL goal ids (the single
+// source of truth for goals stays derive_goals(content_md)). The other sections are rendered
+// for human reading + the chat context pack; their ids round-trip too. Assumes a normalized
+// template (call `.normalized()` first). Returns "" for an empty template.
+pub fn render_template_md(t: &GuideTemplate) -> String {
+    if t.is_empty() {
+        return String::new();
+    }
+    let mut md = String::new();
+
+    let section = |md: &mut String, heading: &str, items: &[TemplateItem]| {
+        if items.is_empty() {
+            return;
+        }
+        md.push_str(&format!("## {heading}\n\n"));
+        for it in items {
+            md.push_str(&format!("- {}: {}\n", it.id, it.text));
+        }
+        md.push('\n');
+    };
+
+    section(&mut md, "Hypotheses", &t.hypotheses);
+    // Tasks → "Goals" so derive_goals picks them up as the stable goal spine.
+    section(&mut md, "Goals", &t.tasks);
+    section(&mut md, "Qualifying questions", &t.qualifying_questions);
+
+    if t.main_blocks.iter().any(|b| !b.title.trim().is_empty() || !b.questions.is_empty()) {
+        md.push_str("## Main questions\n\n");
+        for (i, block) in t.main_blocks.iter().enumerate() {
+            let title = if block.title.trim().is_empty() {
+                format!("Block {}", i + 1)
+            } else {
+                block.title.trim().to_string()
+            };
+            md.push_str(&format!("### {title}\n\n"));
+            for it in &block.questions {
+                md.push_str(&format!("- {}: {}\n", it.id, it.text));
+            }
+            md.push('\n');
+        }
+    }
+
+    section(&mut md, "Hypothesis questions", &t.hypothesis_questions);
+
+    md.trim_end().to_string()
+}
+
+// --- shared analysis system prompt (the rules every guide-grounded stage obeys) ----
+//
+// One source of truth for HOW the model must read an interview against a templated guide,
+// injected as the top-level `system` field of every analysis task's input (extract / reduce /
+// diff / chat). The renderer (adapter::render_prompt) serializes the whole input JSON into the
+// prompt, so the model always sees these rules. Keeping it in one place means the per-interview
+// summary, the cycle synthesis, the diff, and the chat all reason the SAME way (req: "системный
+// промпт должен все это описывать агенту который будет работать с интервью … учитывать на
+// остальных этапах суммаризации интервью, цикла, диффа").
+pub fn analysis_system_prompt() -> &'static str {
+    "You are a senior user-research analyst. You work STRICTLY against a templated interview \
+     guide and a separate product description. Absolute rules:\n\
+     1. ANSWER THE WHOLE GUIDE — never skip anything. Address every hypothesis, every research \
+        task/goal, and every question in the guide (qualifying, main, and hypothesis questions). \
+        If the interview gives nothing on an item, say so explicitly (\"not answered\" / \
+        \"inconclusive\") rather than dropping it.\n\
+     2. USE THE PRODUCT DESCRIPTION as context for interpreting what respondents mean (product \
+        terms, the activation moment, the value prop). Read answers through that lens, but never \
+        let the product description substitute for actual interview evidence.\n\
+     3. INDIRECT ANSWERS COUNT. A question is rarely asked verbatim and respondents routinely \
+        answer one question while talking about another. Credit an answer to a question whenever \
+        the transcript speaks to it, EVEN IF that question was never literally asked — and mark \
+        HOW it was answered: directly, indirectly (surfaced while discussing something else), or \
+        not answered.\n\
+     4. HYPOTHESES: for each hypothesis decide a verdict — confirmed, partially confirmed, \
+        refuted, or inconclusive — with a short rationale grounded in evidence. Weigh \
+        contradicting evidence honestly; do not force a verdict the transcript doesn't support.\n\
+     5. EVIDENCE: weight RESPONDENT statements over interviewer prompts. Quote VERBATIM, in the \
+        original language — never translate or paraphrase a quote — and cite the segment_id it \
+        came from. Prefer a few strong quotes over many weak ones.\n\
+     6. BE HONEST ABOUT GAPS. Do not invent findings, do not overstate confidence, and do not \
+        report a hypothesis as confirmed on thin evidence. \"Inconclusive\" and \"not answered\" \
+        are valid, useful outcomes.\n\
+     Follow the per-task `instructions` for the exact output shape; these rules govern HOW you \
+     reason regardless of the stage."
+}
+
 // --- input shapes (what we feed the CLI per stage) ----------------------------
 
 // One transcript segment handed to the model with a stable id + the speaker's ROLE
@@ -293,6 +538,39 @@ struct ExtractOutput {
     // M10b: the model may also surface notable quotes / surprises not tied to a single goal.
     #[serde(default)]
     notable: Vec<NotableQuote>,
+    // Templated guide: per-question answers + per-hypothesis signals THIS interview supports.
+    #[serde(default)]
+    question_answers: Vec<RawQuestionSignal>,
+    #[serde(default)]
+    hypothesis_signals: Vec<RawHypothesisSignal>,
+}
+
+// One per-interview question answer as the model returns it: which guide question, whether it
+// was answered directly / indirectly / not at all, a short summary, and the supporting quotes.
+#[derive(Deserialize, Debug, Default)]
+struct RawQuestionSignal {
+    #[serde(default)]
+    question_id: String,
+    #[serde(default)]
+    status: String, // direct | indirect | not_answered
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    quotes: Vec<ExtractedQuote>,
+}
+
+// One per-interview hypothesis signal as the model returns it: which hypothesis, whether this
+// interview supports / contradicts / is mixed-or-neutral on it, a short note, and quotes.
+#[derive(Deserialize, Debug, Default)]
+struct RawHypothesisSignal {
+    #[serde(default)]
+    hypothesis_id: String,
+    #[serde(default)]
+    stance: String, // supports | contradicts | mixed | neutral
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    quotes: Vec<ExtractedQuote>,
 }
 
 // A notable quote / surprise from one interview (not necessarily goal-bound). Part of the
@@ -339,15 +617,49 @@ pub struct InterviewQuote {
     pub quote: String,
 }
 
+// A per-interview answer to one guide question (validated): which question, how it was
+// answered (direct / indirect / not_answered), a short summary, and supporting quotes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct InterviewQuestionAnswer {
+    pub question_id: String,
+    pub status: String, // direct | indirect | not_answered
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub quotes: Vec<InterviewQuote>,
+}
+
+// A per-interview signal on one hypothesis (validated): supports / contradicts / mixed /
+// neutral, a short note, and supporting quotes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct InterviewHypothesisSignal {
+    pub hypothesis_id: String,
+    pub stance: String, // supports | contradicts | mixed | neutral
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub quotes: Vec<InterviewQuote>,
+}
+
 // The full per-interview summary doc stored in synthesis.findings_json for a per-interview
 // row (interview_id set). Carries the goals used (for grouped rendering) + per-goal points +
-// notable quotes/surprises.
+// notable quotes/surprises, plus (templated guide) the guide's hypotheses/questions with this
+// interview's per-question answers + per-hypothesis signals. The new fields default empty so
+// older rows (and legacy free-markdown guides) still deserialize + render exactly as before.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct InterviewSummaryDoc {
     pub goals: Vec<Goal>,
     pub by_goal: Vec<InterviewGoalSummary>,
     #[serde(default)]
     pub notable: Vec<NotableQuote>,
+    #[serde(default)]
+    pub hypotheses: Vec<TemplateItem>,
+    #[serde(default)]
+    pub questions: Vec<GuideQuestion>,
+    #[serde(default)]
+    pub question_answers: Vec<InterviewQuestionAnswer>,
+    #[serde(default)]
+    pub hypothesis_signals: Vec<InterviewHypothesisSignal>,
 }
 
 // The per-interview summary row returned to the frontend (parsed doc + the editable
@@ -410,6 +722,34 @@ pub struct RoleBreakdownGroup {
     pub notes: Vec<RoleNote>,
 }
 
+// One cross-interview hypothesis verdict as the model returns it (validated server-side).
+#[derive(Deserialize, Debug, Default)]
+struct RawHypothesisVerdict {
+    #[serde(default)]
+    hypothesis_id: String,
+    #[serde(default)]
+    verdict: String, // confirmed | partially | refuted | inconclusive
+    #[serde(default)]
+    confidence: String, // high | medium | low
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
+}
+
+// One cross-interview, consolidated answer to a guide question as the model returns it.
+#[derive(Deserialize, Debug, Default)]
+struct RawQuestionAnswer {
+    #[serde(default)]
+    question_id: String,
+    #[serde(default)]
+    status: String, // answered | partially | not_answered
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct ReduceOutput {
     #[serde(default)]
@@ -420,6 +760,11 @@ struct ReduceOutput {
     open_questions: Vec<String>,
     #[serde(default)]
     by_role: Vec<RoleBreakdownGroup>,
+    // Templated guide: verdicts per hypothesis + consolidated answers per question.
+    #[serde(default)]
+    hypothesis_verdicts: Vec<RawHypothesisVerdict>,
+    #[serde(default)]
+    question_answers: Vec<RawQuestionAnswer>,
 }
 
 // A validated, server-stamped finding stored in synthesis.findings_json (§7.3.2 shape).
@@ -435,9 +780,44 @@ pub struct Finding {
     pub recommendation: String,
 }
 
+// A validated, cross-interview verdict on one guide hypothesis (templated guide). `verdict`
+// is normalized to confirmed|partially|refuted|inconclusive; the diff aligns these by `id`
+// wave-over-wave to surface verdict shifts.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HypothesisVerdict {
+    pub id: String, // H1..  (matches the guide template's hypothesis ids)
+    pub text: String,
+    pub verdict: String, // confirmed | partially | refuted | inconclusive
+    pub confidence: String, // high | medium | low
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+}
+
+// A validated, cross-interview consolidated answer to one guide question (templated guide).
+// `status` is normalized to answered|partially|not_answered so the UI can flag what the wave
+// left open — req: "суммаризация под каждый вопрос … не пропуская ничего".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QuestionAnswer {
+    pub id: String, // Q1..  (matches the guide template's question ids)
+    pub text: String,
+    #[serde(default)]
+    pub section: String, // qualifying | main | hypothesis
+    #[serde(default)]
+    pub block: String, // the main-block theme (only for section == "main")
+    pub status: String, // answered | partially | not_answered
+    #[serde(default)]
+    pub answer: String,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+}
+
 // The full synthesis document stored in the cycle row's synthesis.findings_json. Carries the
 // GOALS used (for the M9 diff + grouped UI) alongside the findings, open questions, the
-// executive summary, and the optional by-role breakdown (M10b).
+// executive summary, and the optional by-role breakdown (M10b). Templated guide: also the
+// guide's hypotheses + questions with cross-interview verdicts/answers. All new fields default
+// so older M8/M10b rows (and legacy free-markdown guides) still deserialize cleanly.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct SynthesisDoc {
     pub goals: Vec<Goal>,
@@ -449,6 +829,15 @@ pub struct SynthesisDoc {
     pub executive_summary: String,
     #[serde(default)]
     pub by_role: Vec<RoleBreakdownGroup>,
+    // Templated-guide additions.
+    #[serde(default)]
+    pub hypotheses: Vec<TemplateItem>,
+    #[serde(default)]
+    pub questions: Vec<GuideQuestion>,
+    #[serde(default)]
+    pub hypothesis_verdicts: Vec<HypothesisVerdict>,
+    #[serde(default)]
+    pub question_answers: Vec<QuestionAnswer>,
 }
 
 // The cycle synthesis row returned to the frontend (parsed doc + the editable markdown
@@ -466,10 +855,23 @@ pub struct SynthesisRow {
 // --- output JSON schemas handed to the CLI (--json-schema → structured_output) -
 
 fn extract_schema() -> Value {
+    // A quote ref array (segment_id + verbatim quote), reused across point/answer/signal.
+    let quotes = json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["segment_id", "quote"],
+            "properties": {
+                "segment_id": { "type": "integer" },
+                "quote": { "type": "string" }
+            }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["points", "notable"],
+        "required": ["points", "notable", "question_answers", "hypothesis_signals"],
         "properties": {
             "points": {
                 "type": "array",
@@ -480,18 +882,7 @@ fn extract_schema() -> Value {
                     "properties": {
                         "goal_id": { "type": "string" },
                         "point": { "type": "string" },
-                        "quotes": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["segment_id", "quote"],
-                                "properties": {
-                                    "segment_id": { "type": "integer" },
-                                    "quote": { "type": "string" }
-                                }
-                            }
-                        }
+                        "quotes": quotes
                     }
                 }
             },
@@ -507,18 +898,89 @@ fn extract_schema() -> Value {
                         "note": { "type": "string" }
                     }
                 }
+            },
+            "question_answers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["question_id", "status", "summary", "quotes"],
+                    "properties": {
+                        "question_id": { "type": "string" },
+                        "status": { "type": "string", "enum": ["direct", "indirect", "not_answered"] },
+                        "summary": { "type": "string" },
+                        "quotes": quotes
+                    }
+                }
+            },
+            "hypothesis_signals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["hypothesis_id", "stance", "note", "quotes"],
+                    "properties": {
+                        "hypothesis_id": { "type": "string" },
+                        "stance": { "type": "string", "enum": ["supports", "contradicts", "mixed", "neutral"] },
+                        "note": { "type": "string" },
+                        "quotes": quotes
+                    }
+                }
             }
         }
     })
 }
 
 fn reduce_schema() -> Value {
+    // An evidence ref array (interview_id + segment_id + verbatim quote), reused below.
+    let evidence = json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["interview_id", "segment_id", "quote"],
+            "properties": {
+                "interview_id": { "type": "string" },
+                "segment_id": { "type": "integer" },
+                "quote": { "type": "string" }
+            }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["executive_summary", "findings", "open_questions", "by_role"],
+        "required": ["executive_summary", "findings", "open_questions", "by_role", "hypothesis_verdicts", "question_answers"],
         "properties": {
             "executive_summary": { "type": "string" },
+            "hypothesis_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["hypothesis_id", "verdict", "confidence", "rationale", "evidence"],
+                    "properties": {
+                        "hypothesis_id": { "type": "string" },
+                        "verdict": { "type": "string", "enum": ["confirmed", "partially", "refuted", "inconclusive"] },
+                        "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                        "rationale": { "type": "string" },
+                        "evidence": evidence.clone()
+                    }
+                }
+            },
+            "question_answers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["question_id", "status", "answer", "evidence"],
+                    "properties": {
+                        "question_id": { "type": "string" },
+                        "status": { "type": "string", "enum": ["answered", "partially", "not_answered"] },
+                        "answer": { "type": "string" },
+                        "evidence": evidence.clone()
+                    }
+                }
+            },
             "findings": {
                 "type": "array",
                 "items": {
@@ -580,19 +1042,30 @@ fn reduce_schema() -> Value {
 fn build_extract_input(
     product_desc: &str,
     goals: &[Goal],
+    hypotheses: &[TemplateItem],
+    questions: &[GuideQuestion],
     interview: &InterviewInput,
 ) -> Value {
     json!({
         "task": "cycle-synthesis-extract",
-        "instructions": "You are summarizing ONE user-research interview, structured by the research goals. \
-            For EACH goal, extract the concrete, goal-relevant points THIS interview supports. Attach short \
-            VERBATIM quotes (a sentence or two, in the original language — never translate) and the `segment_id` \
-            each quote came from. Weight RESPONDENT statements over interviewer prompts. Only include points \
-            grounded in the transcript; if a goal has nothing, omit it. ALSO list any `notable` quotes or \
-            surprises worth flagging (each with its `segment_id`, the `quote`, and a one-line `note`). Return \
-            ONLY JSON matching the schema.",
+        "system": analysis_system_prompt(),
+        "instructions": "You are summarizing ONE user-research interview, structured by the guide. \
+            (1) For EACH goal, extract the concrete, goal-relevant `points` THIS interview supports, each with \
+            short VERBATIM quotes (original language — never translate) + the `segment_id`. \
+            (2) For EVERY guide question in `questions`, output a `question_answers` entry: set `status` to \
+            `direct` (asked & answered), `indirect` (answered while discussing something else — credit it even \
+            if never asked verbatim), or `not_answered`; give a one-to-two sentence `summary` (empty when \
+            not_answered) and the supporting `quotes`. Do not skip any question. \
+            (3) For EVERY hypothesis in `hypotheses`, output a `hypothesis_signals` entry: `stance` is \
+            `supports`, `contradicts`, `mixed`, or `neutral` (neutral = this interview says nothing about it), \
+            with a short `note` + quotes. \
+            (4) ALSO list any `notable` quotes or surprises (each with `segment_id`, `quote`, one-line `note`). \
+            Weight RESPONDENT statements over interviewer prompts. Use ONLY the goal_ids / question_id / \
+            hypothesis_id provided. Return ONLY JSON matching the schema.",
         "product_desc": product_desc,
         "goals": goals,
+        "hypotheses": hypotheses,
+        "questions": questions,
         "interview": interview
     })
 }
@@ -601,23 +1074,32 @@ fn build_reduce_input(
     product_desc: &str,
     guide: &str,
     goals: &[Goal],
+    hypotheses: &[TemplateItem],
+    questions: &[GuideQuestion],
     extractions: &[InterviewExtraction],
 ) -> Value {
     json!({
         "task": "cycle-synthesis-reduce",
-        "instructions": "You are synthesizing findings ACROSS all interviews in a research wave, FOLLOWING the \
-            guide structure. Using the per-interview extracted points below, produce: (1) a 2-4 sentence \
-            `executive_summary` of the wave; (2) cross-interview FINDINGS — each MUST be bound to one `goal_id` \
-            from the goals list, carry a concise `statement`, a `confidence` (high|medium|low), a `support_count` \
-            (how many interviews support it), `evidence` (the strongest verbatim quotes with their `interview_id` \
-            + `segment_id`), and a short `recommendation`; (3) `open_questions` the wave did not resolve; and (4) \
-            an optional `by_role` breakdown per goal (what each role — e.g. designers vs PMs — said), using the \
-            speaker roles present in the transcripts. Confirm or refute the guide's target conclusions where the \
-            evidence speaks to them. Every finding ties to a goal — no free-floating themes. Return ONLY JSON \
-            matching the schema.",
+        "system": analysis_system_prompt(),
+        "instructions": "You are synthesizing ACROSS all interviews in a research wave, STRICTLY FOLLOWING the \
+            guide. Using the per-interview extractions below, produce: \
+            (1) a 2-4 sentence `executive_summary` of the wave; \
+            (2) `hypothesis_verdicts` — one entry for EVERY hypothesis in `hypotheses`: a `verdict` \
+            (`confirmed`|`partially`|`refuted`|`inconclusive`), a `confidence` (high|medium|low), a `rationale`, \
+            and `evidence` (strongest verbatim quotes with `interview_id` + `segment_id`). Never omit a \
+            hypothesis; use `inconclusive` when the wave is thin. \
+            (3) `question_answers` — one entry for EVERY question in `questions`: a `status` \
+            (`answered`|`partially`|`not_answered`), a consolidated `answer` across interviews (note when it was \
+            answered only indirectly), and `evidence`. Do not skip any question. \
+            (4) cross-interview FINDINGS — each bound to one `goal_id`, with a `statement`, `confidence`, \
+            `support_count`, `evidence`, and a short `recommendation`; \
+            (5) `open_questions` the wave did not resolve; and (6) an optional `by_role` breakdown per goal. \
+            Use ONLY the goal_ids / hypothesis_id / question_id provided. Return ONLY JSON matching the schema.",
         "product_desc": product_desc,
         "guide": guide,
         "goals": goals,
+        "hypotheses": hypotheses,
+        "questions": questions,
         "interviews": extractions
     })
 }
@@ -724,7 +1206,122 @@ fn assemble_by_role(goals: &[Goal], output: &ReduceOutput) -> Vec<RoleBreakdownG
         .collect()
 }
 
+// Keep only evidence refs that point at a real interview + an in-range segment. Shared by the
+// findings / hypothesis / question assembly so every cited quote is traceable (the same
+// discipline assemble_findings applies inline).
+fn valid_evidence(raw: &[Evidence], valid_segments: &HashMap<String, usize>) -> Vec<Evidence> {
+    raw.iter()
+        .filter(|e| valid_segments.get(&e.interview_id).is_some_and(|&n| e.segment_id < n))
+        .map(|e| Evidence {
+            interview_id: e.interview_id.clone(),
+            segment_id: e.segment_id,
+            quote: e.quote.trim().to_string(),
+        })
+        .collect()
+}
+
+// Build one verdict per guide hypothesis, in guide order — NEVER skipping one (req: answer the
+// whole guide). The model's verdict is used when present + valid; a missing/blank hypothesis
+// falls back to `inconclusive` so the UI always shows every hypothesis. Verdict + confidence
+// are normalized; evidence is clamped to real refs.
+fn assemble_hypothesis_verdicts(
+    hypotheses: &[TemplateItem],
+    valid_segments: &HashMap<String, usize>,
+    output: &ReduceOutput,
+) -> Vec<HypothesisVerdict> {
+    hypotheses
+        .iter()
+        .map(|h| {
+            let raw = output.hypothesis_verdicts.iter().find(|v| v.hypothesis_id == h.id);
+            let verdict = raw
+                .map(|r| match r.verdict.trim().to_lowercase().as_str() {
+                    "confirmed" => "confirmed",
+                    "partially" | "partial" | "partially confirmed" => "partially",
+                    "refuted" | "rejected" | "disproven" => "refuted",
+                    _ => "inconclusive",
+                })
+                .unwrap_or("inconclusive")
+                .to_string();
+            let confidence = raw
+                .map(|r| match r.confidence.trim().to_lowercase().as_str() {
+                    "high" => "high",
+                    "low" => "low",
+                    _ => "medium",
+                })
+                .unwrap_or("low")
+                .to_string();
+            let rationale = raw.map(|r| r.rationale.trim().to_string()).unwrap_or_default();
+            let evidence = raw.map(|r| valid_evidence(&r.evidence, valid_segments)).unwrap_or_default();
+            HypothesisVerdict { id: h.id.clone(), text: h.text.clone(), verdict, confidence, rationale, evidence }
+        })
+        .collect()
+}
+
+// Build one consolidated answer per guide question, in guide order — NEVER skipping one. A
+// missing/blank question falls back to `not_answered`. Status is normalized; evidence clamped.
+fn assemble_question_answers(
+    questions: &[GuideQuestion],
+    valid_segments: &HashMap<String, usize>,
+    output: &ReduceOutput,
+) -> Vec<QuestionAnswer> {
+    questions
+        .iter()
+        .map(|q| {
+            let raw = output.question_answers.iter().find(|a| a.question_id == q.id);
+            let answer = raw.map(|r| r.answer.trim().to_string()).unwrap_or_default();
+            let mapped = raw
+                .map(|r| match r.status.trim().to_lowercase().as_str() {
+                    "answered" | "direct" => "answered",
+                    "partially" | "partial" | "indirect" => "partially",
+                    _ => "not_answered",
+                })
+                .unwrap_or("not_answered");
+            // Defensive: a non-not_answered status with no answer text is really not answered.
+            let status = if answer.is_empty() { "not_answered" } else { mapped }.to_string();
+            let evidence = raw.map(|r| valid_evidence(&r.evidence, valid_segments)).unwrap_or_default();
+            QuestionAnswer {
+                id: q.id.clone(),
+                text: q.text.clone(),
+                section: q.section.clone(),
+                block: q.block.clone(),
+                status,
+                answer,
+                evidence,
+            }
+        })
+        .collect()
+}
+
 // --- editable markdown artifact rendering (pure + unit-tested) -----------------
+
+// Human-readable labels for hypothesis verdicts / question-answer statuses (used in the
+// rendered markdown artifacts; the structured UI maps the same enum values to badges).
+fn verdict_label(v: &str) -> &'static str {
+    match v {
+        "confirmed" => "Confirmed",
+        "partially" => "Partially confirmed",
+        "refuted" => "Refuted",
+        _ => "Inconclusive",
+    }
+}
+
+fn question_status_label(s: &str) -> &'static str {
+    match s {
+        "answered" => "Answered",
+        "partially" => "Partially answered",
+        _ => "Not answered",
+    }
+}
+
+fn signal_label(s: &str) -> &'static str {
+    match s {
+        "supports" => "Supports",
+        "contradicts" => "Contradicts",
+        "mixed" => "Mixed",
+        _ => "Neutral",
+    }
+}
+
 
 // Render the CYCLE synthesis as the human-editable markdown report, following the guide
 // structure: Executive summary → per goal (heading → findings with confidence + evidence
@@ -744,6 +1341,48 @@ fn render_cycle_markdown(
     } else {
         md.push_str(doc.executive_summary.trim());
         md.push_str("\n\n");
+    }
+
+    // Hypotheses — each verdict, with rationale + evidence (templated guide).
+    if !doc.hypothesis_verdicts.is_empty() {
+        md.push_str("## Hypotheses\n\n");
+        for h in &doc.hypothesis_verdicts {
+            md.push_str(&format!(
+                "### {} — {} · _{} confidence_\n\n{}\n\n",
+                h.id,
+                verdict_label(&h.verdict),
+                h.confidence,
+                h.text.trim(),
+            ));
+            if !h.rationale.trim().is_empty() {
+                md.push_str(&format!("{}\n\n", h.rationale.trim()));
+            }
+            for e in &h.evidence {
+                if e.quote.trim().is_empty() {
+                    continue;
+                }
+                let who = title_for.get(&e.interview_id).cloned().unwrap_or_else(|| e.interview_id.clone());
+                md.push_str(&format!("> {}\n> — {} · segment {}\n\n", e.quote.trim(), who, e.segment_id + 1));
+            }
+        }
+    }
+
+    // Questions — a consolidated answer per guide question (templated guide).
+    if !doc.question_answers.is_empty() {
+        md.push_str("## Questions\n\n");
+        for q in &doc.question_answers {
+            md.push_str(&format!("### {} — {}\n\n_{}_\n\n", q.id, question_status_label(&q.status), q.text.trim()));
+            if !q.answer.trim().is_empty() {
+                md.push_str(&format!("{}\n\n", q.answer.trim()));
+            }
+            for e in &q.evidence {
+                if e.quote.trim().is_empty() {
+                    continue;
+                }
+                let who = title_for.get(&e.interview_id).cloned().unwrap_or_else(|| e.interview_id.clone());
+                md.push_str(&format!("> {}\n> — {} · segment {}\n\n", e.quote.trim(), who, e.segment_id + 1));
+            }
+        }
     }
 
     // Per goal.
@@ -815,9 +1454,13 @@ fn render_cycle_markdown(
 }
 
 // Build the per-interview summary doc from one interview's extraction, enforcing invariants
-// (goal_id real, segment refs in range) + grouping points by goal in goal order. Pure.
+// (goal_id / question_id / hypothesis_id real, segment refs in range) + grouping points by
+// goal in goal order. `hypotheses` / `questions` are the guide template's items (empty for a
+// legacy free-markdown guide → the new sections stay empty). Pure.
 fn assemble_interview_summary(
     goals: &[Goal],
+    hypotheses: &[TemplateItem],
+    questions: &[GuideQuestion],
     segment_count: usize,
     output: &ExtractOutput,
 ) -> InterviewSummaryDoc {
@@ -859,7 +1502,73 @@ fn assemble_interview_summary(
         })
         .collect();
 
-    InterviewSummaryDoc { goals: goals.to_vec(), by_goal, notable }
+    // Per-question answers: keep only entries that reference a real guide question; normalize
+    // the status; clamp quotes. We keep the model's entries as-is (the cycle reduce is what
+    // force-fills "not_answered" for every question); here we just record what this interview
+    // surfaced. A quote-ref helper local to this interview's segment count.
+    let clamp_quotes = |qs: &[ExtractedQuote]| -> Vec<InterviewQuote> {
+        qs.iter()
+            .filter(|q| q.segment_id < segment_count)
+            .map(|q| InterviewQuote { segment_id: q.segment_id, quote: q.quote.trim().to_string() })
+            .collect()
+    };
+    let q_ids: std::collections::HashSet<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+    let question_answers: Vec<InterviewQuestionAnswer> = output
+        .question_answers
+        .iter()
+        .filter(|a| q_ids.contains(a.question_id.as_str()))
+        .map(|a| {
+            let status = match a.status.trim().to_lowercase().as_str() {
+                "direct" => "direct",
+                "indirect" => "indirect",
+                _ => "not_answered",
+            }
+            .to_string();
+            InterviewQuestionAnswer {
+                question_id: a.question_id.clone(),
+                status,
+                summary: a.summary.trim().to_string(),
+                quotes: clamp_quotes(&a.quotes),
+            }
+        })
+        // Drop a not_answered entry with nothing to say (noise); keep answered ones always.
+        .filter(|a| a.status != "not_answered" || !a.summary.is_empty() || !a.quotes.is_empty())
+        .collect();
+
+    // Per-hypothesis signals: keep real-hypothesis entries; normalize stance; clamp quotes.
+    let h_ids: std::collections::HashSet<&str> = hypotheses.iter().map(|h| h.id.as_str()).collect();
+    let hypothesis_signals: Vec<InterviewHypothesisSignal> = output
+        .hypothesis_signals
+        .iter()
+        .filter(|s| h_ids.contains(s.hypothesis_id.as_str()))
+        .map(|s| {
+            let stance = match s.stance.trim().to_lowercase().as_str() {
+                "supports" => "supports",
+                "contradicts" => "contradicts",
+                "mixed" => "mixed",
+                _ => "neutral",
+            }
+            .to_string();
+            InterviewHypothesisSignal {
+                hypothesis_id: s.hypothesis_id.clone(),
+                stance,
+                note: s.note.trim().to_string(),
+                quotes: clamp_quotes(&s.quotes),
+            }
+        })
+        // Drop a neutral signal with nothing to say; keep supports/contradicts/mixed always.
+        .filter(|s| s.stance != "neutral" || !s.note.is_empty() || !s.quotes.is_empty())
+        .collect();
+
+    InterviewSummaryDoc {
+        goals: goals.to_vec(),
+        by_goal,
+        notable,
+        hypotheses: hypotheses.to_vec(),
+        questions: questions.to_vec(),
+        question_answers,
+        hypothesis_signals,
+    }
 }
 
 // Render a per-interview summary as editable markdown: per goal (heading → points with
@@ -883,6 +1592,45 @@ fn render_interview_markdown(doc: &InterviewSummaryDoc, title: &str) -> String {
                     continue;
                 }
                 md.push_str(&format!("  > {} _(segment {})_\n", q.quote.trim(), q.segment_id + 1));
+            }
+        }
+        md.push('\n');
+    }
+
+    // Hypothesis signals (templated guide): how this interview bears on each hypothesis.
+    if !doc.hypothesis_signals.is_empty() {
+        md.push_str("## Hypothesis signals\n\n");
+        for s in &doc.hypothesis_signals {
+            let text = doc.hypotheses.iter().find(|h| h.id == s.hypothesis_id).map(|h| h.text.clone()).unwrap_or_default();
+            md.push_str(&format!("- **{} · {}** — {}\n", s.hypothesis_id, signal_label(&s.stance), text.trim()));
+            if !s.note.trim().is_empty() {
+                md.push_str(&format!("  {}\n", s.note.trim()));
+            }
+            for q in &s.quotes {
+                if !q.quote.trim().is_empty() {
+                    md.push_str(&format!("  > {} _(segment {})_\n", q.quote.trim(), q.segment_id + 1));
+                }
+            }
+        }
+        md.push('\n');
+    }
+
+    // Question answers (templated guide): what this interview answered, direct or indirect.
+    let answered: Vec<&InterviewQuestionAnswer> =
+        doc.question_answers.iter().filter(|a| a.status != "not_answered").collect();
+    if !answered.is_empty() {
+        md.push_str("## Question answers\n\n");
+        for a in answered {
+            let text = doc.questions.iter().find(|q| q.id == a.question_id).map(|q| q.text.clone()).unwrap_or_default();
+            let how = if a.status == "indirect" { " _(indirect)_" } else { "" };
+            md.push_str(&format!("- **{}**{} — {}\n", a.question_id, how, text.trim()));
+            if !a.summary.trim().is_empty() {
+                md.push_str(&format!("  {}\n", a.summary.trim()));
+            }
+            for q in &a.quotes {
+                if !q.quote.trim().is_empty() {
+                    md.push_str(&format!("  > {} _(segment {})_\n", q.quote.trim(), q.segment_id + 1));
+                }
             }
         }
         md.push('\n');
@@ -993,6 +1741,30 @@ pub(crate) async fn effective_guide_db(pool: &SqlitePool, cycle_id: &str) -> Res
         }
     }
     Ok(Some(inline))
+}
+
+// The structured guide TEMPLATE a cycle's pipeline reasons against (templated guide): the
+// linked guide's parsed template_json, or an EMPTY template when the cycle has no linked guide
+// / the guide is a legacy free-markdown one. Empty → the synthesis behaves exactly as before
+// (goals-only, no hypothesis/question sections). pub(crate) so synthesis + diff share it.
+pub(crate) async fn effective_guide_template_db(
+    pool: &SqlitePool,
+    cycle_id: &str,
+) -> Result<GuideTemplate, String> {
+    let guide_id: Option<Option<String>> = sqlx::query_scalar("SELECT guide_id FROM cycle WHERE id = ?")
+        .bind(cycle_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(Some(gid)) = guide_id.filter(|g| g.as_ref().is_some_and(|s| !s.is_empty())) else {
+        return Ok(GuideTemplate::default());
+    };
+    let template_json: Option<String> = sqlx::query_scalar("SELECT template_json FROM guide WHERE id = ?")
+        .bind(&gid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(template_json.map(|j| GuideTemplate::parse(&j)).unwrap_or_default())
 }
 
 // The effective PRODUCT CONTEXT a cycle's pipeline is grounded on (Products library): prefer
@@ -1327,11 +2099,13 @@ async fn extract_one(
     adapter: &crate::adapter::Adapter,
     product_desc: &str,
     goals: &[Goal],
+    hypotheses: &[TemplateItem],
+    questions: &[GuideQuestion],
     interview: &InterviewInput,
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> (ExtractOutput, InterviewExtraction) {
-    let input = build_extract_input(product_desc, goals, interview);
+    let input = build_extract_input(product_desc, goals, hypotheses, questions, interview);
     let schema = extract_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -1380,12 +2154,14 @@ async fn reduce(
     product_desc: &str,
     guide: &str,
     goals: &[Goal],
+    hypotheses: &[TemplateItem],
+    questions: &[GuideQuestion],
     extractions: &[InterviewExtraction],
     valid_segments: &HashMap<String, usize>,
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> Result<SynthesisDoc, String> {
-    let input = build_reduce_input(product_desc, guide, goals, extractions);
+    let input = build_reduce_input(product_desc, guide, goals, hypotheses, questions, extractions);
     let schema = reduce_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -1414,6 +2190,8 @@ async fn reduce(
 
     let findings = assemble_findings(goals, valid_segments, &output);
     let by_role = assemble_by_role(goals, &output);
+    let hypothesis_verdicts = assemble_hypothesis_verdicts(hypotheses, valid_segments, &output);
+    let question_answers = assemble_question_answers(questions, valid_segments, &output);
     let open_questions: Vec<String> = output
         .open_questions
         .iter()
@@ -1427,6 +2205,10 @@ async fn reduce(
         open_questions,
         executive_summary: output.executive_summary.trim().to_string(),
         by_role,
+        hypotheses: hypotheses.to_vec(),
+        questions: questions.to_vec(),
+        hypothesis_verdicts,
+        question_answers,
     })
 }
 
@@ -1446,15 +2228,21 @@ async fn synthesize_cycle(
     cycle_id: &str,
     product_desc: &str,
     guide: &str,
+    template: &GuideTemplate,
     adapter: &crate::adapter::Adapter,
     interviews: &[InterviewInput],
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> Result<CycleSynthesisResult, String> {
-    let goals = derive_goals(guide);
+    // Goals are the templated guide's TASKS when present (ids already G1..), else derived from
+    // the markdown (legacy / free-markdown guide). Hypotheses + questions come from the template
+    // (empty for a legacy guide → the new sections simply don't appear).
+    let goals = if !template.is_empty() { template.goals() } else { derive_goals(guide) };
+    let hypotheses = template.hypotheses.clone();
+    let questions = template.questions();
     if goals.is_empty() {
         log::warn!(target: "interviewlab::synthesis", "[E-SYN-NO-GOALS] synthesize: cycle='{cycle_id}': no goals derivable from the guide ({} chars) — aborting", guide.len());
-        return Err("no goals could be derived from the guide — add a Goals section first".into());
+        return Err("no goals could be derived from the guide — add a Goals/tasks section first".into());
     }
     if interviews.is_empty() {
         log::warn!(target: "interviewlab::synthesis", "[E-SYN-NO-INTERVIEWS] synthesize: cycle='{cycle_id}': no transcribed interviews to synthesize — aborting");
@@ -1487,9 +2275,11 @@ async fn synthesize_cycle(
         let wave_futs = wave.iter().map(|iv| {
             let done = &done;
             let goals = &goals;
+            let hypotheses = &hypotheses;
+            let questions = &questions;
             async move {
-                let (output, extraction) = extract_one(adapter, product_desc, goals, iv, model_override).await;
-                let summary = assemble_interview_summary(goals, iv.segments.len(), &output);
+                let (output, extraction) = extract_one(adapter, product_desc, goals, hypotheses, questions, iv, model_override).await;
+                let summary = assemble_interview_summary(goals, hypotheses, questions, iv.segments.len(), &output);
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
                     // Reserve the last 20% of the bar for the reduce stage.
@@ -1509,7 +2299,7 @@ async fn synthesize_cycle(
     if let Some(app) = app {
         emit_progress(app, cycle_id, "reduce", total, total, 85, None);
     }
-    let doc = reduce(adapter, product_desc, guide, &goals, &extractions, &valid_segments, model_override).await?;
+    let doc = reduce(adapter, product_desc, guide, &goals, &hypotheses, &questions, &extractions, &valid_segments, model_override).await?;
 
     Ok(CycleSynthesisResult { doc, summaries })
 }
@@ -1577,9 +2367,12 @@ pub async fn run_interview_summary(
         .await?
         .unwrap_or_default();
     let guide = effective_guide_db(&db.pool, &cycle_id).await?.unwrap_or_default();
-    let goals = derive_goals(&guide);
+    let template = effective_guide_template_db(&db.pool, &cycle_id).await?;
+    let goals = if !template.is_empty() { template.goals() } else { derive_goals(&guide) };
+    let hypotheses = template.hypotheses.clone();
+    let questions = template.questions();
     if goals.is_empty() {
-        let msg = "no goals derived from the cycle's guide — add a Goals section first".to_string();
+        let msg = "no goals derived from the cycle's guide — add a Goals/tasks section first".to_string();
         emit_summary_progress(&app, &interview_id, "error", 0, Some(msg.clone()));
         return Err(msg);
     }
@@ -1605,8 +2398,8 @@ pub async fn run_interview_summary(
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     let model_override =
         crate::adapter::task_model_override(&db.pool, "cycle-synthesis-extract").await;
-    let (output, _extraction) = extract_one(&adapter, &product_desc, &goals, &iv, model_override.as_deref()).await;
-    let doc = assemble_interview_summary(&goals, iv.segments.len(), &output);
+    let (output, _extraction) = extract_one(&adapter, &product_desc, &goals, &hypotheses, &questions, &iv, model_override.as_deref()).await;
+    let doc = assemble_interview_summary(&goals, &hypotheses, &questions, iv.segments.len(), &output);
     let content_md = render_interview_markdown(&doc, &title);
     let model_meta = json!({ "adapter": adapter.id, "goals": doc.goals.len() }).to_string();
     let row_id = store_interview_summary_db(&db.pool, &cycle_id, &interview_id, &doc, &content_md, &model_meta).await.map_err(|e| {
@@ -1665,6 +2458,7 @@ pub async fn run_synthesis(
     let guide = effective_guide_db(&db.pool, &cycle_id)
         .await?
         .ok_or("cycle not found")?;
+    let template = effective_guide_template_db(&db.pool, &cycle_id).await?;
 
     // Gather every interview's best role-labeled transcript (skip un-transcribed ones).
     let interview_rows: Vec<(String, String)> =
@@ -1699,7 +2493,7 @@ pub async fn run_synthesis(
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     let model_override = crate::adapter::task_model_override(&db.pool, "cycle-synthesis").await;
     log::info!(target: "interviewlab::synthesis", "run_synthesis: cycle='{cycle_id}' ('{name}'): {} interview(s), adapter='{}'", interviews.len(), adapter.id);
-    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &adapter, &interviews, model_override.as_deref()).await {
+    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &template, &adapter, &interviews, model_override.as_deref()).await {
         Ok(result) => {
             // Persist each per-interview summary (the MAP artifacts).
             for (iv_id, title, summary) in &result.summaries {
@@ -1751,6 +2545,88 @@ pub async fn run_synthesis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- templated guide (parse / normalize / render / questions) -------------
+
+    fn sample_template() -> GuideTemplate {
+        GuideTemplate {
+            hypotheses: vec![
+                TemplateItem { id: String::new(), text: "  Users churn after trial because setup is too long.  ".into() },
+                TemplateItem { id: "stale".into(), text: "Pricing is the main objection.".into() },
+                TemplateItem { id: String::new(), text: "   ".into() }, // blank → dropped
+            ],
+            tasks: vec![
+                TemplateItem { id: String::new(), text: "Understand the activation blocker.".into() },
+                TemplateItem { id: String::new(), text: "Map the first-week journey.".into() },
+            ],
+            qualifying_questions: vec![
+                TemplateItem { id: String::new(), text: "What's your role?".into() },
+            ],
+            main_blocks: vec![
+                QuestionBlock {
+                    title: "  Onboarding  ".into(),
+                    questions: vec![
+                        TemplateItem { id: String::new(), text: "Walk me through your first day.".into() },
+                        TemplateItem { id: String::new(), text: "Where did you get stuck?".into() },
+                    ],
+                },
+                QuestionBlock { title: "   ".into(), questions: vec![] }, // empty block → dropped
+            ],
+            hypothesis_questions: vec![
+                TemplateItem { id: String::new(), text: "Would you have paid at signup?".into() },
+            ],
+        }
+    }
+
+    #[test]
+    fn template_normalized_stamps_stable_ids_and_drops_blanks() {
+        let t = sample_template().normalized();
+        // Hypotheses: H1, H2 (the blank one dropped; the stale id is re-stamped positionally).
+        assert_eq!(t.hypotheses.len(), 2);
+        assert_eq!(t.hypotheses[0].id, "H1");
+        assert_eq!(t.hypotheses[1].id, "H2");
+        assert_eq!(t.hypotheses[0].text, "Users churn after trial because setup is too long.", "text trimmed");
+        // Tasks → goal ids G1, G2.
+        assert_eq!(t.tasks.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), vec!["G1", "G2"]);
+        // The empty main block is dropped; the titled one is trimmed.
+        assert_eq!(t.main_blocks.len(), 1);
+        assert_eq!(t.main_blocks[0].title, "Onboarding");
+        // Questions share ONE global Q counter across qualifying → main → hypothesis questions.
+        let q_ids: Vec<String> = t.questions().into_iter().map(|q| q.id).collect();
+        assert_eq!(q_ids, vec!["Q1", "Q2", "Q3", "Q4"], "global Q numbering in document order");
+        // Section context is carried.
+        let qs = t.questions();
+        assert_eq!(qs[0].section, "qualifying");
+        assert_eq!(qs[1].section, "main");
+        assert_eq!(qs[1].block, "Onboarding");
+        assert_eq!(qs[3].section, "hypothesis");
+    }
+
+    #[test]
+    fn template_goals_match_derive_goals_of_rendered_md() {
+        // The canonical render puts tasks under "## Goals" with explicit Gn tags, so
+        // derive_goals(content_md) yields the SAME ids as template.goals() — the diff spine
+        // stays consistent whether read from the template or the markdown.
+        let t = sample_template().normalized();
+        let md = render_template_md(&t);
+        assert!(md.contains("## Hypotheses"));
+        assert!(md.contains("## Goals"));
+        assert!(md.contains("## Main questions"));
+        assert!(md.contains("### Onboarding"));
+        assert_eq!(derive_goals(&md), t.goals(), "rendered markdown re-derives identical goals");
+    }
+
+    #[test]
+    fn template_parse_empty_and_is_empty() {
+        assert!(GuideTemplate::parse("").is_empty());
+        assert!(GuideTemplate::parse("{}").is_empty());
+        assert!(GuideTemplate::parse("not json").is_empty());
+        assert!(!sample_template().is_empty());
+        // Round-trips through JSON (the template_json column).
+        let t = sample_template().normalized();
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(GuideTemplate::parse(&json), t);
+    }
 
     // --- goal derivation (stability for M9) -----------------------------------
 
@@ -1918,6 +2794,68 @@ mod tests {
         assert_eq!(findings[0].support_count, 2, "bumped to distinct cited interviews");
     }
 
+    // --- hypothesis verdicts + question answers (templated guide, pure) --------
+
+    fn hyps2() -> Vec<TemplateItem> {
+        vec![
+            TemplateItem { id: "H1".into(), text: "Setup is the churn driver.".into() },
+            TemplateItem { id: "H2".into(), text: "Price is the top objection.".into() },
+        ]
+    }
+
+    #[test]
+    fn assemble_hypothesis_verdicts_fills_every_hypothesis_and_validates() {
+        // The model returns a verdict for H1 (with a bogus + one good evidence ref) and an
+        // unknown H9; H2 is OMITTED → must still appear as inconclusive (answer the whole guide).
+        let output: ReduceOutput = serde_json::from_value(json!({
+            "hypothesis_verdicts": [
+                { "hypothesis_id": "H1", "verdict": "confirmed", "confidence": "high",
+                  "rationale": "Five of six stalled at setup.",
+                  "evidence": [
+                    { "interview_id": "iv1", "segment_id": 2, "quote": "took forever" },
+                    { "interview_id": "iv1", "segment_id": 99, "quote": "oob" }
+                  ] },
+                { "hypothesis_id": "H9", "verdict": "refuted", "confidence": "low", "rationale": "x", "evidence": [] }
+            ]
+        })).unwrap();
+        let v = assemble_hypothesis_verdicts(&hyps2(), &valid_segs(), &output);
+        assert_eq!(v.len(), 2, "one verdict per guide hypothesis, in order");
+        assert_eq!(v[0].id, "H1");
+        assert_eq!(v[0].verdict, "confirmed");
+        assert_eq!(v[0].evidence.len(), 1, "out-of-range evidence dropped");
+        assert_eq!(v[1].id, "H2");
+        assert_eq!(v[1].verdict, "inconclusive", "omitted hypothesis defaults to inconclusive");
+        assert_eq!(v[1].confidence, "low");
+    }
+
+    #[test]
+    fn assemble_question_answers_fills_every_question_and_normalizes_status() {
+        let questions = vec![
+            GuideQuestion { id: "Q1".into(), text: "Role?".into(), section: "qualifying".into(), block: String::new() },
+            GuideQuestion { id: "Q2".into(), text: "First day?".into(), section: "main".into(), block: "Onboarding".into() },
+            GuideQuestion { id: "Q3".into(), text: "Pay at signup?".into(), section: "hypothesis".into(), block: String::new() },
+        ];
+        let output: ReduceOutput = serde_json::from_value(json!({
+            "question_answers": [
+                { "question_id": "Q1", "status": "answered", "answer": "PMs and designers.", "evidence": [] },
+                // Q2 says "answered" but the answer is blank → normalized to not_answered.
+                { "question_id": "Q2", "status": "answered", "answer": "   ", "evidence": [] },
+                // Q3 answered only indirectly → maps to "partially".
+                { "question_id": "Q3", "status": "indirect", "answer": "Most would not.", "evidence": [
+                    { "interview_id": "iv2", "segment_id": 0, "quote": "not at signup" }
+                ] }
+                // (no Q-entry omitted here, but a missing one would default to not_answered)
+            ]
+        })).unwrap();
+        let a = assemble_question_answers(&questions, &valid_segs(), &output);
+        assert_eq!(a.len(), 3, "one answer per guide question, in order");
+        assert_eq!(a[0].status, "answered");
+        assert_eq!(a[1].status, "not_answered", "answered-but-blank → not_answered");
+        assert_eq!(a[2].status, "partially", "indirect → partially");
+        assert_eq!(a[2].evidence.len(), 1);
+        assert_eq!(a[2].section, "hypothesis");
+    }
+
     // --- by-role assembly + markdown rendering (M10b, pure) --------------------
 
     #[test]
@@ -1953,6 +2891,7 @@ mod tests {
                 goal_id: "G1".into(),
                 notes: vec![RoleNote { role: "Designer".into(), note: "asked for templates".into() }],
             }],
+            ..Default::default()
         };
         let titles = HashMap::from([("iv1".to_string(), "P01 — Founder".to_string())]);
         let md = render_cycle_markdown(&doc, &titles);
@@ -1982,7 +2921,7 @@ mod tests {
             ],
             "notable": [ { "segment_id": 1, "quote": "five minutes not two days", "note": "wizard ask" }, { "segment_id": 100, "quote": "oob", "note": "" } ]
         })).unwrap();
-        let doc = assemble_interview_summary(&goals3(), 5, &output);
+        let doc = assemble_interview_summary(&goals3(), &[], &[], 5, &output);
         // Only G1 + G2 groups (GZ unknown dropped); points grouped by goal order.
         assert_eq!(doc.by_goal.len(), 2);
         assert_eq!(doc.by_goal[0].goal_id, "G1");
@@ -2052,6 +2991,7 @@ mod tests {
             open_questions: output.open_questions.iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).collect(),
             executive_summary: output.executive_summary.trim().to_string(),
             by_role: assemble_by_role(&goals, &output),
+            ..Default::default()
         };
         assert_eq!(doc.open_questions.len(), 1, "blank open question filtered");
         assert_eq!(doc.by_role.len(), 1, "by-role group kept");
@@ -2161,15 +3101,23 @@ mod tests {
             title: "P01".into(),
             segments: vec![],
         };
-        let extract = build_extract_input(product, &goals, &iv);
+        let extract = build_extract_input(product, &goals, &[], &[], &iv);
         assert_eq!(
             extract["product_desc"], product,
             "extract prompt carries the product context"
         );
-        let reduce = build_reduce_input(product, "Goals:\n- G1", &goals, &[]);
+        assert_eq!(
+            extract["system"], analysis_system_prompt(),
+            "extract prompt carries the shared analysis system prompt"
+        );
+        let reduce = build_reduce_input(product, "Goals:\n- G1", &goals, &[], &[], &[]);
         assert_eq!(
             reduce["product_desc"], product,
             "reduce prompt carries the product context"
+        );
+        assert_eq!(
+            reduce["system"], analysis_system_prompt(),
+            "reduce prompt carries the shared analysis system prompt"
         );
     }
 
@@ -2192,6 +3140,7 @@ mod tests {
             open_questions: vec!["q?".into()],
             executive_summary: "summary v1".into(),
             by_role: vec![],
+            ..Default::default()
         };
         let id1 = store_cycle_synthesis_db(&pool, &cycle_id, &doc1, "# MD v1", "meta1").await.unwrap();
         let got = get_synthesis_db(&pool, &cycle_id).await.unwrap().unwrap();
@@ -2235,6 +3184,10 @@ mod tests {
                 points: vec![InterviewPoint { point: "Stalled at connect.".into(), quotes: vec![InterviewQuote { segment_id: 0, quote: "no creds".into() }] }],
             }],
             notable: vec![NotableQuote { segment_id: 1, quote: "five minutes".into(), note: "wizard ask".into() }],
+            hypotheses: vec![],
+            questions: vec![],
+            question_answers: vec![],
+            hypothesis_signals: vec![],
         };
         store_interview_summary_db(&pool, &cycle_id, &iv, &doc, "# Summary", "m").await.unwrap();
         // A cycle-level row coexists independently of the per-interview one.
@@ -2355,7 +3308,7 @@ mod tests {
             ],
         };
 
-        let result = synthesize_cycle(None, "m10b-verify", product_desc, guide, &adapter, &[iv1.clone(), iv2.clone()], None)
+        let result = synthesize_cycle(None, "m10b-verify", product_desc, guide, &GuideTemplate::default(), &adapter, &[iv1.clone(), iv2.clone()], None)
             .await
             .expect("real synthesis should succeed");
         let doc = &result.doc;
@@ -2518,7 +3471,8 @@ mod tests {
             assert!(!interviews.is_empty(), "no cleaned interviews for {name} (run stage 2 first)");
             println!("synthesizing {name}: {} interviews via claude ...", interviews.len());
 
-            let result = synthesize_cycle(None, cycle_id, &product_desc, &guide, &adapter, &interviews, None)
+            let template = effective_guide_template_db(&pool, cycle_id).await.unwrap();
+            let result = synthesize_cycle(None, cycle_id, &product_desc, &guide, &template, &adapter, &interviews, None)
                 .await
                 .expect("real synthesis should succeed");
 

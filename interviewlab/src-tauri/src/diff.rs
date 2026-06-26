@@ -49,7 +49,7 @@ use sqlx::SqlitePool;
 use tauri::Emitter;
 use uuid::Uuid;
 
-use crate::synthesis::{Goal, SynthesisDoc};
+use crate::synthesis::{Goal, HypothesisVerdict, SynthesisDoc};
 use crate::Db;
 
 // Tauri event the Diff tab subscribes to for progress (single-stage: diffing → done).
@@ -140,6 +140,50 @@ fn to_diff_inputs(doc: &SynthesisDoc) -> Vec<DiffFindingInput> {
         .collect()
 }
 
+// One hypothesis handed to the diff model with BOTH waves' verdict + rationale, aligned by id,
+// so it can explain (the `why`) what changed. Verdict labels are authoritative; the model only
+// writes the prose. `prev_*` is empty for a new hypothesis; `current_*` for a dropped one.
+#[derive(Serialize, Clone, Debug)]
+struct DiffHypothesisInput {
+    id: String,
+    text: String,
+    prev_verdict: String,
+    current_verdict: String,
+    prev_rationale: String,
+    current_rationale: String,
+}
+
+fn to_hypothesis_inputs(current: &[HypothesisVerdict], previous: &[HypothesisVerdict]) -> Vec<DiffHypothesisInput> {
+    let mut out: Vec<DiffHypothesisInput> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for c in current {
+        seen.insert(c.id.as_str());
+        let prev = previous.iter().find(|p| p.id == c.id);
+        out.push(DiffHypothesisInput {
+            id: c.id.clone(),
+            text: c.text.clone(),
+            prev_verdict: prev.map(|p| p.verdict.clone()).unwrap_or_default(),
+            current_verdict: c.verdict.clone(),
+            prev_rationale: prev.map(|p| p.rationale.clone()).unwrap_or_default(),
+            current_rationale: c.rationale.clone(),
+        });
+    }
+    for p in previous {
+        if seen.contains(p.id.as_str()) {
+            continue;
+        }
+        out.push(DiffHypothesisInput {
+            id: p.id.clone(),
+            text: p.text.clone(),
+            prev_verdict: p.verdict.clone(),
+            current_verdict: String::new(),
+            prev_rationale: p.rationale.clone(),
+            current_rationale: String::new(),
+        });
+    }
+    out
+}
+
 // --- model output shape (§7.3.3) ----------------------------------------------
 
 // One change entry as the model returns it. `status` is free text here and normalized
@@ -167,12 +211,24 @@ struct RawGoalChanges {
     changes: Vec<RawChange>,
 }
 
+// One per-hypothesis `why` note the model returns (verdict labels stay authoritative from the
+// syntheses; the model only explains the wave-over-wave change).
+#[derive(Deserialize, Debug, Default)]
+struct RawHypothesisWhy {
+    #[serde(default)]
+    hypothesis_id: String,
+    #[serde(default)]
+    why: String,
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct RawDiffOutput {
     #[serde(default)]
     by_goal: Vec<RawGoalChanges>,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    hypotheses: Vec<RawHypothesisWhy>,
 }
 
 // --- validated, stored shape --------------------------------------------------
@@ -221,15 +277,98 @@ pub struct GoalDiff {
     pub entries: Vec<DiffEntry>,
 }
 
+// One hypothesis compared wave-over-wave (templated guide). The verdict labels are
+// AUTHORITATIVE from each synthesis (never trusted from the diff model); the `shift` is
+// computed deterministically from prev→current verdict, and the model supplies only the
+// `why`. `prev_verdict` is None when the hypothesis is new this wave; `verdict` is None when
+// it was dropped (retired from the guide).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HypothesisDiffEntry {
+    pub hypothesis_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    pub shift: String, // unchanged | strengthened | weakened | new | dropped
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
 // The full diff document stored in diff.diff_json. Carries the shared goals (id + text,
 // so the UI groups + labels without re-reading either synthesis) + the per-goal entries +
-// the one-line summary.
+// the one-line summary, plus (templated guide) the wave-over-wave hypothesis verdict shifts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DiffDoc {
     pub goals: Vec<DiffGoalRef>,
     pub by_goal: Vec<GoalDiff>,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub hypotheses: Vec<HypothesisDiffEntry>,
+}
+
+// Order the four verdicts by "strength" so a shift can be classified deterministically:
+// refuted < inconclusive < partially < confirmed. A verdict moving UP is `strengthened`,
+// DOWN is `weakened`, same is `unchanged`.
+fn verdict_rank(v: &str) -> i32 {
+    match v {
+        "confirmed" => 3,
+        "partially" => 2,
+        "inconclusive" => 1,
+        "refuted" => 0,
+        _ => 1, // unknown → treat as inconclusive
+    }
+}
+
+// Build the wave-over-wave hypothesis diff from the two syntheses' authoritative verdicts,
+// aligned by hypothesis id (current order first, then previous-only / dropped). The `shift` is
+// derived from the verdict ranks; the model's per-id `why` (keyed by hypothesis_id) is attached
+// when present. Pure + unit-tested.
+fn assemble_hypothesis_diff(
+    current: &[HypothesisVerdict],
+    previous: &[HypothesisVerdict],
+    whys: &std::collections::HashMap<String, String>,
+) -> Vec<HypothesisDiffEntry> {
+    let mut out: Vec<HypothesisDiffEntry> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for c in current {
+        seen.insert(c.id.as_str());
+        let prev = previous.iter().find(|p| p.id == c.id);
+        let shift = match prev {
+            None => "new",
+            Some(p) => match verdict_rank(&c.verdict).cmp(&verdict_rank(&p.verdict)) {
+                std::cmp::Ordering::Greater => "strengthened",
+                std::cmp::Ordering::Less => "weakened",
+                std::cmp::Ordering::Equal => "unchanged",
+            },
+        }
+        .to_string();
+        out.push(HypothesisDiffEntry {
+            hypothesis_id: c.id.clone(),
+            text: c.text.clone(),
+            prev_verdict: prev.map(|p| p.verdict.clone()),
+            verdict: Some(c.verdict.clone()),
+            shift,
+            why: whys.get(&c.id).cloned().unwrap_or_default(),
+        });
+    }
+    // Previous-only hypotheses (retired from the guide this wave) → dropped.
+    for p in previous {
+        if seen.contains(p.id.as_str()) {
+            continue;
+        }
+        out.push(HypothesisDiffEntry {
+            hypothesis_id: p.id.clone(),
+            text: p.text.clone(),
+            prev_verdict: Some(p.verdict.clone()),
+            verdict: None,
+            shift: "dropped".to_string(),
+            why: whys.get(&p.id).cloned().unwrap_or_default(),
+        });
+    }
+    out
 }
 
 // A goal label stored in the diff doc (id + the current/aligned text). Decoupled from
@@ -256,8 +395,20 @@ fn diff_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["by_goal", "summary"],
+        "required": ["by_goal", "summary", "hypotheses"],
         "properties": {
+            "hypotheses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["hypothesis_id", "why"],
+                    "properties": {
+                        "hypothesis_id": { "type": "string" },
+                        "why": { "type": "string" }
+                    }
+                }
+            },
             "by_goal": {
                 "type": "array",
                 "items": {
@@ -297,27 +448,32 @@ fn build_diff_input(
     goals: &[SharedGoal],
     current: &[DiffFindingInput],
     previous: &[DiffFindingInput],
+    hypotheses: &[DiffHypothesisInput],
 ) -> Value {
     json!({
         "task": "cycle-diff",
+        "system": crate::synthesis::analysis_system_prompt(),
         "instructions": "You are comparing two research waves at the level of CONCLUSIONS — \
-            this is a FINDINGS-LEVEL diff, NOT a text diff. For EACH goal, align the current \
-            wave's findings with the previous wave's findings BY MEANING (same underlying \
-            conclusion = a match, even if worded differently), then classify each as: \
-            `new` (a conclusion present this wave with no match last wave), \
-            `changed` (the same conclusion as a previous finding but with a shift in \
-            confidence, root cause, or recommendation), \
-            `dropped` (a previous conclusion with no match this wave), or \
-            `unchanged` (the same conclusion with no material shift). \
-            Give every entry a short `why`; for `changed`, say WHAT shifted (confidence / \
-            root cause / recommendation). Reference findings by id: set `finding_id` to the \
-            CURRENT finding's id (leave \"\" for `dropped`) and `prev_finding_id` to the \
-            PREVIOUS finding's id (leave \"\" for `new`). Use ONLY the goal_ids and finding \
-            ids provided. End with a one-line `summary` of what changed this wave. Return \
-            ONLY JSON matching the schema.",
+            this is a FINDINGS-LEVEL diff, NOT a text diff. \
+            (A) For EACH goal, align the current wave's findings with the previous wave's findings \
+            BY MEANING (same underlying conclusion = a match, even if worded differently), then \
+            classify each as: `new` (a conclusion present this wave with no match last wave), \
+            `changed` (the same conclusion as a previous finding but with a shift in confidence, \
+            root cause, or recommendation), `dropped` (a previous conclusion with no match this \
+            wave), or `unchanged` (the same conclusion with no material shift). Give every entry a \
+            short `why`; for `changed`, say WHAT shifted. Reference findings by id: set `finding_id` \
+            to the CURRENT finding's id (leave \"\" for `dropped`) and `prev_finding_id` to the \
+            PREVIOUS finding's id (leave \"\" for `new`). \
+            (B) For EACH hypothesis in `hypotheses`, write a one-line `why` in `hypotheses` \
+            explaining how its verdict moved between waves (e.g. why it firmed up from partially \
+            to confirmed, or what new evidence weakened it) — keyed by `hypothesis_id`. The verdict \
+            labels themselves are fixed; you only explain the change. \
+            Use ONLY the goal_ids / finding ids / hypothesis ids provided. End with a one-line \
+            `summary` of what changed this wave. Return ONLY JSON matching the schema.",
         "goals": goals,
         "current_findings": current,
-        "previous_findings": previous
+        "previous_findings": previous,
+        "hypotheses": hypotheses
     })
 }
 
@@ -434,6 +590,9 @@ fn assemble_diff(
             .collect(),
         by_goal,
         summary: output.summary.trim().to_string(),
+        // Filled in by diff_syntheses from the authoritative verdicts (kept out of the model's
+        // hands); the pure assemble stays focused on the findings-level diff.
+        hypotheses: Vec::new(),
     }
 }
 
@@ -474,8 +633,9 @@ async fn diff_syntheses(
     let goals = shared_goals(&current.goals, &previous.goals);
     let cur_inputs = to_diff_inputs(current);
     let prev_inputs = to_diff_inputs(previous);
+    let hyp_inputs = to_hypothesis_inputs(&current.hypothesis_verdicts, &previous.hypothesis_verdicts);
 
-    let input = build_diff_input(&goals, &cur_inputs, &prev_inputs);
+    let input = build_diff_input(&goals, &cur_inputs, &prev_inputs, &hyp_inputs);
     let schema = diff_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -487,7 +647,17 @@ async fn diff_syntheses(
     let output: RawDiffOutput = serde_json::from_value(value.clone())
         .map_err(|e| format!("diff output shape invalid: {e}; got {value}"))?;
 
-    Ok(assemble_diff(&goals, &cur_inputs, &prev_inputs, &output))
+    let mut doc = assemble_diff(&goals, &cur_inputs, &prev_inputs, &output);
+    // Hypotheses diff: verdict shifts are computed deterministically from the two syntheses'
+    // authoritative verdicts; only the per-id `why` comes from the model.
+    let whys: std::collections::HashMap<String, String> = output
+        .hypotheses
+        .iter()
+        .filter(|h| !h.hypothesis_id.trim().is_empty())
+        .map(|h| (h.hypothesis_id.trim().to_string(), h.why.trim().to_string()))
+        .collect();
+    doc.hypotheses = assemble_hypothesis_diff(&current.hypothesis_verdicts, &previous.hypothesis_verdicts, &whys);
+    Ok(doc)
 }
 
 // --- storing the diff ---------------------------------------------------------
@@ -919,6 +1089,39 @@ mod tests {
         assert_eq!(entries.len(), 1, "unknown-status entry dropped");
         assert_eq!(entries[0].status, DiffStatus::Unchanged, "\"same\" normalized to unchanged");
         assert_eq!(entries[0].statement, "Users stall at warehouse connect.", "blank statement fell back to F1");
+    }
+
+    #[test]
+    fn assemble_hypothesis_diff_classifies_shifts() {
+        use crate::synthesis::HypothesisVerdict;
+        let hv = |id: &str, text: &str, verdict: &str| HypothesisVerdict {
+            id: id.into(), text: text.into(), verdict: verdict.into(),
+            confidence: "medium".into(), rationale: String::new(), evidence: vec![],
+        };
+        // H1 firms up (partially→confirmed), H2 weakens (confirmed→refuted), H3 is new this
+        // wave, H4 was retired (previous-only → dropped).
+        let current = vec![
+            hv("H1", "Setup churn", "confirmed"),
+            hv("H2", "Price objection", "refuted"),
+            hv("H3", "Invite trigger", "partially"),
+        ];
+        let previous = vec![
+            hv("H1", "Setup churn", "partially"),
+            hv("H2", "Price objection", "confirmed"),
+            hv("H4", "Mobile parity", "inconclusive"),
+        ];
+        let whys = std::collections::HashMap::from([("H1".to_string(), "more evidence".to_string())]);
+        let d = assemble_hypothesis_diff(&current, &previous, &whys);
+        assert_eq!(d.len(), 4, "current order first, then previous-only");
+        assert_eq!((d[0].hypothesis_id.as_str(), d[0].shift.as_str()), ("H1", "strengthened"));
+        assert_eq!(d[0].why, "more evidence", "model why attached by id");
+        assert_eq!(d[0].prev_verdict.as_deref(), Some("partially"));
+        assert_eq!(d[0].verdict.as_deref(), Some("confirmed"));
+        assert_eq!((d[1].hypothesis_id.as_str(), d[1].shift.as_str()), ("H2", "weakened"));
+        assert_eq!((d[2].hypothesis_id.as_str(), d[2].shift.as_str()), ("H3", "new"));
+        assert!(d[2].prev_verdict.is_none());
+        assert_eq!((d[3].hypothesis_id.as_str(), d[3].shift.as_str()), ("H4", "dropped"));
+        assert!(d[3].verdict.is_none());
     }
 
     #[test]

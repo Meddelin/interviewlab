@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { FileText, Plus, Target, Trash2 } from "lucide-react";
+import { Code2, FileText, LayoutTemplate, Plus, Target, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { MarkdownEditor } from "@/components/markdown-editor";
+import { GuideTemplateEditor } from "@/components/guide-template-editor";
 import {
   useCreateGuide,
   useDeleteGuide,
@@ -20,13 +21,18 @@ import {
   useUpdateGuide,
 } from "@/lib/guide-queries";
 import { relativeTime } from "@/lib/format";
-import type { Guide } from "@/lib/tauri";
+import {
+  EMPTY_TEMPLATE,
+  templateGoals,
+  templateIsEmpty,
+  type Guide,
+  type GuideTemplate,
+} from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
-// Default scaffold for a new guide so the markdown editor opens with a usable shape
-// (a Goals section is what synthesis derives goal_ids from).
-const NEW_GUIDE_TEMPLATE =
-  "## Goals\n\n- G1: \n- G2: \n\n## Target conclusions\n\n- \n";
+// Which editing surface is shown for a guide: the structured template (the 5 fixed blocks) or
+// the raw markdown body (free-form, for guides that don't use the template).
+type EditMode = "structured" | "raw";
 
 // ── Create-guide dialog ────────────────────────────────────────────────────────
 function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
@@ -38,9 +44,11 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
     const trimmed = name.trim();
     if (!trimmed) return;
     try {
+      // New guides start as an empty STRUCTURED template — the editor opens on the 5 blocks
+      // ready to fill (a power user can switch to Raw markdown).
       const g = await createGuide.mutateAsync({
         name: trimmed,
-        content_md: NEW_GUIDE_TEMPLATE,
+        template: EMPTY_TEMPLATE,
       });
       setName("");
       setOpen(false);
@@ -92,30 +100,49 @@ function GuideEditor({ guide }: { guide: Guide }) {
   const updateGuide = useUpdateGuide();
   const deleteGuide = useDeleteGuide();
 
+  // A guide is structured (uses the template) unless it's a legacy free-markdown guide with no
+  // template but existing content — then we open on Raw so we don't hide its body.
+  const startStructured = !templateIsEmpty(guide.template) || !guide.content_md.trim();
+
   // Local editable buffers, re-seeded whenever a different guide is selected.
   const [name, setName] = useState(guide.name);
   const [contentMd, setContentMd] = useState(guide.content_md);
+  const [template, setTemplate] = useState<GuideTemplate>(guide.template);
+  const [mode, setMode] = useState<EditMode>(startStructured ? "structured" : "raw");
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     setName(guide.name);
     setContentMd(guide.content_md);
+    setTemplate(guide.template);
+    setMode(!templateIsEmpty(guide.template) || !guide.content_md.trim() ? "structured" : "raw");
     setDirty(false);
   }, [guide.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function save() {
     try {
-      await updateGuide.mutateAsync({
-        id: guide.id,
-        name: name.trim() || "Untitled guide",
-        content_md: contentMd,
-      });
+      // The active tab decides the stored representation: structured → send the template (the
+      // backend renders content_md from it); raw → send markdown + clear the template.
+      await updateGuide.mutateAsync(
+        mode === "structured"
+          ? { id: guide.id, name: name.trim() || "Untitled guide", content_md: "", template }
+          : {
+              id: guide.id,
+              name: name.trim() || "Untitled guide",
+              content_md: contentMd,
+              template: EMPTY_TEMPLATE,
+            },
+      );
       setDirty(false);
       toast.success("Guide saved");
     } catch (e) {
       toast.error(`Couldn't save the guide. ${String(e)}`);
     }
   }
+
+  // Goals shown in the derived-goals panel: from the live template (structured) or the
+  // last-saved derived goals (raw).
+  const derivedGoals = mode === "structured" ? templateGoals(template) : guide.goals;
 
   async function remove() {
     if (!confirm(`Delete "${guide.name}"? Cycles using it will fall back to their inline guide.`))
@@ -171,36 +198,76 @@ function GuideEditor({ guide }: { guide: Guide }) {
         </Button>
       </div>
 
-      {/* The markdown editor (Plate). Long-form prose: the editing column above is
-          capped to a comfortable reading width (full ultra-wide prose is hard to
-          read), so the editor simply fills that column. */}
-      <MarkdownEditor
-        key={guide.id}
-        value={guide.content_md}
-        onChange={(md) => {
-          setContentMd(md);
-          setDirty(true);
-        }}
-        placeholder="Write the guide in markdown — start with a Goals section…"
-      />
+      {/* Mode toggle: structured template vs raw markdown. */}
+      <div className="flex w-fit items-center rounded-md border border-border p-0.5">
+        <button
+          type="button"
+          onClick={() => setMode("structured")}
+          className={cn(
+            "flex items-center gap-1.5 rounded px-2.5 py-1 text-xs transition-colors",
+            mode === "structured"
+              ? "bg-secondary text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <LayoutTemplate className="size-3.5" />
+          Template
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode("raw")}
+          className={cn(
+            "flex items-center gap-1.5 rounded px-2.5 py-1 text-xs transition-colors",
+            mode === "raw"
+              ? "bg-secondary text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <Code2 className="size-3.5" />
+          Raw markdown
+        </button>
+      </div>
 
-      {/* Derived goals — what synthesis ties findings back to. */}
+      {mode === "structured" ? (
+        <GuideTemplateEditor
+          key={guide.id}
+          template={template}
+          onChange={(t) => {
+            setTemplate(t);
+            setDirty(true);
+          }}
+        />
+      ) : (
+        // The markdown editor (Plate). Long-form prose: the editing column above is
+        // capped to a comfortable reading width, so the editor simply fills that column.
+        <MarkdownEditor
+          key={guide.id}
+          value={guide.content_md}
+          onChange={(md) => {
+            setContentMd(md);
+            setDirty(true);
+          }}
+          placeholder="Write the guide in markdown — start with a Goals section…"
+        />
+      )}
+
+      {/* Derived goals — what synthesis ties findings back to (the template's tasks, or the
+          Goals bullets of a raw-markdown guide). */}
       <div className="flex flex-col gap-2 rounded-lg border border-border bg-card/40 p-3">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <Target className="size-3.5" />
           Derived goals
-          <span className="font-numeric text-foreground/70">
-            {guide.goals.length}
-          </span>
+          <span className="font-numeric text-foreground/70">{derivedGoals.length}</span>
         </div>
-        {guide.goals.length === 0 ? (
+        {derivedGoals.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            Add bullets under a “Goals” heading — they become stable goal ids (G1, G2…)
-            and are re-derived when you save.
+            {mode === "structured"
+              ? "Add tasks under “Задачи интервью” — they become stable goal ids (G1, G2…)."
+              : "Add bullets under a “Goals” heading — they become stable goal ids (G1, G2…)."}
           </p>
         ) : (
           <ul className="flex flex-col gap-1.5">
-            {guide.goals.map((g) => (
+            {derivedGoals.map((g) => (
               <li key={g.id} className="flex items-start gap-2 text-xs">
                 <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-numeric text-[10px] text-muted-foreground">
                   {g.id}

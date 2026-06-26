@@ -61,8 +61,34 @@ import type {
   UpdateGuideInput,
   UpdateRoleInput,
   VersionInfo,
+  GuideTemplate,
+} from "./tauri";
+import {
+  EMPTY_TEMPLATE,
+  normalizeTemplate,
+  renderTemplateMd,
+  templateGoals,
+  templateIsEmpty,
 } from "./tauri";
 import { MOCK_AUDIO_DATA_URI } from "./mock-audio";
+
+// Mirror the Rust resolve_guide_write: a structured template (when present) is the source of
+// truth — content_md is rendered from it + goals come from its tasks; otherwise content_md is
+// stored verbatim + goals derived from it. Shared by the create/update guide mock handlers.
+function resolveGuideWrite(
+  contentMd: string,
+  template: GuideTemplate | undefined,
+): { content_md: string; template: GuideTemplate; goals: Goal[] } {
+  const t = template ? normalizeTemplate(template) : EMPTY_TEMPLATE;
+  if (!templateIsEmpty(t)) {
+    return { content_md: renderTemplateMd(t), template: t, goals: templateGoals(t) };
+  }
+  return { content_md: contentMd, template: EMPTY_TEMPLATE, goals: deriveGoals(contentMd) };
+}
+
+function cloneGuide(g: Guide): Guide {
+  return { ...g, goals: g.goals.map((x) => ({ ...x })) };
+}
 
 // --- tiny helpers -------------------------------------------------------------
 
@@ -224,6 +250,7 @@ const guides: Guide[] = [
     name: "Activation deep-dive",
     content_md: ACTIVATION_GUIDE_MD,
     goals: [],
+    template: EMPTY_TEMPLATE,
     created_at: now - 41 * DAY,
     updated_at: now - 3 * DAY,
   },
@@ -232,6 +259,7 @@ const guides: Guide[] = [
     name: "Pricing & packaging",
     content_md: PRICING_GUIDE_MD,
     goals: [],
+    template: EMPTY_TEMPLATE,
     created_at: now - 22 * DAY,
     updated_at: now - 20 * DAY,
   },
@@ -2300,29 +2328,31 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     case "create_guide": {
       const req = (a.req ?? {}) as CreateGuideInput;
       const ts = Date.now();
-      const content_md = req.content_md ?? "";
+      const w = resolveGuideWrite(req.content_md ?? "", req.template);
       const guide: Guide = {
         id: uuid(),
         name: (req.name ?? "").trim() || "Untitled guide",
-        content_md,
-        goals: deriveGoals(content_md),
+        content_md: w.content_md,
+        goals: w.goals,
+        template: w.template,
         created_at: ts,
         updated_at: ts,
       };
       guides.push(guide);
-      return Promise.resolve({ ...guide, goals: guide.goals.map((x) => ({ ...x })) } as T);
+      return Promise.resolve(cloneGuide(guide) as T);
     }
 
     case "update_guide": {
       const req = a.req as UpdateGuideInput;
       const guide = guides.find((g) => g.id === req.id);
       if (!guide) return Promise.reject(new Error(`guide not found: ${req.id}`));
+      const w = resolveGuideWrite(req.content_md, req.template);
       guide.name = req.name.trim() || guide.name;
-      guide.content_md = req.content_md;
-      // Re-derive goals from the new content (stable ids), exactly like the Rust backend.
-      guide.goals = deriveGoals(req.content_md);
+      guide.content_md = w.content_md;
+      guide.goals = w.goals;
+      guide.template = w.template;
       guide.updated_at = Date.now();
-      return Promise.resolve({ ...guide, goals: guide.goals.map((x) => ({ ...x })) } as T);
+      return Promise.resolve(cloneGuide(guide) as T);
     }
 
     case "delete_guide": {

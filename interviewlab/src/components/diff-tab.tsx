@@ -24,6 +24,7 @@ import {
   type DiffReadiness,
   type DiffRow,
   type DiffStatus,
+  type HypothesisDiffEntry,
 } from "@/lib/tauri";
 // dev-mock: browser-only, never active under Tauri.
 import { mockOnDiffProgress } from "@/lib/dev-mock";
@@ -68,6 +69,65 @@ const STATUS_META: Record<
 };
 
 const STATUS_ORDER: DiffStatus[] = ["new", "changed", "dropped", "unchanged"];
+
+// Hypothesis verdict shift → label + color. strengthened reads green (firmed up), weakened
+// red (eroded), new green, dropped/unchanged neutral.
+const SHIFT_META: Record<string, { label: string; dot: string; text: string; border: string }> = {
+  strengthened: { label: "Strengthened", dot: "bg-status-ready", text: "text-status-ready", border: "border-status-ready/40" },
+  weakened: { label: "Weakened", dot: "bg-status-error", text: "text-status-error", border: "border-status-error/40" },
+  new: { label: "New", dot: "bg-status-ready", text: "text-status-ready", border: "border-status-ready/40" },
+  dropped: { label: "Dropped", dot: "bg-muted-foreground/60", text: "text-muted-foreground", border: "border-border" },
+  unchanged: { label: "Unchanged", dot: "bg-muted-foreground/60", text: "text-muted-foreground", border: "border-border" },
+};
+
+function VerdictLabel({ v }: { v?: string | null }) {
+  if (!v) return <span className="text-muted-foreground/50">—</span>;
+  const map: Record<string, string> = {
+    confirmed: "Confirmed",
+    partially: "Partially",
+    refuted: "Refuted",
+    inconclusive: "Inconclusive",
+  };
+  return <span className="text-foreground/80">{map[v] ?? v}</span>;
+}
+
+// The hypotheses-diff section: how each hypothesis's verdict moved wave-over-wave.
+function HypothesesDiffSection({ entries }: { entries: HypothesisDiffEntry[] }) {
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="text-sm font-medium text-foreground">Hypotheses</h3>
+      <div className="flex flex-col gap-3">
+        {entries.map((h) => {
+          const m = SHIFT_META[h.shift] ?? SHIFT_META.unchanged;
+          return (
+            <div key={h.hypothesis_id} className="flex flex-col gap-1.5 border-l border-border pl-3">
+              <div className="flex items-start justify-between gap-3">
+                <p className="text-sm leading-snug text-foreground/90">
+                  <span className="mr-1.5 font-numeric text-[11px] text-muted-foreground/70">
+                    {h.hypothesis_id}
+                  </span>
+                  {h.text}
+                </p>
+                <Badge variant="outline" className={cn("shrink-0 gap-1.5", m.border, m.text)}>
+                  <span className={cn("size-1.5 rounded-full", m.dot)} aria-hidden="true" />
+                  {m.label}
+                </Badge>
+              </div>
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <VerdictLabel v={h.prev_verdict} />
+                <ArrowRightLeft className="size-3 text-muted-foreground/50" aria-hidden="true" />
+                <VerdictLabel v={h.verdict} />
+              </p>
+              {h.why && (
+                <p className="text-xs leading-relaxed text-muted-foreground">{h.why}</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
 // A compact status badge — colored dot + label, matching the synthesis-tab badge feel.
 function StatusBadge({ status }: { status: DiffStatus }) {
@@ -313,6 +373,10 @@ export function DiffTab({ cycleId }: { cycleId: string }) {
             )}
             <StatusTally entries={allEntries} />
           </div>
+
+          {(diff!.doc.hypotheses?.length ?? 0) > 0 && (
+            <HypothesesDiffSection entries={diff!.doc.hypotheses!} />
+          )}
 
           {diff!.doc.goals.map((goal) => {
             const group = diff!.doc.by_goal.find((g) => g.goal_id === goal.id);

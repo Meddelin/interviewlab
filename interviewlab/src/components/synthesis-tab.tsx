@@ -39,6 +39,8 @@ import {
   type Evidence,
   type Finding,
   type Goal,
+  type HypothesisVerdict,
+  type QuestionAnswer,
   type RoleBreakdownGroup,
   type SynthesisProgress,
   type SynthesisRow,
@@ -231,6 +233,154 @@ function GoalSection({
           </ul>
         </div>
       )}
+    </section>
+  );
+}
+
+// Verdict → badge styling. confirmed reads green, refuted red, partial amber, inconclusive
+// neutral — the same status-color family the rest of the app uses.
+function VerdictBadge({ verdict }: { verdict: string }) {
+  const v = verdict.toLowerCase();
+  const meta: Record<string, { label: string; dot: string; text: string; border: string }> = {
+    confirmed: { label: "Confirmed", dot: "bg-status-ready", text: "text-status-ready", border: "border-status-ready/40" },
+    partially: { label: "Partially confirmed", dot: "bg-status-processing", text: "", border: "" },
+    refuted: { label: "Refuted", dot: "bg-status-error", text: "text-status-error", border: "border-status-error/40" },
+    inconclusive: { label: "Inconclusive", dot: "bg-muted-foreground/60", text: "text-muted-foreground", border: "" },
+  };
+  const m = meta[v] ?? meta.inconclusive;
+  return (
+    <Badge variant="outline" className={cn("gap-1.5", m.border, m.text)}>
+      <span className={cn("size-1.5 rounded-full", m.dot)} aria-hidden="true" />
+      {m.label}
+    </Badge>
+  );
+}
+
+// Question-answer status → small label. answered=green, partially=amber, not_answered=red.
+function QuestionStatusBadge({ status }: { status: string }) {
+  const s = status.toLowerCase();
+  const meta: Record<string, { label: string; dot: string; text: string }> = {
+    answered: { label: "Answered", dot: "bg-status-ready", text: "text-status-ready" },
+    partially: { label: "Partial", dot: "bg-status-processing", text: "text-muted-foreground" },
+    not_answered: { label: "Not answered", dot: "bg-status-error", text: "text-status-error" },
+  };
+  const m = meta[s] ?? meta.not_answered;
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 text-[11px]", m.text)}>
+      <span className={cn("size-1.5 rounded-full", m.dot)} aria-hidden="true" />
+      {m.label}
+    </span>
+  );
+}
+
+// The hypotheses section of the structured view: a verdict per hypothesis with rationale +
+// evidence quotes.
+function HypothesesSection({
+  verdicts,
+  titleFor,
+  onOpenInterview,
+}: {
+  verdicts: HypothesisVerdict[];
+  titleFor: (id: string) => string;
+  onOpenInterview: (id: string) => void;
+}) {
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex items-baseline gap-2.5">
+        <span className="flex items-center gap-1.5 font-numeric text-xs font-medium text-primary">
+          <Lightbulb className="size-3.5" aria-hidden="true" />
+          Hypotheses
+        </span>
+      </div>
+      <div className="flex flex-col gap-4">
+        {verdicts.map((h) => (
+          <Card key={h.id} size="sm" className="gap-3">
+            <CardHeader>
+              <CardTitle className="text-sm leading-snug">{h.text}</CardTitle>
+              <CardAction>
+                <span className="font-numeric text-[11px] text-muted-foreground/70">{h.id}</span>
+              </CardAction>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <VerdictBadge verdict={h.verdict} />
+                <Badge variant="ghost" className="text-muted-foreground">
+                  {h.confidence} confidence
+                </Badge>
+              </div>
+              {h.rationale && (
+                <p className="text-sm leading-relaxed text-foreground/85">{h.rationale}</p>
+              )}
+              {(h.evidence?.length ?? 0) > 0 && (
+                <ul className="flex flex-col gap-2.5 border-l border-border pl-3">
+                  {h.evidence!.map((e, i) => (
+                    <EvidenceQuote
+                      key={`${e.interview_id}-${e.segment_id}-${i}`}
+                      evidence={e}
+                      interviewTitle={titleFor(e.interview_id)}
+                      onOpen={() => onOpenInterview(e.interview_id)}
+                    />
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// The questions section: a consolidated answer per guide question, with its answered status.
+function QuestionsSection({
+  answers,
+  titleFor,
+  onOpenInterview,
+}: {
+  answers: QuestionAnswer[];
+  titleFor: (id: string) => string;
+  onOpenInterview: (id: string) => void;
+}) {
+  return (
+    <section className="flex flex-col gap-3">
+      <div className="flex items-baseline gap-2.5">
+        <span className="flex items-center gap-1.5 font-numeric text-xs font-medium text-primary">
+          <FileText className="size-3.5" aria-hidden="true" />
+          Questions
+        </span>
+      </div>
+      <div className="flex flex-col gap-3">
+        {answers.map((q) => (
+          <div key={q.id} className="flex flex-col gap-1.5 border-l border-border pl-3">
+            <div className="flex items-start justify-between gap-3">
+              <p className="text-sm leading-snug text-foreground/90">
+                <span className="mr-1.5 font-numeric text-[11px] text-muted-foreground/70">
+                  {q.id}
+                </span>
+                {q.text}
+              </p>
+              <div className="shrink-0">
+                <QuestionStatusBadge status={q.status} />
+              </div>
+            </div>
+            {q.answer && (
+              <p className="text-sm leading-relaxed text-muted-foreground">{q.answer}</p>
+            )}
+            {(q.evidence?.length ?? 0) > 0 && (
+              <ul className="mt-0.5 flex flex-col gap-2 border-l border-border pl-3">
+                {q.evidence!.map((e, i) => (
+                  <EvidenceQuote
+                    key={`${e.interview_id}-${e.segment_id}-${i}`}
+                    evidence={e}
+                    interviewTitle={titleFor(e.interview_id)}
+                    onOpen={() => onOpenInterview(e.interview_id)}
+                  />
+                ))}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
@@ -503,8 +653,25 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
           />
         </div>
       ) : (
-        // The structured findings-by-goal view (read-only; the data the diff compares).
+        // The structured view (read-only): hypotheses verdicts → per-question answers →
+        // findings-by-goal (the data the diff compares).
         <div className="flex max-w-2xl flex-col gap-8">
+          {(doc?.hypothesis_verdicts?.length ?? 0) > 0 && (
+            <HypothesesSection
+              verdicts={doc!.hypothesis_verdicts!}
+              titleFor={titleFor}
+              onOpenInterview={openInterview}
+            />
+          )}
+
+          {(doc?.question_answers?.length ?? 0) > 0 && (
+            <QuestionsSection
+              answers={doc!.question_answers!}
+              titleFor={titleFor}
+              onOpenInterview={openInterview}
+            />
+          )}
+
           {groupGoals.map((goal) => (
             <GoalSection
               key={goal.id}
