@@ -18,6 +18,8 @@ import { useCycle, useCycles, useUpdateCycle } from "@/lib/cycle-queries";
 import { useGuides } from "@/lib/guide-queries";
 import { useProducts } from "@/lib/product-queries";
 import { MarkdownEditor } from "@/components/markdown-editor";
+import { GuideTemplatePreview } from "@/components/guide-template-editor";
+import { templateIsEmpty } from "@/lib/tauri";
 import { InterviewsTab } from "@/components/interviews-tab";
 import { SynthesisTab } from "@/components/synthesis-tab";
 import { DiffTab } from "@/components/diff-tab";
@@ -215,26 +217,35 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
 
           {selectedGuide ? (
             <div className="flex flex-col gap-3 rounded-lg border border-border bg-card/40 p-3">
-              {/* Content preview — RENDERED markdown (fixes ui-backlog.md #2: raw ##/- shown). */}
-              <MarkdownPreview value={selectedGuide.content_md} />
-              {selectedGuide.goals.length > 0 && (
-                <div className="flex flex-col gap-1.5 border-t border-border pt-3">
-                  <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                    <Target className="size-3.5" />
-                    {selectedGuide.goals.length} goal
-                    {selectedGuide.goals.length === 1 ? "" : "s"}
-                  </div>
-                  <ul className="flex flex-col gap-1">
-                    {selectedGuide.goals.map((g) => (
-                      <li key={g.id} className="flex items-start gap-2 text-xs">
-                        <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-numeric text-[10px] text-muted-foreground">
-                          {g.id}
-                        </span>
-                        <span className="text-foreground/80">{g.text}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+              {/* A STRUCTURED guide shows its template (the 5 blocks, with the H/G/Q ids the
+                  synthesis/diff reference) so the cycle Overview reflects the actual template —
+                  not just a flat markdown blob. A free-markdown guide falls back to the rendered
+                  markdown preview (fixes ui-backlog.md #2: raw ##/- shown). */}
+              {!templateIsEmpty(selectedGuide.template) ? (
+                <GuideTemplatePreview template={selectedGuide.template} />
+              ) : (
+                <>
+                  <MarkdownPreview value={selectedGuide.content_md} />
+                  {selectedGuide.goals.length > 0 && (
+                    <div className="flex flex-col gap-1.5 border-t border-border pt-3">
+                      <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                        <Target className="size-3.5" />
+                        {selectedGuide.goals.length} goal
+                        {selectedGuide.goals.length === 1 ? "" : "s"}
+                      </div>
+                      <ul className="flex flex-col gap-1">
+                        {selectedGuide.goals.map((g) => (
+                          <li key={g.id} className="flex items-start gap-2 text-xs">
+                            <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-numeric text-[10px] text-muted-foreground">
+                              {g.id}
+                            </span>
+                            <span className="text-foreground/80">{g.text}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           ) : (

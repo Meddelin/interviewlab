@@ -486,6 +486,12 @@ pub fn analysis_system_prompt() -> &'static str {
      5. EVIDENCE: weight RESPONDENT statements over interviewer prompts. Quote VERBATIM, in the \
         original language — never translate or paraphrase a quote — and cite the segment_id it \
         came from. Prefer a few strong quotes over many weak ones.\n\
+     5a. OUTPUT LANGUAGE: write EVERY piece of prose you author — point summaries, question \
+        answers, hypothesis rationales/notes, findings, recommendations, the executive summary — \
+        in the SAME language as the interview transcript and the guide. If the interview is in \
+        Russian, answer in Russian; do NOT translate your analysis into English. Only the field \
+        names / enum values stay in English (the schema); everything you write for a human reads \
+        in the source language.\n\
      6. BE HONEST ABOUT GAPS. Do not invent findings, do not overstate confidence, and do not \
         report a hypothesis as confirmed on thin evidence. \"Inconclusive\" and \"not answered\" \
         are valid, useful outcomes.\n\
