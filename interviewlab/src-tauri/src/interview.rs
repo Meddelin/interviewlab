@@ -224,9 +224,12 @@ fn transcode_and_probe(src: &Path, dst: &Path) -> Result<i64, String> {
     let src_s = src.to_string_lossy().to_string();
     let dst_s = dst.to_string_lossy().to_string();
 
+    // OUTPUT options (after -i): drop any video stream, force mono 16 kHz 16-bit PCM. Pinning
+    // the codec + rate explicitly (not just `-ar`) guarantees the wav whisper reads is truly
+    // 16 kHz — a wrong rate would silently compress every timestamp (see asr::TARGET_SAMPLE_RATE).
     let mut child = FfmpegCommand::new()
         .input(&src_s)
-        .args(["-ac", "1", "-ar", "16000"]) // mono, 16 kHz
+        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
         .arg("-y") // overwrite
         .output(&dst_s)
         .spawn()
