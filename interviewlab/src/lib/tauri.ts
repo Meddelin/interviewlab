@@ -123,6 +123,11 @@ export function deleteInterview(id: string): Promise<void> {
   return invoke<void>("delete_interview", { id });
 }
 
+// Rename an interview (its title defaults to the imported file's basename).
+export function renameInterview(id: string, title: string): Promise<void> {
+  return invoke<void>("rename_interview", { id, title });
+}
+
 // --- ASR engine (Milestone 4) -------------------------------------------------
 // Mirrors of the Rust ASR structs/commands (src-tauri/src/asr.rs).
 
@@ -1258,7 +1263,8 @@ export function deleteProduct(id: string): Promise<void> {
 // produces. Mirror of the Rust `GlossaryTerm` (src-tauri/src/glossary.rs).
 export type GlossaryTerm = {
   id: string;
-  product_id: string;
+  // null = a GLOBAL (app-wide) term shared across all products; string = per-product.
+  product_id: string | null;
   canonical: string;
   aliases: string[];
   notes: string;
@@ -1268,6 +1274,13 @@ export type GlossaryTerm = {
 
 export type CreateGlossaryTermInput = {
   product_id: string;
+  canonical: string;
+  aliases?: string[];
+  notes?: string;
+};
+
+// A global term to create (no product scope — applies to every interview).
+export type CreateGlobalGlossaryTermInput = {
   canonical: string;
   aliases?: string[];
   notes?: string;
@@ -1310,6 +1323,17 @@ export function listGlossaryTerms(productId: string): Promise<GlossaryTerm[]> {
 
 export function createGlossaryTerm(req: CreateGlossaryTermInput): Promise<GlossaryTerm> {
   return invoke<GlossaryTerm>("create_glossary_term", { req });
+}
+
+// Global glossary (product_id = null): one app-wide list merged into every interview.
+export function listGlobalGlossaryTerms(): Promise<GlossaryTerm[]> {
+  return invoke<GlossaryTerm[]>("list_global_glossary_terms");
+}
+
+export function createGlobalGlossaryTerm(
+  req: CreateGlobalGlossaryTermInput,
+): Promise<GlossaryTerm> {
+  return invoke<GlossaryTerm>("create_global_glossary_term", { req });
 }
 
 export function updateGlossaryTerm(req: UpdateGlossaryTermInput): Promise<GlossaryTerm> {

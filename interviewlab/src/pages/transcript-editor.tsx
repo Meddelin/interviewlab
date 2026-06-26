@@ -1225,7 +1225,8 @@ export function TranscriptEditorPage() {
   }, [dirty, doSave, saveMutation.isPending, selected.size]);
 
   function goBack() {
-    navigate(`/cycles/${cycleId}`);
+    // Return to the Interviews tab the editor was opened from (not the cycle Overview).
+    navigate(`/cycles/${cycleId}?tab=interviews`);
   }
 
   return (

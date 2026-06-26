@@ -181,6 +181,22 @@ async fn mark_error_db(pool: &SqlitePool, interview_id: &str) -> Result<(), sqlx
     Ok(())
 }
 
+// Rename an interview (the title is the file basename on import; this lets the user fix it).
+// Caller validates the title is non-empty; we store it trimmed and bump updated_at.
+async fn rename_interview_db(
+    pool: &SqlitePool,
+    id: &str,
+    title: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE interview SET title = ?, updated_at = ? WHERE id = ?")
+        .bind(title)
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 async fn list_interviews_db(
     pool: &SqlitePool,
     cycle_id: &str,
@@ -448,6 +464,23 @@ pub async fn list_interviews(
 #[tauri::command]
 pub async fn delete_interview(db: tauri::State<'_, Db>, id: String) -> Result<(), String> {
     delete_interview_db(&db.pool, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// Rename an interview. The title defaults to the imported file's basename; this is the
+// edit affordance for it (Interviews tab). Rejects an all-whitespace title.
+#[tauri::command]
+pub async fn rename_interview(
+    db: tauri::State<'_, Db>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("an interview needs a title".into());
+    }
+    rename_interview_db(&db.pool, &id, title)
         .await
         .map_err(|e| e.to_string())
 }

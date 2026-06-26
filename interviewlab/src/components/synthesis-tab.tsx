@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   FileText,
   LayoutList,
@@ -27,26 +25,21 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { useInterviews } from "@/lib/interview-queries";
 import {
-  synthesisKeys,
   useCycleGoals,
   useRunSynthesis,
   useSaveCycleSynthesis,
   useSynthesis,
 } from "@/lib/synthesis-queries";
+import { useSynthesisRunStore } from "@/lib/synthesis-run-store";
 import {
-  IN_TAURI,
-  SYNTHESIS_PROGRESS_EVENT,
   type Evidence,
   type Finding,
   type Goal,
   type HypothesisVerdict,
   type QuestionAnswer,
   type RoleBreakdownGroup,
-  type SynthesisProgress,
   type SynthesisRow,
 } from "@/lib/tauri";
-// dev-mock: browser-only, never active under Tauri.
-import { mockOnSynthesisProgress } from "@/lib/dev-mock";
 import { absoluteDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -400,15 +393,18 @@ type View = "artifact" | "structured";
 export function SynthesisTab({ cycleId }: { cycleId: string }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const qc = useQueryClient();
   const { data: synthesis, isPending } = useSynthesis(cycleId);
   const { data: goals } = useCycleGoals(cycleId);
   const { data: interviews } = useInterviews(cycleId);
   const runSynthesis = useRunSynthesis(cycleId);
   const saveArtifact = useSaveCycleSynthesis(cycleId);
 
-  // Live stage progress (null when idle).
-  const [progress, setProgress] = useState<SynthesisProgress | null>(null);
+  // Live stage progress lives in the GLOBAL synthesis-run store (not local state), so it
+  // survives navigating away and back: a single app-level listener feeds it, and the store
+  // is seeded on run-start (startCycle) and cleared on the terminal event. null = idle.
+  const progress = useSynthesisRunStore((s) => s.cycleByCycleId[cycleId]) ?? null;
+  const startCycle = useSynthesisRunStore((s) => s.startCycle);
+  const endCycle = useSynthesisRunStore((s) => s.endCycle);
   const [view, setView] = useState<View>("artifact");
 
   // M11: a chat citation [[finding:Fn]] routes to #finding-Fn — switch to the structured
@@ -450,44 +446,13 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     setEditorKey((k) => k + 1);
   }, [storedMd]);
 
-  // Subscribe to synthesis progress; clear on a terminal stage + refresh the synthesis.
-  useEffect(() => {
-    function onProgress(p: SynthesisProgress) {
-      if (p.cycle_id !== cycleId) return;
-      if (p.stage === "done" || p.stage === "error") {
-        setProgress(null);
-        qc.invalidateQueries({ queryKey: synthesisKeys.detail(cycleId) });
-        if (p.stage === "error") {
-          toast.error(`Synthesis failed: ${p.error ?? "unknown"}`);
-        }
-      } else {
-        setProgress(p);
-      }
-    }
-
-    if (!IN_TAURI) {
-      return mockOnSynthesisProgress(onProgress);
-    }
-    const unlisten = getCurrentWebview().listen<SynthesisProgress>(
-      SYNTHESIS_PROGRESS_EVENT,
-      (e) => onProgress(e.payload),
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [cycleId, qc]);
-
-  const running = runSynthesis.isPending || progress != null;
+  // Terminal handling (clear progress + refresh the artifact) lives in the app-level
+  // useSynthesisRuns listener, so it works even if this tab is unmounted mid-run.
+  const running = progress != null;
 
   async function handleRun() {
-    setProgress({
-      cycle_id: cycleId,
-      stage: "extract",
-      done: 0,
-      total: 0,
-      progress: 0,
-      error: null,
-    });
+    // Seed the global run state so the "running" UI persists across navigation.
+    startCycle(cycleId);
     try {
       const row: SynthesisRow = await runSynthesis.mutateAsync();
       toast.success(
@@ -496,7 +461,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
         } across ${row.doc.goals.length} goals.`,
       );
     } catch (e) {
-      setProgress(null);
+      endCycle(cycleId);
       toast.error(`Couldn't synthesize. ${String(e)}`);
     }
   }

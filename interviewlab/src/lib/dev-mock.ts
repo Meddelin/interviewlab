@@ -372,6 +372,16 @@ const glossaryTerms: GlossaryTerm[] = [
     created_at: now - 3 * DAY,
     updated_at: now - 3 * DAY,
   },
+  // A GLOBAL term (product_id = null): shared across every product, edited in Settings → Glossary.
+  {
+    id: "g3333333-3333-4333-8333-333333333333",
+    product_id: null,
+    canonical: "Jira",
+    aliases: ["джира", "жира"],
+    notes: "issue tracker",
+    created_at: now - 3 * DAY,
+    updated_at: now - 3 * DAY,
+  },
 ];
 
 // Interviews for the populated cycle (Activation deep-dive). Varied statuses
@@ -1729,6 +1739,17 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       return Promise.resolve(undefined as T);
     }
 
+    case "rename_interview": {
+      const id = String(a.id);
+      const title = String(a.title ?? "").trim();
+      const row = interviews.find((r) => r.id === id);
+      if (row && title) {
+        row.title = title;
+        row.updated_at = Date.now();
+      }
+      return Promise.resolve(undefined as T);
+    }
+
     // --- ASR (Milestone 4) ---------------------------------------------------
 
     case "asr_device": {
@@ -2592,6 +2613,29 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       const term: GlossaryTerm = {
         id: uuid(),
         product_id: req.product_id,
+        canonical: (req.canonical ?? "").trim(),
+        aliases: (req.aliases ?? []).map((s) => s.trim()).filter(Boolean),
+        notes: (req.notes ?? "").trim(),
+        created_at: ts,
+        updated_at: ts,
+      };
+      glossaryTerms.push(term);
+      return Promise.resolve({ ...term } as T);
+    }
+
+    case "list_global_glossary_terms": {
+      const rows = glossaryTerms
+        .filter((t) => t.product_id === null)
+        .sort((x, y) => x.canonical.localeCompare(y.canonical));
+      return Promise.resolve(rows.map((t) => ({ ...t })) as T);
+    }
+
+    case "create_global_glossary_term": {
+      const req = (a.req ?? {}) as { canonical?: string; aliases?: string[]; notes?: string };
+      const ts = Date.now();
+      const term: GlossaryTerm = {
+        id: uuid(),
+        product_id: null,
         canonical: (req.canonical ?? "").trim(),
         aliases: (req.aliases ?? []).map((s) => s.trim()).filter(Boolean),
         notes: (req.notes ?? "").trim(),

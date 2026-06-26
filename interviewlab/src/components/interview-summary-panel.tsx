@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Loader2, Save, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -10,13 +9,7 @@ import {
   useRunInterviewSummary,
   useSaveInterviewSummary,
 } from "@/lib/synthesis-queries";
-import {
-  IN_TAURI,
-  INTERVIEW_SUMMARY_PROGRESS_EVENT,
-  type InterviewSummaryProgress,
-} from "@/lib/tauri";
-// dev-mock: browser-only, never active under Tauri.
-import { mockOnInterviewSummaryProgress } from "@/lib/dev-mock";
+import { useSynthesisRunStore } from "@/lib/synthesis-run-store";
 
 // The per-interview "Summary" section (Milestone 10b): the MAP-stage artifact, structured
 // by the guide's goals, stored + editable. Run/Regenerate produces it; the user can edit
@@ -30,9 +23,12 @@ export function InterviewSummaryPanel({
   const runSummary = useRunInterviewSummary(interviewId);
   const saveSummary = useSaveInterviewSummary(interviewId);
 
-  const [progress, setProgress] = useState<InterviewSummaryProgress | null>(
-    null,
-  );
+  // Run progress lives in the GLOBAL synthesis-run store so it survives navigation: the
+  // app-level useSynthesisRuns listener feeds it, and the panel seeds/clears it on start/fail.
+  const progress =
+    useSynthesisRunStore((s) => s.summaryByInterview[interviewId]) ?? null;
+  const startSummary = useSynthesisRunStore((s) => s.startSummary);
+  const endSummary = useSynthesisRunStore((s) => s.endSummary);
   const [draft, setDraft] = useState("");
   const [dirty, setDirty] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
@@ -44,46 +40,19 @@ export function InterviewSummaryPanel({
     setEditorKey((k) => k + 1);
   }, [storedMd]);
 
-  // Subscribe to per-interview summary progress.
-  useEffect(() => {
-    function onProgress(p: InterviewSummaryProgress) {
-      if (p.interview_id !== interviewId) return;
-      if (p.stage === "done" || p.stage === "error") {
-        setProgress(null);
-        if (p.stage === "error") {
-          toast.error(`Summary failed: ${p.error ?? "unknown"}`);
-        }
-      } else {
-        setProgress(p);
-      }
-    }
-    if (!IN_TAURI) {
-      return mockOnInterviewSummaryProgress(onProgress);
-    }
-    const unlisten = getCurrentWebview().listen<InterviewSummaryProgress>(
-      INTERVIEW_SUMMARY_PROGRESS_EVENT,
-      (e) => onProgress(e.payload),
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [interviewId]);
-
-  const running = runSummary.isPending || progress != null;
+  // Terminal handling (clear progress + refresh the summary) lives in the app-level
+  // useSynthesisRuns listener, so it works even if this panel is unmounted mid-run.
+  const running = progress != null;
   const hasSummary = !!summary && storedMd.trim().length > 0;
 
   async function handleRun() {
-    setProgress({
-      interview_id: interviewId,
-      stage: "running",
-      progress: 10,
-      error: null,
-    });
+    // Seed the global run state so the "running" UI persists across navigation.
+    startSummary(interviewId);
     try {
       await runSummary.mutateAsync();
       toast.success("Interview summary ready");
     } catch (e) {
-      setProgress(null);
+      endSummary(interviewId);
       toast.error(`Couldn't summarize. ${String(e)}`);
     }
   }

@@ -42,7 +42,8 @@ fn now_ms() -> i64 {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct GlossaryTerm {
     pub id: String,
-    pub product_id: String,
+    // None = a GLOBAL (app-wide) term shared across all products; Some = per-product.
+    pub product_id: Option<String>,
     pub canonical: String,
     pub aliases: Vec<String>,
     pub notes: String,
@@ -55,7 +56,7 @@ pub struct GlossaryTerm {
 #[derive(FromRow)]
 struct GlossaryRow {
     id: String,
-    product_id: String,
+    product_id: Option<String>,
     canonical: String,
     aliases_json: String,
     notes: String,
@@ -102,6 +103,17 @@ pub struct CreateGlossaryTerm {
 #[derive(Deserialize)]
 pub struct UpdateGlossaryTerm {
     pub id: String,
+    pub canonical: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+// Create a GLOBAL term (product_id = NULL). Same shape as CreateGlossaryTerm minus the
+// product scope — the term applies to every interview regardless of product.
+#[derive(Deserialize)]
+pub struct CreateGlobalGlossaryTerm {
     pub canonical: String,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -201,6 +213,18 @@ async fn list_for_product_db(pool: &SqlitePool, product_id: &str) -> Result<Vec<
     Ok(rows.into_iter().map(GlossaryTerm::from).collect())
 }
 
+// The GLOBAL (app-wide) terms — product_id IS NULL. Shared across every product, merged
+// into each interview's glossary by glossary_for_interview_db.
+async fn list_global_db(pool: &SqlitePool) -> Result<Vec<GlossaryTerm>, sqlx::Error> {
+    let rows: Vec<GlossaryRow> = sqlx::query_as(
+        "SELECT id, product_id, canonical, aliases_json, notes, created_at, updated_at \
+         FROM glossary_term WHERE product_id IS NULL ORDER BY canonical COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(GlossaryTerm::from).collect())
+}
+
 async fn get_term_db(pool: &SqlitePool, id: &str) -> Result<Option<GlossaryTerm>, sqlx::Error> {
     let row: Option<GlossaryRow> = sqlx::query_as(
         "SELECT id, product_id, canonical, aliases_json, notes, created_at, updated_at \
@@ -212,9 +236,10 @@ async fn get_term_db(pool: &SqlitePool, id: &str) -> Result<Option<GlossaryTerm>
     Ok(row.map(GlossaryTerm::from))
 }
 
+// `product_id = None` inserts a GLOBAL term (NULL product_id); Some(pid) a per-product one.
 async fn create_term_db(
     pool: &SqlitePool,
-    product_id: &str,
+    product_id: Option<&str>,
     canonical: &str,
     aliases: &[String],
     notes: &str,
@@ -290,7 +315,7 @@ async fn add_terms_db(
         if key.is_empty() || !seen.insert(key) {
             continue;
         }
-        inserted.push(create_term_db(pool, product_id, &t.canonical, &t.aliases, &t.notes).await?);
+        inserted.push(create_term_db(pool, Some(product_id), &t.canonical, &t.aliases, &t.notes).await?);
     }
     Ok(inserted)
 }
@@ -321,16 +346,28 @@ pub(crate) async fn product_id_for_interview_db(
     Ok(product_id.filter(|s| !s.is_empty()))
 }
 
-// The glossary terms for an interview (interview → cycle → product → terms). Empty when the
-// cycle has no linked product. pub(crate) so asr.rs + cleanup.rs share one resolution path.
+// The glossary terms for an interview: the GLOBAL (app-wide) list merged with the interview's
+// product list (interview → cycle → product). The product list wins on a canonical-key
+// collision (more specific), so a product can override a global spelling. pub(crate) so
+// asr.rs + cleanup.rs share one resolution path.
 pub(crate) async fn glossary_for_interview_db(
     pool: &SqlitePool,
     interview_id: &str,
 ) -> Result<Vec<GlossaryTerm>, String> {
-    match product_id_for_interview_db(pool, interview_id).await? {
-        Some(pid) => list_for_product_db(pool, &pid).await.map_err(|e| e.to_string()),
-        None => Ok(Vec::new()),
-    }
+    let global = list_global_db(pool).await.map_err(|e| e.to_string())?;
+    let product = match product_id_for_interview_db(pool, interview_id).await? {
+        Some(pid) => list_for_product_db(pool, &pid).await.map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    // Product terms override global ones with the same canonical (case-insensitive).
+    let product_keys: std::collections::HashSet<String> =
+        product.iter().map(|t| term_key(&t.canonical)).collect();
+    let mut terms: Vec<GlossaryTerm> = global
+        .into_iter()
+        .filter(|t| !product_keys.contains(&term_key(&t.canonical)))
+        .collect();
+    terms.extend(product);
+    Ok(terms)
 }
 
 // --- B/C: term extraction via the CLI -----------------------------------------
@@ -600,7 +637,27 @@ pub async fn create_glossary_term(
     if req.canonical.trim().is_empty() {
         return Err("a glossary term needs a canonical spelling".into());
     }
-    create_term_db(&db.pool, &req.product_id, &req.canonical, &req.aliases, &req.notes).await
+    create_term_db(&db.pool, Some(req.product_id.as_str()), &req.canonical, &req.aliases, &req.notes).await
+}
+
+// The GLOBAL (app-wide) glossary — terms shared across every product (product_id = NULL).
+// Edited in Settings → Glossary; merged into each interview's terms by glossary_for_interview_db.
+#[tauri::command]
+pub async fn list_global_glossary_terms(
+    db: tauri::State<'_, Db>,
+) -> Result<Vec<GlossaryTerm>, String> {
+    list_global_db(&db.pool).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_global_glossary_term(
+    db: tauri::State<'_, Db>,
+    req: CreateGlobalGlossaryTerm,
+) -> Result<GlossaryTerm, String> {
+    if req.canonical.trim().is_empty() {
+        return Err("a glossary term needs a canonical spelling".into());
+    }
+    create_term_db(&db.pool, None, &req.canonical, &req.aliases, &req.notes).await
 }
 
 #[tauri::command]
@@ -775,7 +832,7 @@ mod tests {
         let pool = test_pool().await;
         let pid = seed_product(&pool).await;
 
-        let t = create_term_db(&pool, &pid, "  API ", &["эй-пи-ай".into(), "апишка".into()], " the HTTP API ")
+        let t = create_term_db(&pool, Some(pid.as_str()), "  API ", &["эй-пи-ай".into(), "апишка".into()], " the HTTP API ")
             .await
             .unwrap();
         assert_eq!(t.canonical, "API", "canonical trimmed");
@@ -803,7 +860,7 @@ mod tests {
     async fn add_terms_dedupes() {
         let pool = test_pool().await;
         let pid = seed_product(&pool).await;
-        create_term_db(&pool, &pid, "Jira", &[], "").await.unwrap();
+        create_term_db(&pool, Some(pid.as_str()), "Jira", &[], "").await.unwrap();
 
         let added = add_terms_db(
             &pool,
@@ -827,7 +884,7 @@ mod tests {
     async fn product_delete_cascades_terms() {
         let pool = test_pool().await;
         let pid = seed_product(&pool).await;
-        create_term_db(&pool, &pid, "API", &[], "").await.unwrap();
+        create_term_db(&pool, Some(pid.as_str()), "API", &[], "").await.unwrap();
         sqlx::query("DELETE FROM product WHERE id = ?").bind(&pid).execute(&pool).await.unwrap();
         assert_eq!(list_for_product_db(&pool, &pid).await.unwrap().len(), 0, "terms cascade-deleted");
     }
@@ -837,7 +894,7 @@ mod tests {
     async fn resolves_glossary_through_interview_cycle_product() {
         let pool = test_pool().await;
         let pid = seed_product(&pool).await;
-        create_term_db(&pool, &pid, "Figma", &["фигма".into()], "").await.unwrap();
+        create_term_db(&pool, Some(pid.as_str()), "Figma", &["фигма".into()], "").await.unwrap();
 
         let ts = now_ms();
         let cycle = Uuid::new_v4().to_string();
@@ -861,12 +918,52 @@ mod tests {
         assert!(glossary_for_interview_db(&pool, &iv2).await.unwrap().is_empty());
     }
 
+    // Global (product_id = NULL) terms merge into every interview, and a product term with the
+    // same canonical overrides the global one (more specific wins).
+    #[tokio::test]
+    async fn global_terms_merge_and_product_overrides() {
+        let pool = test_pool().await;
+        let pid = seed_product(&pool).await;
+
+        // Two global terms; the product redefines one of them ("API") with its own aliases.
+        create_term_db(&pool, None, "Jira", &["джира".into()], "").await.unwrap();
+        create_term_db(&pool, None, "API", &["глобал".into()], "").await.unwrap();
+        create_term_db(&pool, Some(pid.as_str()), "API", &["продукт".into()], "").await.unwrap();
+
+        assert_eq!(list_global_db(&pool).await.unwrap().len(), 2, "two global terms");
+
+        let ts = now_ms();
+        let cycle = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO cycle (id, name, product_desc, product_id, created_at, updated_at) VALUES (?, 'c', '', ?, ?, ?)")
+            .bind(&cycle).bind(&pid).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        let iv = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO interview (id, cycle_id, title, status, created_at, updated_at) VALUES (?, ?, 't', 'new', ?, ?)")
+            .bind(&iv).bind(&cycle).bind(ts).bind(ts).execute(&pool).await.unwrap();
+
+        let merged = glossary_for_interview_db(&pool, &iv).await.unwrap();
+        assert_eq!(merged.len(), 2, "global Jira + product API (global API overridden)");
+        let api = merged.iter().find(|t| t.canonical == "API").unwrap();
+        assert_eq!(api.aliases, vec!["продукт".to_string()], "product term wins on collision");
+        assert_eq!(api.product_id.as_deref(), Some(pid.as_str()));
+        let jira = merged.iter().find(|t| t.canonical == "Jira").unwrap();
+        assert!(jira.product_id.is_none(), "global term carried through");
+
+        // An interview with no linked product still gets the global terms.
+        let cycle2 = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO cycle (id, name, product_desc, created_at, updated_at) VALUES (?, 'c2', 'inline', ?, ?)")
+            .bind(&cycle2).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        let iv2 = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO interview (id, cycle_id, title, status, created_at, updated_at) VALUES (?, ?, 't', 'new', ?, ?)")
+            .bind(&iv2).bind(&cycle2).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        assert_eq!(glossary_for_interview_db(&pool, &iv2).await.unwrap().len(), 2, "globals apply product-less");
+    }
+
     fn terms(pairs: &[(&str, &[&str])]) -> Vec<GlossaryTerm> {
         pairs
             .iter()
             .map(|(c, al)| GlossaryTerm {
                 id: "x".into(),
-                product_id: "p".into(),
+                product_id: Some("p".into()),
                 canonical: c.to_string(),
                 aliases: al.iter().map(|s| s.to_string()).collect(),
                 notes: String::new(),

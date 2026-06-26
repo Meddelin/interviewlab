@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useLocation, useParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { ArrowUpRight, Target } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -308,16 +308,42 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
   );
 }
 
+const CYCLE_TABS = ["overview", "interviews", "synthesis", "diff"];
+
 export function CycleDetailPage() {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  // Controlled tab so a chat finding-citation (#finding-Fn) can switch to the Synthesis
-  // tab — where the synthesis tab's own effect then scrolls the finding into view (M11).
-  const [tab, setTab] = useState("overview");
+  // Controlled tab. Seeded from the `?tab=` query param so links can deep-link a tab (e.g.
+  // the transcript editor's Back button returns to ?tab=interviews). Also switches to the
+  // Synthesis tab on a chat finding-citation (#finding-Fn), where its own effect scrolls
+  // the finding into view (M11).
+  const tabParam = searchParams.get("tab");
+  const [tab, setTab] = useState(
+    tabParam && CYCLE_TABS.includes(tabParam) ? tabParam : "overview",
+  );
+  // Follow the query param when it changes (e.g. navigating in from the editor).
+  useEffect(() => {
+    if (tabParam && CYCLE_TABS.includes(tabParam)) setTab(tabParam);
+  }, [tabParam]);
   useEffect(() => {
     if (location.hash.startsWith("#finding-")) setTab("synthesis");
   }, [location.hash, location.key]);
+
+  // Keep the URL in sync when the user clicks a tab, so a refresh/back stays put.
+  function selectTab(next: string) {
+    setTab(next);
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === "overview") p.delete("tab");
+        else p.set("tab", next);
+        return p;
+      },
+      { replace: true },
+    );
+  }
 
   if (!id) return null;
 
@@ -326,7 +352,7 @@ export function CycleDetailPage() {
   // cycle's tabs; the shell docks the panel against the whole content area.
   return (
     <div className="flex h-full min-h-0 flex-col gap-5">
-      <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1 gap-5">
+      <Tabs value={tab} onValueChange={selectTab} className="min-h-0 flex-1 gap-5">
         <TabsList variant="line" className="border-b border-border pb-0">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="interviews">Interviews</TabsTrigger>

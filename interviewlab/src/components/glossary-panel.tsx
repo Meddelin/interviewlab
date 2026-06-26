@@ -5,10 +5,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
-  useCreateGlossaryTerm,
-  useDeleteGlossaryTerm,
-  useGlossaryTerms,
-  useUpdateGlossaryTerm,
+  useCreateGlossaryScopeTerm,
+  useDeleteGlossaryScopeTerm,
+  useGlossaryScopeTerms,
+  useUpdateGlossaryScopeTerm,
+  type GlossaryScope,
 } from "@/lib/glossary-queries";
 import type { GlossaryTerm } from "@/lib/tauri";
 
@@ -22,9 +23,9 @@ function parseAliases(raw: string): string[] {
 
 // One term row — toggles between a read view (canonical + alias chips + notes) and an inline
 // editor. Aliases are the garbled/variant forms the ASR produces; canonical is the fix.
-function TermRow({ productId, term }: { productId: string; term: GlossaryTerm }) {
-  const update = useUpdateGlossaryTerm(productId);
-  const del = useDeleteGlossaryTerm(productId);
+function TermRow({ scope, term }: { scope: GlossaryScope; term: GlossaryTerm }) {
+  const update = useUpdateGlossaryScopeTerm(scope);
+  const del = useDeleteGlossaryScopeTerm(scope);
   const [editing, setEditing] = useState(false);
   const [canonical, setCanonical] = useState(term.canonical);
   const [aliases, setAliases] = useState(term.aliases.join(", "));
@@ -127,12 +128,17 @@ function TermRow({ productId, term }: { productId: string; term: GlossaryTerm })
   );
 }
 
-// The glossary panel for a product: a focused term→canonical list that anchors anglicisms /
-// technical terms / product names across transcription + cleanup (docs/transcription-
-// terminology.md). Lives under the product's markdown editor.
-export function GlossaryPanel({ productId }: { productId: string }) {
-  const { data: terms, isPending } = useGlossaryTerms(productId);
-  const create = useCreateGlossaryTerm(productId);
+// The glossary panel — a focused term→canonical list that anchors anglicisms / technical
+// terms / product names across transcription + cleanup (docs/transcription-terminology.md).
+// Renders at either scope: a single product (under the Products markdown editor) or the
+// GLOBAL app-wide list (Settings → Glossary), which the backend merges into every interview.
+export function GlossaryPanel({ productId }: { productId?: string }) {
+  const scope: GlossaryScope = productId
+    ? { kind: "product", productId }
+    : { kind: "global" };
+  const isGlobal = scope.kind === "global";
+  const { data: terms, isPending } = useGlossaryScopeTerms(scope);
+  const create = useCreateGlossaryScopeTerm(scope);
   const [canonical, setCanonical] = useState("");
   const [aliases, setAliases] = useState("");
 
@@ -140,7 +146,7 @@ export function GlossaryPanel({ productId }: { productId: string }) {
     const c = canonical.trim();
     if (!c) return;
     try {
-      await create.mutateAsync({ product_id: productId, canonical: c, aliases: parseAliases(aliases) });
+      await create.mutateAsync({ canonical: c, aliases: parseAliases(aliases) });
       setCanonical("");
       setAliases("");
     } catch (e) {
@@ -153,14 +159,15 @@ export function GlossaryPanel({ productId }: { productId: string }) {
       <div className="flex flex-col gap-0.5">
         <span className="flex items-center gap-2 text-sm font-medium text-foreground">
           <BookText className="size-4 text-muted-foreground" />
-          Glossary
+          {isGlobal ? "Global glossary" : "Glossary"}
           {terms && terms.length > 0 && (
             <span className="font-numeric text-xs text-muted-foreground">({terms.length})</span>
           )}
         </span>
         <p className="text-xs text-muted-foreground">
-          Term → canonical spelling, with the garbled forms the ASR produces as aliases. Biases
-          transcription and keeps terms consistent during cleanup.
+          {isGlobal
+            ? "Shared across every product. Term → canonical spelling, with the garbled forms the ASR produces as aliases — merged into each interview on top of its product glossary."
+            : "Term → canonical spelling, with the garbled forms the ASR produces as aliases. Biases transcription and keeps terms consistent during cleanup."}
         </p>
       </div>
 
@@ -195,13 +202,14 @@ export function GlossaryPanel({ productId }: { productId: string }) {
         <p className="px-1 py-2 text-xs text-muted-foreground">Loading…</p>
       ) : !terms || terms.length === 0 ? (
         <p className="px-1 py-2 text-xs text-muted-foreground">
-          No terms yet. Add the anglicisms, acronyms, and product names that get mis-transcribed —
-          or auto-suggest them from an interview on the Interviews tab.
+          {isGlobal
+            ? "No terms yet. Add the anglicisms, acronyms, and tooling names that recur across every product (API, Jira, дедлайн…) so they're transcribed consistently everywhere."
+            : "No terms yet. Add the anglicisms, acronyms, and product names that get mis-transcribed — or auto-suggest them from an interview on the Interviews tab."}
         </p>
       ) : (
         <div className="overflow-hidden rounded-md border border-border bg-background">
           {terms.map((t) => (
-            <TermRow key={t.id} productId={productId} term={t} />
+            <TermRow key={t.id} scope={scope} term={t} />
           ))}
         </div>
       )}

@@ -72,6 +72,7 @@ import { mockOnDiarModelProgress, mockOnModelProgress } from "@/lib/dev-mock";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { asrKeys } from "@/lib/asr-queries";
 import { RolesSettings } from "@/components/roles-settings";
+import { GlossaryPanel } from "@/components/glossary-panel";
 import { toast } from "sonner";
 
 // §4.4 Settings: Tabs (AI CLI | Transcription | About). M4 fills the Transcription
@@ -906,6 +907,7 @@ export function SettingsPage() {
         <TabsList variant="line" className="border-b border-border pb-0">
           <TabsTrigger value="ai-cli">AI CLI</TabsTrigger>
           <TabsTrigger value="transcription">Transcription</TabsTrigger>
+          <TabsTrigger value="glossary">Glossary</TabsTrigger>
           <TabsTrigger value="roles">Roles</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
@@ -916,6 +918,21 @@ export function SettingsPage() {
 
         <TabsContent value="transcription">
           <TranscriptionTab />
+        </TabsContent>
+
+        <TabsContent value="glossary">
+          <div className="flex w-full flex-col gap-3 pt-2">
+            <div className="flex flex-col gap-1">
+              <h2 className="text-sm font-medium text-foreground">
+                Global glossary
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                One app-wide term list shared across every product — merged into each
+                interview on top of its own product glossary.
+              </p>
+            </div>
+            <GlossaryPanel />
+          </div>
         </TabsContent>
 
         <TabsContent value="roles">

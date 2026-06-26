@@ -6,19 +6,23 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   BookText,
+  Check,
   FileAudio,
   FileText,
   FileUp,
   Loader2,
+  Pencil,
   PencilLine,
   Sparkles,
   Square,
   Trash2,
   Upload,
   Users,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { DataTable } from "@/components/data-table";
 import { StatusDot, interviewStatus } from "@/components/status-dot";
@@ -29,6 +33,7 @@ import {
   useAddInterviewFiles,
   useDeleteInterview,
   useInterviews,
+  useRenameInterview,
 } from "@/lib/interview-queries";
 import { useModels } from "@/lib/asr-queries";
 import { useUiStore } from "@/lib/ui-store";
@@ -83,8 +88,12 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const { data: models } = useModels();
   const addFiles = useAddInterviewFiles(cycleId);
   const deleteInterview = useDeleteInterview(cycleId);
+  const renameInterview = useRenameInterview(cycleId);
   const qc = useQueryClient();
   const [isDragOver, setIsDragOver] = useState(false);
+  // Inline title rename: the row being edited (null = none) + its working value.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   // The model + language + expected-speaker count chosen in Settings → Transcription drive
   // every Transcribe / Re-diarize.
@@ -397,6 +406,30 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     navigate(`/cycles/${cycleId}/interviews/${row.id}`);
   }
 
+  function startRename(row: InterviewRow) {
+    setRenamingId(row.id);
+    setRenameValue(row.title);
+  }
+
+  function cancelRename() {
+    setRenamingId(null);
+    setRenameValue("");
+  }
+
+  async function commitRename(row: InterviewRow) {
+    const title = renameValue.trim();
+    if (!title || title === row.title) {
+      cancelRename();
+      return;
+    }
+    try {
+      await renameInterview.mutateAsync({ id: row.id, title });
+      cancelRename();
+    } catch (e) {
+      toast.error(`Couldn't rename the interview. ${String(e)}`);
+    }
+  }
+
   async function ingest(paths: string[]) {
     try {
       await addFiles.mutateAsync(paths);
@@ -435,12 +468,68 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       {
         accessorKey: "title",
         header: "Interview",
-        cell: ({ row }) => (
-          <span className="flex items-center gap-2 font-medium">
-            <FileAudio className="size-4 shrink-0 text-muted-foreground" />
-            <span className="truncate">{row.original.title}</span>
-          </span>
-        ),
+        cell: ({ row }) => {
+          if (renamingId === row.original.id) {
+            return (
+              <span className="flex items-center gap-1.5">
+                <FileAudio className="size-4 shrink-0 text-muted-foreground" />
+                <Input
+                  autoFocus
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") commitRename(row.original);
+                    if (e.key === "Escape") cancelRename();
+                  }}
+                  className="h-7"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Save title"
+                  disabled={renameInterview.isPending}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    commitRename(row.original);
+                  }}
+                >
+                  <Check className="size-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Cancel rename"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    cancelRename();
+                  }}
+                >
+                  <X className="size-3.5" />
+                </Button>
+              </span>
+            );
+          }
+          return (
+            <span className="group/title flex items-center gap-2 font-medium">
+              <FileAudio className="size-4 shrink-0 text-muted-foreground" />
+              <span className="truncate">{row.original.title}</span>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Rename ${row.original.title}`}
+                className="shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startRename(row.original);
+                }}
+              >
+                <Pencil className="size-3.5" />
+              </Button>
+            </span>
+          );
+        },
       },
       {
         accessorKey: "duration_ms",
@@ -682,6 +771,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       deleteInterview,
+      renameInterview,
+      renamingId,
+      renameValue,
       asrProgress,
       cleanProgress,
       selectedModel,
