@@ -190,6 +190,7 @@ pub fn run() {
             transcript::list_participants,
             transcript::save_participants,
             transcript::save_edited_transcript,
+            transcript::import_transcript_file,
             adapter::list_adapters,
             adapter::rescan_plugins,
             adapter::get_active_adapter,

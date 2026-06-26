@@ -429,6 +429,24 @@ export function saveEditedTranscript(
   return invoke<TranscriptVersion>("save_edited_transcript", { input });
 }
 
+// What import_transcript_file reports back for the success toast (Rust `ImportResult`).
+export type ImportResult = {
+  transcript_id: string;
+  segments: number;
+  speakers: number;
+};
+
+// Import a diarized transcript (.txt: `M:SS - M:SS` / speaker / text blocks) and attach it
+// to an interview as its raw transcript — skips local ASR while keeping every downstream
+// feature (media seek, clear, re-transcribe a range, re-diarize, clean, synthesis) working
+// against the still-attached audio. Flips the interview to 'transcribed' on success.
+export function importTranscriptFile(
+  interviewId: string,
+  path: string,
+): Promise<ImportResult> {
+  return invoke<ImportResult>("import_transcript_file", { interviewId, path });
+}
+
 // --- CLI adapter layer (Milestone 6, spec §7) ---------------------------------
 // Mirrors of the Rust adapter structs/commands (src-tauri/src/adapter.rs).
 
