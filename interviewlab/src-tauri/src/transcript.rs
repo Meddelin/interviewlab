@@ -26,6 +26,10 @@ use crate::Db;
 
 // Interview status M5 writes once an edited version is saved (schema §2.2 vocab).
 const STATUS_EDITED: &str = "edited";
+// Status written when a diarized transcript is imported from a .txt file (same terminal
+// state as a fresh ASR run — a raw transcript now exists, so the editor/clean/synthesis
+// flows all unlock exactly as they do after transcription).
+const STATUS_TRANSCRIBED: &str = "transcribed";
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -361,6 +365,204 @@ async fn save_edited_db(pool: &SqlitePool, input: &SaveEditedInput) -> Result<Tr
         })
 }
 
+// --- diarized .txt import (attach a ready transcript to an interview's audio) ----
+//
+// Lets the user skip local ASR by importing a transcript they already have, while keeping
+// every downstream feature intact: the parsed reply blocks carry real timestamps, so they
+// become a normal `raw` transcript and the editor's media seek / clear / re-transcribe a
+// range / re-diarize / clean / synthesis all work against the still-attached audio. The
+// file format (one block = `M:SS - M:SS` line, speaker-name line, then text, blocks split
+// by a blank line) is parsed by a tolerant line state-machine — no regex dependency.
+
+// What the command reports back to the UI for the success toast.
+#[derive(Serialize)]
+pub struct ImportResult {
+    pub transcript_id: String,
+    pub segments: usize,
+    pub speakers: usize,
+}
+
+// Parse a `M:SS`, `MM:SS` or `HH:MM:SS` time token into milliseconds. Each colon-separated
+// field accumulates base-60 (so the last field is seconds, the next minutes, then hours);
+// requires at least one colon so a bare number in reply text can never look like a time.
+fn parse_time_to_ms(tok: &str) -> Option<i64> {
+    let parts: Vec<&str> = tok.trim().split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let mut total: i64 = 0;
+    for p in &parts {
+        let n: i64 = p.trim().parse().ok()?;
+        if n < 0 {
+            return None;
+        }
+        total = total * 60 + n;
+    }
+    Some(total * 1000)
+}
+
+// Recognize a timestamp line `<start> - <end>`. The two times contain no spaces, so a
+// real timestamp line splits into exactly three whitespace tokens with a dash separator
+// (ASCII '-', en-dash, or em-dash) and both ends parsing as a time. A speaker name
+// ("Stanislav Medvedev") or reply text won't satisfy all three, so this never misfires.
+fn parse_timestamp_line(line: &str) -> Option<(i64, i64)> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.len() != 3 {
+        return None;
+    }
+    if !matches!(tokens[1], "-" | "\u{2013}" | "\u{2014}") {
+        return None;
+    }
+    let start = parse_time_to_ms(tokens[0])?;
+    let end = parse_time_to_ms(tokens[2])?;
+    Some((start, end))
+}
+
+// A reply block accumulated while scanning lines, before it's finalized into a Segment.
+struct PendingBlock {
+    start_ms: i64,
+    end_ms: i64,
+    speaker: Option<String>,
+    text: Vec<String>,
+}
+
+fn finalize_block(b: PendingBlock, block_no: usize) -> Result<Segment, String> {
+    let speaker = b
+        .speaker
+        .ok_or_else(|| format!("block {block_no}: timestamp has no speaker name after it"))?;
+    if b.text.is_empty() {
+        return Err(format!("block {block_no} ({speaker}): reply text is empty"));
+    }
+    // Defensive: a reversed range collapses to a point (timing must never widen backwards).
+    let end_ms = if b.end_ms < b.start_ms { b.start_ms } else { b.end_ms };
+    Ok(Segment {
+        start_ms: b.start_ms,
+        end_ms,
+        speaker_label: speaker,
+        text: b.text.join(" "),
+    })
+}
+
+// Parse the diarized .txt into ordered segments. A timestamp line opens a new block, the
+// first non-empty line after it is the speaker, and every later non-empty line until the
+// next timestamp is reply text (so multi-line replies and one-or-more blank lines between
+// blocks both parse cleanly). Errors name the offending block so the user can fix the file.
+fn parse_diarized_txt(content: &str) -> Result<Vec<Segment>, String> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut cur: Option<PendingBlock> = None;
+    let mut block_no = 0usize;
+
+    for raw in content.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some((start_ms, end_ms)) = parse_timestamp_line(line) {
+            if let Some(b) = cur.take() {
+                out.push(finalize_block(b, block_no)?);
+            }
+            block_no += 1;
+            cur = Some(PendingBlock { start_ms, end_ms, speaker: None, text: Vec::new() });
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue; // blank separators (and any preamble whitespace) are skipped
+        }
+        match cur.as_mut() {
+            // Non-blank text before the first timestamp is stray preamble — ignore it.
+            None => continue,
+            Some(b) if b.speaker.is_none() => b.speaker = Some(trimmed.to_string()),
+            Some(b) => b.text.push(trimmed.to_string()),
+        }
+    }
+    if let Some(b) = cur.take() {
+        out.push(finalize_block(b, block_no)?);
+    }
+    if out.is_empty() {
+        return Err(
+            "no reply blocks found — expected `M:SS - M:SS` timestamp lines, each followed by a \
+             speaker name and the reply text"
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+// Replace any existing raw transcript with the imported segments (mirrors asr.rs's
+// store_raw_transcript_db: re-using version 1 / kind 'raw' keeps re-import idempotent).
+async fn store_imported_raw_db(
+    pool: &SqlitePool,
+    interview_id: &str,
+    segments_json: &str,
+) -> Result<String, String> {
+    sqlx::query("DELETE FROM transcript WHERE interview_id = ? AND kind = 'raw'")
+        .bind(interview_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO transcript (id, interview_id, version, kind, language, engine, segments_json, created_at) \
+         VALUES (?, ?, 1, 'raw', NULL, 'import:txt', ?, ?)",
+    )
+    .bind(&id)
+    .bind(interview_id)
+    .bind(segments_json)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+// Import a diarized transcript for an interview: parse → store as raw → seed participants
+// from the distinct speaker names (preserving any role binding already on a matching
+// speaker_label, so a re-import doesn't wipe assignments) → flip status to 'transcribed'.
+async fn import_transcript_db(pool: &SqlitePool, interview_id: &str, content: &str) -> Result<ImportResult, String> {
+    let segments = parse_diarized_txt(content)?;
+    let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
+    let transcript_id = store_imported_raw_db(pool, interview_id, &segments_json).await?;
+
+    // Distinct speaker names in first-seen order become the participant set. The names are
+    // the per-segment speaker_label as-is (the editor's chips + synthesis read the label),
+    // so no S1/S2 remapping is needed — re-diarize can later overwrite labels if the user
+    // wants ASR-clustered speakers instead.
+    let mut speakers: Vec<String> = Vec::new();
+    for s in &segments {
+        if !speakers.iter().any(|n| n == &s.speaker_label) {
+            speakers.push(s.speaker_label.clone());
+        }
+    }
+
+    let existing = list_participants_db(pool, interview_id).await.map_err(|e| e.to_string())?;
+    let participants: Vec<ParticipantInput> = speakers
+        .iter()
+        .map(|name| match existing.iter().find(|p| p.speaker_label.as_deref() == Some(name.as_str())) {
+            // Keep an already-bound participant's role/identity; just re-affirm the label.
+            Some(p) => ParticipantInput {
+                id: Some(p.id.clone()),
+                display_name: p.display_name.clone(),
+                role: p.role.clone(),
+                role_id: p.role_id.clone(),
+                speaker_label: Some(name.clone()),
+            },
+            // New speaker → name as display name, role left unassigned for the editor.
+            None => ParticipantInput {
+                id: None,
+                display_name: name.clone(),
+                role: String::new(),
+                role_id: None,
+                speaker_label: Some(name.clone()),
+            },
+        })
+        .collect();
+    save_participants_db(pool, interview_id, &participants).await?;
+
+    set_status_db(pool, interview_id, STATUS_TRANSCRIBED)
+        .await
+        .map_err(|e| format!("set status transcribed: {e}"))?;
+
+    Ok(ImportResult { transcript_id, segments: segments.len(), speakers: speakers.len() })
+}
+
 // --- Tauri commands (thin wrappers; stringify errors for the frontend) ---------
 
 // List which transcript versions exist for an interview (for the version Select).
@@ -398,6 +600,20 @@ pub async fn save_participants(
 #[tauri::command]
 pub async fn save_edited_transcript(db: tauri::State<'_, Db>, input: SaveEditedInput) -> Result<TranscriptVersion, String> {
     save_edited_db(&db.pool, &input).await
+}
+
+// Import a diarized transcript (.txt) and attach it to an interview as its raw transcript.
+// Reads the file, strips a UTF-8 BOM if present, and runs the parse → store → participants
+// → status flow. After this the interview behaves exactly like a freshly-transcribed one.
+#[tauri::command]
+pub async fn import_transcript_file(
+    db: tauri::State<'_, Db>,
+    interview_id: String,
+    path: String,
+) -> Result<ImportResult, String> {
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    import_transcript_db(&db.pool, &interview_id, content).await
 }
 
 #[cfg(test)]
@@ -643,5 +859,128 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].display_name, "Only");
         assert_eq!(list_participants_db(&pool, &iv).await.unwrap().len(), 1);
+    }
+
+    // --- diarized .txt import ---------------------------------------------------
+
+    const SAMPLE_TXT: &str = "0:01 - 0:12\nStanislav Medvedev\nТак смотри, мы сейчас в целом планируем наш замечательный бивер.\n\n0:12 - 0:18\nStanislav Medvedev\nПоэтому сейчас хочется пообщаться с теми, кто нас использует часто.\n\n0:40 - 0:51\nAndrey Belokopytov\nДа, ну так-то, конечно, есть кое-что.\n\n10:05 - 10:13\nStanislav Medvedev\nМожет у тебя есть какой-то сразу вопросик?\n";
+
+    // The spec's example fragment parses into ordered segments with real ms timing,
+    // speaker names as labels, and the text joined per block.
+    #[test]
+    fn parse_sample_fragment() {
+        let segs = parse_diarized_txt(SAMPLE_TXT).unwrap();
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].start_ms, 1_000);
+        assert_eq!(segs[0].end_ms, 12_000);
+        assert_eq!(segs[0].speaker_label, "Stanislav Medvedev");
+        assert!(segs[0].text.starts_with("Так смотри"));
+        // Two-digit minutes: 10:05 → 605s, 10:13 → 613s.
+        assert_eq!(segs[3].start_ms, 605_000);
+        assert_eq!(segs[3].end_ms, 613_000);
+        assert_eq!(segs[2].speaker_label, "Andrey Belokopytov");
+    }
+
+    // A multi-line reply (no blank line inside the block) joins into one segment; CRLF line
+    // endings and a leading BOM-less preamble blank line don't derail the scan.
+    #[test]
+    fn parse_multiline_reply_and_crlf() {
+        let txt = "\r\n0:00 - 0:05\r\nAlice\r\nПервая строка реплики.\r\nВторая строка той же реплики.\r\n\r\n0:05 - 0:09\r\nBob\r\nОтвет.\r\n";
+        let segs = parse_diarized_txt(txt).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "Первая строка реплики. Вторая строка той же реплики.");
+        assert_eq!(segs[1].speaker_label, "Bob");
+    }
+
+    // Reply text that merely looks dash-separated ("да - нет") is NOT mistaken for a
+    // timestamp line (the ends don't parse as times), so it stays inside the reply.
+    #[test]
+    fn dash_in_text_is_not_a_timestamp() {
+        let txt = "0:00 - 0:03\nAlice\nну да - нет, не уверена\n";
+        let segs = parse_diarized_txt(txt).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "ну да - нет, не уверена");
+    }
+
+    // A file with no timestamp lines is a clear user error, not a silent empty import.
+    #[test]
+    fn parse_rejects_no_blocks() {
+        assert!(parse_diarized_txt("just some prose\nwith no timestamps\n").is_err());
+    }
+
+    // A timestamp with no following speaker name is reported (block-numbered).
+    #[test]
+    fn parse_rejects_missing_speaker() {
+        // Second block opens before the first ever got a speaker.
+        let txt = "0:00 - 0:03\n\n0:03 - 0:05\nBob\nhi\n";
+        assert!(parse_diarized_txt(txt).is_err());
+    }
+
+    // End-to-end: import seeds the raw transcript, derives participants from the distinct
+    // speakers, and flips status to 'transcribed' — the same terminal state ASR produces.
+    #[tokio::test]
+    async fn import_creates_raw_participants_and_status() {
+        let pool = test_pool().await;
+        // Bare interview (no transcript yet), mimicking a freshly-ingested audio file.
+        let cycle_id = Uuid::new_v4().to_string();
+        let iv = Uuid::new_v4().to_string();
+        let ts = now_ms();
+        sqlx::query("INSERT INTO cycle (id, name, created_at, updated_at) VALUES (?, 'c', ?, ?)")
+            .bind(&cycle_id).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO interview (id, cycle_id, title, status, created_at, updated_at) VALUES (?, ?, 'iv', 'new', ?, ?)")
+            .bind(&iv).bind(&cycle_id).bind(ts).bind(ts).execute(&pool).await.unwrap();
+
+        let res = import_transcript_db(&pool, &iv, SAMPLE_TXT).await.unwrap();
+        assert_eq!(res.segments, 4);
+        assert_eq!(res.speakers, 2);
+
+        // Raw transcript is readable with the imported timing + labels.
+        let raw = get_version_db(&pool, &iv, "raw").await.unwrap().expect("raw exists");
+        assert_eq!(raw.engine.as_deref(), Some("import:txt"));
+        assert_eq!(raw.segments.len(), 4);
+        assert_eq!(raw.segments[0].start_ms, 1_000);
+
+        // One participant per distinct speaker, name as display name + speaker_label binding.
+        let ps = list_participants_db(&pool, &iv).await.unwrap();
+        assert_eq!(ps.len(), 2);
+        assert!(ps.iter().any(|p| p.display_name == "Stanislav Medvedev"
+            && p.speaker_label.as_deref() == Some("Stanislav Medvedev")));
+        assert!(ps.iter().any(|p| p.display_name == "Andrey Belokopytov"));
+
+        let status: String = sqlx::query_scalar("SELECT status FROM interview WHERE id = ?")
+            .bind(&iv).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "transcribed");
+    }
+
+    // Re-importing preserves a role already assigned to a matching speaker_label (the user
+    // doesn't lose role bindings when they swap in a corrected transcript file).
+    #[tokio::test]
+    async fn reimport_preserves_role_binding() {
+        let pool = test_pool().await;
+        let cycle_id = Uuid::new_v4().to_string();
+        let iv = Uuid::new_v4().to_string();
+        let ts = now_ms();
+        sqlx::query("INSERT INTO cycle (id, name, created_at, updated_at) VALUES (?, 'c', ?, ?)")
+            .bind(&cycle_id).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO interview (id, cycle_id, title, status, created_at, updated_at) VALUES (?, ?, 'iv', 'new', ?, ?)")
+            .bind(&iv).bind(&cycle_id).bind(ts).bind(ts).execute(&pool).await.unwrap();
+
+        import_transcript_db(&pool, &iv, SAMPLE_TXT).await.unwrap();
+        // Assign a role to "Andrey Belokopytov" (as the editor would).
+        let mut ps: Vec<ParticipantInput> = list_participants_db(&pool, &iv).await.unwrap().into_iter().map(|p| ParticipantInput {
+            id: Some(p.id),
+            display_name: p.display_name,
+            role: if p.speaker_label.as_deref() == Some("Andrey Belokopytov") { "respondent".into() } else { p.role },
+            role_id: if p.speaker_label.as_deref() == Some("Andrey Belokopytov") { Some("respondent".into()) } else { p.role_id },
+            speaker_label: p.speaker_label,
+        }).collect();
+        ps.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        save_participants_db(&pool, &iv, &ps).await.unwrap();
+
+        // Re-import the same speakers — the respondent binding survives.
+        import_transcript_db(&pool, &iv, SAMPLE_TXT).await.unwrap();
+        let after = list_participants_db(&pool, &iv).await.unwrap();
+        let andrey = after.iter().find(|p| p.speaker_label.as_deref() == Some("Andrey Belokopytov")).unwrap();
+        assert_eq!(andrey.role_id.as_deref(), Some("respondent"));
     }
 }

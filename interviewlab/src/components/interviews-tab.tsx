@@ -8,6 +8,7 @@ import {
   BookText,
   FileAudio,
   FileText,
+  FileUp,
   Loader2,
   PencilLine,
   Sparkles,
@@ -38,6 +39,7 @@ import {
   cleanTranscript,
   DIAR_PROGRESS_EVENT,
   IN_TAURI,
+  importTranscriptFile,
   INTERVIEW_PROGRESS_EVENT,
   rediarizeInterview,
   type AsrProgress,
@@ -291,6 +293,34 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     }
   }
 
+  // Attach an already-diarized transcript (.txt) instead of running local ASR. Picks the
+  // file, hands the path to the backend (which parses → stores it as the raw transcript →
+  // seeds participants from the speaker names → flips status to 'transcribed'), then
+  // refreshes so Edit/Clean/Re-diarize unlock. The audio stays attached, so media seek,
+  // clearing a segment and re-transcribing a range keep working.
+  async function importTxt(row: InterviewRow) {
+    if (!IN_TAURI) {
+      toast.error("Importing a transcript file works in the desktop app.");
+      return;
+    }
+    const selected = await openFileDialog({
+      multiple: false,
+      filters: [{ name: "Transcript", extensions: ["txt"] }],
+    });
+    if (!selected) return;
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    try {
+      const res = await importTranscriptFile(row.id, path);
+      toast.success(
+        `Imported transcript for "${row.title}" — ${res.segments} segment${res.segments === 1 ? "" : "s"}, ${res.speakers} speaker${res.speakers === 1 ? "" : "s"}`,
+      );
+    } catch (e) {
+      toast.error(`Couldn't import the transcript. ${String(e)}`);
+    } finally {
+      qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
+    }
+  }
+
   // Stop a running transcription (bug #5). Signals the backend cancel flag; whisper aborts
   // mid-run, the interview lands on `error`, and the queue frees. Clear the local percent
   // optimistically so the row drops out of the "Transcribing…" state immediately.
@@ -516,6 +546,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
           // Re-diarize re-labels speakers on an existing transcript (same precondition as
           // Clean: a transcript must exist).
           const canRediarize = canClean;
+          // Import a ready-made .txt transcript — offered once media is prepared (same
+          // states as Transcribe), and re-runnable to swap in a corrected file.
+          const canImport = canTranscribe;
           return (
             <div className="flex items-center justify-end gap-1">
               {transcribing && (
@@ -596,6 +629,22 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   Re-diarize
                 </Button>
               )}
+              {canImport && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy}
+                  aria-label={`Import a transcript file for ${row.original.title}`}
+                  className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    importTxt(row.original);
+                  }}
+                >
+                  <FileUp className="size-3.5" />
+                  Import .txt
+                </Button>
+              )}
               {canTranscribe && (
                 <Button
                   variant="ghost"
@@ -665,7 +714,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
             Drag audio or video files here
           </p>
           <p className="text-xs text-muted-foreground">
-            Each file becomes an interview, normalized to 16 kHz audio.
+            Each file becomes an interview, normalized to 16 kHz audio. Already
+            have a diarized transcript? Use a row's <em>Import .txt</em> to attach
+            it instead of transcribing.
           </p>
         </div>
         <Button
