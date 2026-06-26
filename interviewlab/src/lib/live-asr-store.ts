@@ -1,5 +1,10 @@
 import { create } from "zustand";
-import type { AsrProgress, DiarProgress, Segment } from "@/lib/tauri";
+import type {
+  AsrProgress,
+  CleanupProgress,
+  DiarProgress,
+  Segment,
+} from "@/lib/tauri";
 
 // Live, in-flight transcription/diarization state, keyed by interview id. This is what lets
 // you OPEN the interview while a slow Mac run is still going and watch it fill in: a single
@@ -29,8 +34,22 @@ export type LiveAsr = {
 
 type LiveAsrState = {
   byInterview: Record<string, LiveAsr>;
+  // Live cleanup percent (0..100) keyed by interview, while a cleanup pass runs. Separate from
+  // the ASR buffer above because cleanup is a distinct phase with no segments/diarization. This
+  // is what lets the Interviews-tab "Cleaning… N%" badge survive navigating away and back: a
+  // single app-level listener feeds it, not the tab's own (unmounting) state.
+  cleanByInterview: Record<string, number>;
+
   onAsr: (p: AsrProgress) => void;
   onDiar: (p: DiarProgress) => void;
+  onCleanup: (p: CleanupProgress) => void;
+
+  // Optimistic markers so a row flips to its running phase the instant the button is clicked,
+  // before the first backend event lands (and survives a tab switch in between).
+  markTranscribing: (interviewId: string) => void;
+  markCleaning: (interviewId: string) => void;
+  clearCleaning: (interviewId: string) => void;
+
   // Drop the live buffer for an interview (e.g. once its stored transcript has loaded).
   reset: (interviewId: string) => void;
 };
@@ -47,6 +66,7 @@ const EMPTY: LiveAsr = {
 
 export const useLiveAsrStore = create<LiveAsrState>((set) => ({
   byInterview: {},
+  cleanByInterview: {},
 
   onAsr: (p) =>
     set((s) => {
@@ -117,12 +137,51 @@ export const useLiveAsrStore = create<LiveAsrState>((set) => ({
       return { byInterview: { ...s.byInterview, [p.interview_id]: next } };
     }),
 
+  onCleanup: (p) =>
+    set((s) => {
+      const next = { ...s.cleanByInterview };
+      if (p.status === "cleaning") {
+        next[p.interview_id] = p.progress;
+      } else {
+        // 'cleaned' | 'error' — the phase is over; the stored status takes over the badge.
+        delete next[p.interview_id];
+      }
+      return { cleanByInterview: next };
+    }),
+
+  markTranscribing: (interviewId) =>
+    set((s) => ({
+      // Fresh transcribing entry (clears any leftover segments from a prior run) so the row
+      // shows "Transcribing…" immediately; real progress/segment events then fill it in.
+      byInterview: {
+        ...s.byInterview,
+        [interviewId]: { ...EMPTY, status: "transcribing" },
+      },
+    })),
+
+  markCleaning: (interviewId) =>
+    set((s) => ({
+      cleanByInterview: { ...s.cleanByInterview, [interviewId]: 0 },
+    })),
+
+  clearCleaning: (interviewId) =>
+    set((s) => {
+      if (s.cleanByInterview[interviewId] === undefined) return s;
+      const next = { ...s.cleanByInterview };
+      delete next[interviewId];
+      return { cleanByInterview: next };
+    }),
+
   reset: (interviewId) =>
     set((s) => {
-      if (!s.byInterview[interviewId]) return s;
-      const next = { ...s.byInterview };
-      delete next[interviewId];
-      return { byInterview: next };
+      const hasAsr = !!s.byInterview[interviewId];
+      const hasClean = s.cleanByInterview[interviewId] !== undefined;
+      if (!hasAsr && !hasClean) return s;
+      const byInterview = { ...s.byInterview };
+      const cleanByInterview = { ...s.cleanByInterview };
+      delete byInterview[interviewId];
+      delete cleanByInterview[interviewId];
+      return { byInterview, cleanByInterview };
     }),
 }));
 

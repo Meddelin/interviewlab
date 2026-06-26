@@ -37,31 +37,21 @@ import {
 } from "@/lib/interview-queries";
 import { useModels } from "@/lib/asr-queries";
 import { useUiStore } from "@/lib/ui-store";
+import { useLiveAsrStore } from "@/lib/live-asr-store";
 import {
-  ASR_PROGRESS_EVENT,
   cancelTranscription,
-  CLEANUP_PROGRESS_EVENT,
   cleanTranscript,
-  DIAR_PROGRESS_EVENT,
   IN_TAURI,
   importTranscriptFile,
   INTERVIEW_PROGRESS_EVENT,
   rediarizeInterview,
-  type AsrProgress,
-  type CleanupProgress,
-  type DiarProgress,
   type InterviewProgress,
   type InterviewRow,
   transcribeInterview,
 } from "@/lib/tauri";
 import { GlossarySuggestDialog } from "@/components/glossary-suggest-dialog";
 // dev-mock: browser-only, never active under Tauri.
-import {
-  mockOnAsrProgress,
-  mockOnCleanupProgress,
-  mockOnDragDrop,
-  mockOnProgress,
-} from "@/lib/dev-mock";
+import { mockOnDragDrop, mockOnProgress } from "@/lib/dev-mock";
 
 // Audio/video extensions we accept for ingest (spec §3.2 batch ingest).
 const MEDIA_EXTS = [
@@ -78,9 +68,6 @@ const MEDIA_EXTS = [
   "avi",
 ];
 
-// Live per-interview transcription progress (interview_id → percent), driven by the
-// `asr://progress` event. Drives the row's "Transcribing… N%" label.
-type AsrState = Record<string, number>;
 
 export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const navigate = useNavigate();
@@ -106,16 +93,35 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const expectedSpeakers =
     asrExpectedSpeakers === "auto" ? null : Number(asrExpectedSpeakers);
 
-  // Live transcription progress per interview (cleared on terminal status).
-  const [asrProgress, setAsrProgress] = useState<AsrState>({});
-  // Live cleanup progress per interview (interview_id → percent, cleared when done).
-  const [cleanProgress, setCleanProgress] = useState<AsrState>({});
   // The interview whose glossary-suggest dialog is open (null = closed).
   const [glossaryFor, setGlossaryFor] = useState<InterviewRow | null>(null);
-  // Interviews currently in the DIARIZATION phase (after whisper hits 100%, before the row
-  // flips to `transcribed`). Without this the badge sat frozen at "Transcribing 100%" for the
-  // whole CPU diarization tail — now it shows a distinct "Diarizing…" phase.
-  const [diarizing, setDiarizing] = useState<Record<string, boolean>>({});
+
+  // Live run progress comes from the GLOBAL live-asr store (fed by the app-level useLiveAsr
+  // listener), NOT local state — so the "Transcribing… / Diarizing… / Cleaning… N%" badges
+  // survive switching cycle tabs and the editor round-trip (the store outlives this tab).
+  const liveAsr = useLiveAsrStore((s) => s.byInterview);
+  const cleanProgress = useLiveAsrStore((s) => s.cleanByInterview);
+  const markTranscribing = useLiveAsrStore((s) => s.markTranscribing);
+  const markCleaning = useLiveAsrStore((s) => s.markCleaning);
+  const clearCleaning = useLiveAsrStore((s) => s.clearCleaning);
+  const resetLive = useLiveAsrStore((s) => s.reset);
+  // Per-row maps the columns read: transcription percent (while whisper runs) and the
+  // diarization phase (after whisper hits 100%, before the row flips to `transcribed` — so the
+  // badge shows a distinct "Diarizing…" instead of a frozen "Transcribing 100%").
+  const asrProgress = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const [id, a] of Object.entries(liveAsr)) {
+      if (a.status === "transcribing") m[id] = a.progress;
+    }
+    return m;
+  }, [liveAsr]);
+  const diarizing = useMemo(() => {
+    const m: Record<string, boolean> = {};
+    for (const [id, a] of Object.entries(liveAsr)) {
+      if (a.diarActive) m[id] = true;
+    }
+    return m;
+  }, [liveAsr]);
 
   // Live row updates: each finished file emits `interview://progress`; just
   // invalidate this cycle's list so the table re-renders with new status/duration.
@@ -173,103 +179,10 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cycleId]);
 
-  // Live transcription updates: `asr://progress` carries status + percent per
-  // interview. Track the percent for the row label and invalidate the list on any
-  // status change so the badge flips (new → transcribing → transcribed | error).
-  useEffect(() => {
-    function onAsr(p: AsrProgress) {
-      setAsrProgress((prev) => {
-        const next = { ...prev };
-        if (p.status === "transcribing" && p.progress >= 0) {
-          next[p.interview_id] = p.progress;
-        } else if (p.status === "transcribed" || p.status === "error") {
-          delete next[p.interview_id];
-        }
-        return next;
-      });
-      if (p.status === "transcribed" || p.status === "error") {
-        // Whisper terminal → the diarization phase is over too; drop any diarizing flag.
-        setDiarizing((prev) => {
-          if (!prev[p.interview_id]) return prev;
-          const next = { ...prev };
-          delete next[p.interview_id];
-          return next;
-        });
-        qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
-        if (p.status === "error") {
-          toast.error(`Transcription failed: ${p.error ?? "unknown"}`);
-        }
-      }
-    }
-
-    if (!IN_TAURI) {
-      return mockOnAsrProgress(onAsr);
-    }
-    const unlisten = getCurrentWebview().listen<AsrProgress>(
-      ASR_PROGRESS_EVENT,
-      (e) => onAsr(e.payload),
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [cycleId, qc]);
-
-  // Live diarization updates: `asr://diar-progress` fires AFTER whisper finishes, while the row
-  // is still `transcribing`. Track which interviews are in the diarization phase so the badge
-  // shows "Diarizing…" instead of a frozen "Transcribing 100%". Cleared on done/error (and on
-  // the whisper terminal event above, as a backstop). Tauri-only — the browser mock doesn't diarize.
-  useEffect(() => {
-    if (!IN_TAURI) return;
-    const unlisten = getCurrentWebview().listen<DiarProgress>(
-      DIAR_PROGRESS_EVENT,
-      (e) => {
-        const p = e.payload;
-        setDiarizing((prev) => {
-          const next = { ...prev };
-          if (p.status === "diarizing") next[p.interview_id] = true;
-          else delete next[p.interview_id]; // 'done' | 'error'
-          return next;
-        });
-      },
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [cycleId]);
-
-  // Live cleanup updates: `cleanup://progress` carries batch status + percent per
-  // interview. Track the percent for the row label and invalidate the list on a
-  // terminal status so the badge flips (cleaning → cleaned | error).
-  useEffect(() => {
-    function onCleanup(p: CleanupProgress) {
-      setCleanProgress((prev) => {
-        const next = { ...prev };
-        if (p.status === "cleaning") {
-          next[p.interview_id] = p.progress;
-        } else {
-          delete next[p.interview_id];
-        }
-        return next;
-      });
-      if (p.status === "cleaned" || p.status === "error") {
-        qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
-        if (p.status === "error") {
-          toast.error(`Cleanup failed: ${p.error ?? "unknown"}`);
-        }
-      }
-    }
-
-    if (!IN_TAURI) {
-      return mockOnCleanupProgress(onCleanup);
-    }
-    const unlisten = getCurrentWebview().listen<CleanupProgress>(
-      CLEANUP_PROGRESS_EVENT,
-      (e) => onCleanup(e.payload),
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [cycleId, qc]);
+  // NOTE: transcription / diarization / cleanup progress is captured GLOBALLY by the app-level
+  // useLiveAsr listener into the live-asr store (it also invalidates the list + toasts on a
+  // terminal event), so those listeners no longer live here — that's what makes the running
+  // badges survive a tab switch / editor round-trip.
 
   function filterMedia(paths: string[]): string[] {
     return paths.filter((p) => {
@@ -287,15 +200,11 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       );
       return;
     }
-    setAsrProgress((prev) => ({ ...prev, [row.id]: 0 }));
+    markTranscribing(row.id);
     try {
       await transcribeInterview(row.id, asrModelId, asrLanguage, expectedSpeakers);
     } catch (e) {
-      setAsrProgress((prev) => {
-        const next = { ...prev };
-        delete next[row.id];
-        return next;
-      });
+      resetLive(row.id);
       toast.error(`Couldn't transcribe. ${String(e)}`);
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
@@ -336,11 +245,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   async function stopTranscription(row: InterviewRow) {
     try {
       await cancelTranscription(row.id);
-      setAsrProgress((prev) => {
-        const next = { ...prev };
-        delete next[row.id];
-        return next;
-      });
+      resetLive(row.id);
       toast.message(`Stopping "${row.title}"…`);
     } catch (e) {
       toast.error(`Couldn't stop. ${String(e)}`);
@@ -368,16 +273,12 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // Run the "no grammar errors" cleanup pass (spec §6.7). Optimistically flips the row
   // to 'cleaning'; the cleanup://progress stream + invalidation do the rest.
   async function clean(row: InterviewRow) {
-    setCleanProgress((prev) => ({ ...prev, [row.id]: 0 }));
+    markCleaning(row.id);
     try {
       await cleanTranscript(row.id);
       toast.success(`Cleaned "${row.title}"`);
     } catch (e) {
-      setCleanProgress((prev) => {
-        const next = { ...prev };
-        delete next[row.id];
-        return next;
-      });
+      clearCleaning(row.id);
       toast.error(`Couldn't clean. ${String(e)}`);
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
@@ -776,6 +677,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       renameValue,
       asrProgress,
       cleanProgress,
+      diarizing,
       selectedModel,
       asrModelId,
       asrLanguage,
