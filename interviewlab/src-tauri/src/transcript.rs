@@ -176,16 +176,43 @@ async fn get_version_db(pool: &SqlitePool, interview_id: &str, kind: &str) -> Re
     }
 }
 
-// The "best" version timing source for the immutability re-stamp: prefer an existing
-// 'edited', else 'cleaned', else 'raw'. Returns just the timing pairs (start,end) in
-// segment order. None if the interview has no transcript at all.
-async fn timing_source_db(pool: &SqlitePool, interview_id: &str) -> Result<Option<Vec<(i64, i64)>>, String> {
-    for kind in ["edited", "cleaned", "raw"] {
+// The set of REAL segment boundaries we pin saved timing to (the immutability invariant,
+// spec §4.5). We take them from the FINEST available version — prefer 'raw' (the original
+// ASR/import segmentation), else 'cleaned', else 'edited'. Raw is the superset: cleaned and
+// edited are derived from it by merging, so their boundaries are a subset of raw's. Snapping
+// against raw therefore allows ANY legitimate coalescing OR later re-split to land on a real
+// boundary, even after the coarser 'edited' version already exists. Returns sorted, de-duped
+// (starts, ends). None if the interview has no transcript at all.
+async fn boundary_set_db(pool: &SqlitePool, interview_id: &str) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+    for kind in ["raw", "cleaned", "edited"] {
         if let Some(v) = get_version_db(pool, interview_id, kind).await? {
-            return Ok(Some(v.segments.iter().map(|s| (s.start_ms, s.end_ms)).collect()));
+            let mut starts: Vec<i64> = v.segments.iter().map(|s| s.start_ms).collect();
+            let mut ends: Vec<i64> = v.segments.iter().map(|s| s.end_ms).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            ends.sort_unstable();
+            ends.dedup();
+            return Ok(Some((starts, ends)));
         }
     }
     Ok(None)
+}
+
+// Snap a value to the nearest member of a sorted, de-duplicated slice (ties → the lower one).
+// Used to pin an edited segment's start/end onto a real source boundary: an exact match is
+// returned unchanged (the common case — the editor always uses real boundaries), and any
+// off-boundary value is pulled to the closest real one. An empty slice leaves the value as-is.
+fn snap_to_nearest(value: i64, sorted: &[i64]) -> i64 {
+    match sorted.binary_search(&value) {
+        Ok(_) => value,
+        Err(0) => *sorted.first().unwrap_or(&value),
+        Err(pos) if pos >= sorted.len() => *sorted.last().unwrap_or(&value),
+        Err(pos) => {
+            let lo = sorted[pos - 1];
+            let hi = sorted[pos];
+            if value - lo <= hi - value { lo } else { hi }
+        }
+    }
 }
 
 // The next free transcript version number for an interview (UNIQUE(interview,version)).
@@ -327,22 +354,26 @@ async fn save_participants_db(
 
 // --- the combined Save (segments + participants + status), timing-immutable -----
 
-// Save the edited transcript: re-stamp each segment's timing from the stored source
-// version (enforcing the spec's timing-immutable invariant regardless of what the
-// client sent), persist as the 'edited' version, save participants, set status 'edited'.
+// Save the edited transcript: pin each segment's timing to a REAL source boundary (the
+// spec's timing-immutable invariant), persist as the 'edited' version, save participants,
+// set status 'edited'.
+//
+// Why snap-to-boundary and NOT the old re-stamp-by-index: the editor coalesces fine-grained
+// segments into PARAGRAPHS before saving, so it sends fewer segments than the source. The old
+// `saved[i] = source[i]` therefore corrupted timing — a merged paragraph took the i-th raw
+// segment's span instead of its own [first.start, last.end]. Matching by VALUE instead fixes
+// that: a legitimate paragraph's start/end are themselves real source boundaries, so they snap
+// to themselves (preserved exactly), while a buggy/malicious off-boundary value is still pulled
+// back onto a real boundary — the client can never invent or shift a timestamp.
 async fn save_edited_db(pool: &SqlitePool, input: &SaveEditedInput) -> Result<TranscriptVersion, String> {
-    // Authoritative timing comes from the stored source, matched by index. The client's
-    // start/end are ignored — only text + speaker_label are user-editable (spec §4.5).
-    let source_timing = timing_source_db(pool, &input.interview_id).await?;
+    let boundaries = boundary_set_db(pool, &input.interview_id).await?;
 
     let mut segments = input.segments.clone();
-    if let Some(timing) = &source_timing {
-        for (i, seg) in segments.iter_mut().enumerate() {
-            if let Some((start, end)) = timing.get(i) {
-                seg.start_ms = *start;
-                seg.end_ms = *end;
-            }
-            // Defensive: a segment that somehow has end < start gets clamped (never widens timing).
+    if let Some((starts, ends)) = &boundaries {
+        for seg in segments.iter_mut() {
+            seg.start_ms = snap_to_nearest(seg.start_ms, starts);
+            seg.end_ms = snap_to_nearest(seg.end_ms, ends);
+            // Defensive: never let a snapped pair invert (end before start).
             if seg.end_ms < seg.start_ms {
                 seg.end_ms = seg.start_ms;
             }
@@ -666,15 +697,16 @@ mod tests {
     }
 
     // The M5 verify path: edit text + assign speaker roles + Save → reload shows the
-    // persisted edited text & participant assignments, and segment TIMING is unchanged.
+    // persisted edited text & participant assignments, and segment TIMING stays pinned to
+    // REAL source boundaries — a buggy/malicious client can't invent or shift a timestamp.
     #[tokio::test]
     async fn save_edited_reload_persists_and_timing_immutable() {
         let pool = test_pool().await;
         let raw = sample_raw();
         let iv = seed_interview_with_raw(&pool, &raw).await;
 
-        // Edit text + reassign speaker labels; deliberately send WRONG timing to prove
-        // the backend ignores it and re-stamps from the stored raw version.
+        // Edit text + reassign speaker labels; deliberately send WRONG timing to prove the
+        // backend snaps every boundary back onto a real raw boundary (immutability by value).
         let edited_segments = vec![
             Segment { start_ms: 999999, end_ms: 999999, speaker_label: "interviewer".into(), text: "Я обычно захожу и смотрю заказы.".into() },
             Segment { start_ms: -5, end_ms: -5, speaker_label: "respondent".into(), text: "И потом проверяю аналитику.".into() },
@@ -692,18 +724,22 @@ mod tests {
             language: Some("ru".into()),
         }).await.unwrap();
 
-        // Returned version is 'edited', carries the corrected timing (not the bogus client values).
+        // Returned version is 'edited', carries snapped timing (not the bogus client values).
         assert_eq!(saved.kind, "edited");
         assert_eq!(saved.segments.len(), 3);
         assert_eq!(saved.segments[0].text, "Я обычно захожу и смотрю заказы.");
 
-        // Reload from DB and assert persistence + timing-immutability against the raw.
+        // Reload from DB and assert persistence + timing pinned to real raw boundaries.
+        let valid_starts: Vec<i64> = raw.iter().map(|s| s.start_ms).collect();
+        let valid_ends: Vec<i64> = raw.iter().map(|s| s.end_ms).collect();
         let reloaded = get_version_db(&pool, &iv, "edited").await.unwrap().expect("edited exists");
         assert_eq!(reloaded.segments.len(), raw.len());
         for (i, seg) in reloaded.segments.iter().enumerate() {
-            // Timing matches the ORIGINAL raw exactly — never the client's bogus values.
-            assert_eq!(seg.start_ms, raw[i].start_ms, "start_ms must be immutable (seg {i})");
-            assert_eq!(seg.end_ms, raw[i].end_ms, "end_ms must be immutable (seg {i})");
+            // The bogus client timing is gone: each boundary is a REAL raw boundary, and the
+            // pair is well-ordered. Never an invented value like 999999 or -5.
+            assert!(valid_starts.contains(&seg.start_ms), "start_ms must be a real boundary (seg {i}): {}", seg.start_ms);
+            assert!(valid_ends.contains(&seg.end_ms), "end_ms must be a real boundary (seg {i}): {}", seg.end_ms);
+            assert!(seg.end_ms >= seg.start_ms, "timing must not invert (seg {i})");
         }
         // Text + speaker_label reflect the edit.
         assert_eq!(reloaded.segments[0].text, "Я обычно захожу и смотрю заказы.");
@@ -727,6 +763,74 @@ mod tests {
         // The raw version is untouched (the editor never mutates earlier versions).
         let still_raw = get_version_db(&pool, &iv, "raw").await.unwrap().unwrap();
         assert_eq!(still_raw.segments, raw);
+    }
+
+    // Regression (the coalescing bug): the editor merges consecutive same-speaker raw segments
+    // into ONE paragraph before saving, so it sends FEWER segments than raw. The merged
+    // paragraph's span is [first.start, last.end]. The old index re-stamp wrongly gave it
+    // raw[0]'s span (0..4200) — losing the real end. Snapping to boundaries preserves the full
+    // merged span (0..13100) exactly, because both ends are real raw boundaries.
+    #[tokio::test]
+    async fn save_edited_coalesced_preserves_merged_span() {
+        let pool = test_pool().await;
+        let raw = sample_raw(); // 3 contiguous S1 segments spanning 0..13100
+        let iv = seed_interview_with_raw(&pool, &raw).await;
+
+        // What the editor sends after coalescing all three into one paragraph.
+        let merged = Segment {
+            start_ms: raw[0].start_ms,
+            end_ms: raw[2].end_ms,
+            speaker_label: "S1".into(),
+            text: "ну вот я обычно захожу и смотрю заказы и потом проверяю аналитику но воронку не настроил".into(),
+        };
+
+        save_edited_db(&pool, &SaveEditedInput {
+            interview_id: iv.clone(),
+            segments: vec![merged.clone()],
+            participants: vec![],
+            language: Some("ru".into()),
+        }).await.unwrap();
+
+        let reloaded = get_version_db(&pool, &iv, "edited").await.unwrap().expect("edited exists");
+        assert_eq!(reloaded.segments.len(), 1, "the merged paragraph is saved as one segment");
+        assert_eq!(reloaded.segments[0].start_ms, 0, "merged start preserved");
+        assert_eq!(reloaded.segments[0].end_ms, 13100, "merged end preserved (was corrupted to 4200 before)");
+        assert_eq!(reloaded.segments[0].text, merged.text);
+    }
+
+    // After a save, a later re-split must still land on a FINE-GRAINED raw boundary — even
+    // though the now-existing 'edited' version is coarser. boundary_set_db prefers raw, so the
+    // mid-turn boundary (4200) is still snappable.
+    #[tokio::test]
+    async fn re_split_after_save_snaps_to_raw_boundary() {
+        let pool = test_pool().await;
+        let raw = sample_raw();
+        let iv = seed_interview_with_raw(&pool, &raw).await;
+
+        // First save: one merged paragraph (0..13100).
+        save_edited_db(&pool, &SaveEditedInput {
+            interview_id: iv.clone(),
+            segments: vec![Segment { start_ms: 0, end_ms: 13100, speaker_label: "S1".into(), text: "merged".into() }],
+            participants: vec![],
+            language: None,
+        }).await.unwrap();
+
+        // Second save: the user re-split the turn at the raw boundary 4200 (a boundary that is
+        // NOT present in the coarse 'edited' version, only in raw).
+        save_edited_db(&pool, &SaveEditedInput {
+            interview_id: iv.clone(),
+            segments: vec![
+                Segment { start_ms: 0, end_ms: 4200, speaker_label: "interviewer".into(), text: "first".into() },
+                Segment { start_ms: 4200, end_ms: 13100, speaker_label: "respondent".into(), text: "rest".into() },
+            ],
+            participants: vec![],
+            language: None,
+        }).await.unwrap();
+
+        let reloaded = get_version_db(&pool, &iv, "edited").await.unwrap().unwrap();
+        assert_eq!(reloaded.segments.len(), 2);
+        assert_eq!((reloaded.segments[0].start_ms, reloaded.segments[0].end_ms), (0, 4200));
+        assert_eq!((reloaded.segments[1].start_ms, reloaded.segments[1].end_ms), (4200, 13100));
     }
 
     // Re-saving overwrites the same 'edited' row rather than piling up versions.
@@ -815,11 +919,15 @@ mod tests {
         }).await.unwrap();
 
         // Reload and assert.
+        let valid_starts: Vec<i64> = raw.iter().map(|s| s.start_ms).collect();
+        let valid_ends: Vec<i64> = raw.iter().map(|s| s.end_ms).collect();
         let reloaded = get_version_db(&pool, &iv, "edited").await.unwrap().expect("edited persisted");
         assert_eq!(reloaded.segments.len(), raw.len());
         for (i, seg) in reloaded.segments.iter().enumerate() {
-            assert_eq!(seg.start_ms, raw[i].start_ms, "start_ms immutable (seg {i})");
-            assert_eq!(seg.end_ms, raw[i].end_ms, "end_ms immutable (seg {i})");
+            // Timing is pinned to real raw boundaries (the bogus 7/7 client values are gone).
+            assert!(valid_starts.contains(&seg.start_ms), "start_ms must be a real boundary (seg {i})");
+            assert!(valid_ends.contains(&seg.end_ms), "end_ms must be a real boundary (seg {i})");
+            assert!(seg.end_ms >= seg.start_ms, "timing must not invert (seg {i})");
         }
         assert_eq!(reloaded.segments[0].text, "Отредактированный первый сегмент.");
         assert_eq!(reloaded.segments[0].speaker_label, "interviewer");
