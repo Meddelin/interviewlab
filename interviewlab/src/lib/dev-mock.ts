@@ -67,6 +67,7 @@ import {
   normalizeTemplate,
   renderTemplateMd,
   templateGoals,
+  templateQuestions,
   templateIsEmpty,
 } from "./tauri";
 import { MOCK_AUDIO_DATA_URI } from "./mock-audio";
@@ -274,6 +275,46 @@ const guides: Guide[] = [
     template: EMPTY_GUIDE_TEMPLATE,
     created_at: now - 22 * DAY,
     updated_at: now - 20 * DAY,
+  },
+  {
+    // A filled STRUCTURED template (browser preview only) so the editor + the cycle Overview
+    // preview demonstrate the five blocks. Standalone — not wired to any pre-baked synthesis,
+    // so it can't drift from the seeded findings. content_md/goals are derived in the post-pass.
+    id: "11111111-1111-4111-8111-0000000000a1",
+    name: "Activation (templated)",
+    content_md: "",
+    goals: [],
+    template: {
+      hypotheses: [
+        { id: "", text: "New accounts stall because connecting a data source needs creds they don't have at signup." },
+        { id: "", text: "Users invite a teammate only once they have something to show." },
+      ],
+      tasks: [
+        { id: "", text: "Understand why new accounts stall before the first funnel." },
+        { id: "", text: "Find which onboarding step confuses most." },
+      ],
+      qualifying_questions: [
+        { id: "", text: "What's your role, and how long have you used the product?" },
+      ],
+      main_blocks: [
+        {
+          title: "Onboarding",
+          questions: [
+            { id: "", text: "Walk me through your first session after signing up." },
+            { id: "", text: "Where did you get stuck, if anywhere?" },
+          ],
+        },
+        {
+          title: "Data sources",
+          questions: [{ id: "", text: "How did connecting your first data source go?" }],
+        },
+      ],
+      hypothesis_questions: [
+        { id: "", text: "At what point did you (or would you) invite a teammate?" },
+      ],
+    },
+    created_at: now - 5 * DAY,
+    updated_at: now - 1 * DAY,
   },
 ];
 
@@ -940,7 +981,15 @@ function deriveGoals(guide: string): Goal[] {
 // backend derives + caches these; the mock derives on seed so the library/picker render
 // "N goals" with stable ids).
 for (const g of guides) {
-  g.goals = deriveGoals(g.content_md);
+  if (!templateIsEmpty(g.template)) {
+    // A structured guide: render content_md + goals from its template (mirrors the backend).
+    const w = resolveGuideWrite(g.content_md, g.template);
+    g.content_md = w.content_md;
+    g.template = w.template;
+    g.goals = w.goals;
+  } else {
+    g.goals = deriveGoals(g.content_md);
+  }
 }
 
 // --- M10b: render the cycle synthesis as editable markdown (mirrors Rust
@@ -1022,6 +1071,35 @@ function renderInterviewMarkdown(doc: InterviewSummaryDoc, title: string): strin
     }
     lines.push("");
   }
+  // Hypothesis signals (templated guide): mirror the Rust render_interview_markdown.
+  if (doc.hypothesis_signals && doc.hypothesis_signals.length > 0) {
+    const label: Record<string, string> = { supports: "Supports", contradicts: "Contradicts", mixed: "Mixed", neutral: "Neutral" };
+    lines.push("## Hypothesis signals", "");
+    for (const s of doc.hypothesis_signals) {
+      const text = (doc.hypotheses ?? []).find((h) => h.id === s.hypothesis_id)?.text ?? "";
+      lines.push(`- **${s.hypothesis_id} · ${label[s.stance] ?? s.stance}** — ${text.trim()}`);
+      if (s.note?.trim()) lines.push(`  ${s.note.trim()}`);
+      for (const q of s.quotes ?? [])
+        if (q.quote.trim()) lines.push(`  > ${q.quote.trim()} _(segment ${q.segment_id + 1})_`);
+    }
+    lines.push("");
+  }
+
+  // Question answers (templated guide): only the answered ones, like the Rust renderer.
+  const answered = (doc.question_answers ?? []).filter((a) => a.status !== "not_answered");
+  if (answered.length > 0) {
+    lines.push("## Question answers", "");
+    for (const a of answered) {
+      const text = (doc.questions ?? []).find((q) => q.id === a.question_id)?.text ?? "";
+      const how = a.status === "indirect" ? " _(indirect)_" : "";
+      lines.push(`- **${a.question_id}**${how} — ${text.trim()}`);
+      if (a.summary?.trim()) lines.push(`  ${a.summary.trim()}`);
+      for (const q of a.quotes ?? [])
+        if (q.quote.trim()) lines.push(`  > ${q.quote.trim()} _(segment ${q.segment_id + 1})_`);
+    }
+    lines.push("");
+  }
+
   if (doc.notable.length > 0) {
     lines.push("## Notable quotes & surprises", "");
     for (const n of doc.notable) {
@@ -1432,6 +1510,74 @@ function effectiveGuide(cycleId: string): string {
     if (g && g.content_md.trim()) return g.content_md;
   }
   return cycle.guide ?? "";
+}
+
+// The structured template the cycle's linked guide carries (empty for a legacy/free-markdown
+// guide), mirroring the Rust effective_guide_template_db.
+function effectiveGuideTemplate(cycleId: string): GuideTemplate {
+  const cycle = cycles.find((c) => c.id === cycleId);
+  if (cycle?.guide_id) {
+    const g = guides.find((g) => g.id === cycle.guide_id);
+    if (g) return g.template;
+  }
+  return EMPTY_GUIDE_TEMPLATE;
+}
+
+// Build a per-interview summary doc DISTRIBUTED OVER THE TEMPLATE for the browser preview: a
+// point per task/goal, an answer per guide question (direct / indirect / not_answered), and a
+// signal per hypothesis — so the dev preview demonstrates the templated synthesis the real
+// backend produces. Prose is in Russian to mirror a Russian-language interview (the real CLI
+// writes in the interview's language; the mock has no transcript to detect, so we pick RU).
+function mockTemplatedInterviewDoc(template: GuideTemplate): InterviewSummaryDoc {
+  const goals = templateGoals(template);
+  const questions = templateQuestions(template);
+  const by_goal = goals.map((g, i) => ({
+    goal_id: g.id,
+    points: [
+      {
+        point: `Интервью даёт сигнал по задаче «${g.text}».`,
+        quotes: [{ segment_id: i % 3, quote: "…с первого раза это было неочевидно." }],
+      },
+    ],
+  }));
+  const qStatuses = ["direct", "indirect", "not_answered"] as const;
+  const question_answers = questions.map((q, i) => {
+    const status = qStatuses[i % 3];
+    return {
+      question_id: q.id,
+      status,
+      summary:
+        status === "not_answered"
+          ? ""
+          : `Респондент ответил ${status === "indirect" ? "косвенно, обсуждая другое" : "напрямую"}: коротко по сути вопроса «${q.text}».`,
+      quotes:
+        status === "not_answered"
+          ? []
+          : [{ segment_id: i % 3, quote: "…я бы, наверное, так и сделал." }],
+    };
+  });
+  const hStances = ["supports", "contradicts", "mixed"] as const;
+  const hypothesis_signals = template.hypotheses.map((h, i) => {
+    const stance = hStances[i % 3];
+    const word = stance === "supports" ? "поддерживает" : stance === "contradicts" ? "противоречит" : "неоднозначно относится к";
+    return {
+      hypothesis_id: h.id,
+      stance,
+      note: `Это интервью ${word} гипотезе.`,
+      quotes: [{ segment_id: i % 3, quote: "…на старте мне не хватало доступов." }],
+    };
+  });
+  return {
+    goals,
+    by_goal,
+    notable: [
+      { segment_id: 0, quote: "…честно, пустой дашборд — это самое страшное.", note: "Сильная реакция на пустой экран." },
+    ],
+    hypotheses: template.hypotheses,
+    questions,
+    question_answers,
+    hypothesis_signals,
+  };
 }
 
 // Mirror the Rust effective_product_db (Products library): prefer the cycle's linked product
@@ -2145,9 +2291,14 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
         const iv = interviews.find((r) => r.id === interviewId);
         const cycleId = iv?.cycle_id ?? "";
         const seeded = mockInterviewSummaries[interviewId];
-        const doc: InterviewSummaryDoc = seeded
-          ? structuredClone(seeded.doc)
-          : { goals: deriveGoals(effectiveGuide(cycleId)), by_goal: [], notable: [] };
+        const template = effectiveGuideTemplate(cycleId);
+        // A templated guide always wins, so (re)generating ANY interview in a cycle linked to a
+        // structured guide shows the full distribution — even for the pre-seeded interviews.
+        const doc: InterviewSummaryDoc = !templateIsEmpty(template)
+          ? mockTemplatedInterviewDoc(template)
+          : seeded
+            ? structuredClone(seeded.doc)
+            : { goals: deriveGoals(effectiveGuide(cycleId)), by_goal: [], notable: [] };
         const row: InterviewSummaryRow = {
           id: seeded?.id ?? "summary-" + interviewId,
           cycle_id: cycleId,

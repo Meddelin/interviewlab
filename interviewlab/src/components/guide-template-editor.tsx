@@ -12,7 +12,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import type { GuideTemplate } from "@/lib/tauri";
+import type { GuideTemplate, TemplateItem } from "@/lib/tauri";
+import { templateIsEmpty } from "@/lib/tauri";
 
 // The structured, templated-guide editor (req: "шаблонизировать гайд"). Five fixed blocks the
 // user fills by clicking "+ add": hypotheses to validate, research tasks (= the synthesis
@@ -174,6 +175,86 @@ function Block({
         {addLabel}
       </Button>
     </section>
+  );
+}
+
+// A compact, READ-ONLY preview of a structured guide template — the five blocks with their
+// stable ids (H/G/Q). Used where we want to show the template's SHAPE (e.g. the cycle Overview)
+// rather than the flat rendered markdown. Item ids come straight from the stored, normalized
+// template, so no renumbering is needed here.
+function PreviewBlock({
+  icon: Icon,
+  title,
+  items,
+}: {
+  icon: typeof Target;
+  title: string;
+  items: TemplateItem[];
+}) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <Icon className="size-3.5 text-primary/70" aria-hidden />
+        {title}
+        <span className="font-numeric text-foreground/60">{items.length}</span>
+      </div>
+      <ul className="flex flex-col gap-1">
+        {items.map((it) => (
+          <li key={it.id} className="flex items-start gap-2 text-xs">
+            <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-numeric text-[10px] text-muted-foreground">
+              {it.id}
+            </span>
+            <span className="text-foreground/80">{it.text}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function GuideTemplatePreview({ template }: { template: GuideTemplate }) {
+  if (templateIsEmpty(template)) return null;
+  const mainQuestions = template.main_blocks.flatMap((b) => b.questions);
+  return (
+    <div className="flex flex-col gap-3">
+      <PreviewBlock icon={FlaskConical} title="Гипотезы" items={template.hypotheses} />
+      <PreviewBlock icon={Target} title="Задачи интервью" items={template.tasks} />
+      <PreviewBlock icon={ListChecks} title="Квалифицирующие вопросы" items={template.qualifying_questions} />
+      {/* Main questions: show per themed block so the structure reads. */}
+      {mainQuestions.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+            <Layers className="size-3.5 text-primary/70" aria-hidden />
+            Основная часть вопросов
+            <span className="font-numeric text-foreground/60">{mainQuestions.length}</span>
+          </div>
+          <div className="flex flex-col gap-2 pl-1">
+            {template.main_blocks.map(
+              (b, bi) =>
+                b.questions.length > 0 && (
+                  <div key={bi} className="flex flex-col gap-1">
+                    {b.title.trim() && (
+                      <span className="text-[11px] font-medium text-foreground/70">{b.title}</span>
+                    )}
+                    <ul className="flex flex-col gap-1">
+                      {b.questions.map((it) => (
+                        <li key={it.id} className="flex items-start gap-2 text-xs">
+                          <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-numeric text-[10px] text-muted-foreground">
+                            {it.id}
+                          </span>
+                          <span className="text-foreground/80">{it.text}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ),
+            )}
+          </div>
+        </div>
+      )}
+      <PreviewBlock icon={HelpCircle} title="Вопросы по гипотезам" items={template.hypothesis_questions} />
+    </div>
   );
 }
 
