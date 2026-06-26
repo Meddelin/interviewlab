@@ -11,6 +11,46 @@ clearly. A human will then drive the end‑to‑end test (upload a real intervie
 
 ---
 
+## Updating an existing setup? Read this FIRST (don't repeat verified init)
+
+If this Mac **already ran InterviewLab successfully before** — the app launched, your CLI was active
+and **Test CLI → Available**, and an ASR model was downloaded — then you are doing an **incremental
+update** (a `git pull` brought new code), **not** a fresh initialization. The one‑time setup below
+(§1, §4, §5) was **verified once and stays valid across updates**; re‑doing it wastes time and, for
+the multi‑GB models, bandwidth. **Skip what was already confirmed and only do the delta.**
+
+**Skip (already verified at init — trust it):**
+- **§1 Prerequisites** — Xcode CLT, `brew node/ffmpeg`, Rust, your CLI. Assume installed; (re)install a
+  tool **only if the build actually errors that it's missing**.
+- **§5 CLI / plugin registration** — your manifest under `…/plugins/<id>/manifest.json` **persists**.
+  Do **not** re‑register, re‑select, or overwrite it. (Re‑run **Test CLI** only if an LLM step fails.)
+- **§4 Model downloads** — the whisper + diarization models in the app data dir **persist**. Do **not**
+  re‑download.
+
+**Do ONLY the update:**
+1. `git pull`, then `npm install` (picks up any new JS deps); the next `npm run tauri dev` recompiles
+   the Rust **incrementally** (not from scratch).
+2. Verify **only what this update changed** — read the PR / changelog deltas, exercise just those paths.
+3. Report only **new** source‑side failures per §6B.
+
+> Rule of thumb: an init step is **"verified once, trusted thereafter."** Re‑verify it only if (a) this
+> update's changelog touched it, or (b) something downstream actually fails and points back at it.
+
+**Delta for THIS update (transcription quality + Mac speed):**
+- **Segment shape is fixed at the source.** Whisper used to fragment more and more toward the end of a
+  long interview (a sentence arriving as a few words, sometimes a lone pronoun). The backend now folds
+  consecutive same‑speaker fragments into **sentence‑level segments** before storing (logs
+  `coalesced N → M segments`). Nothing to configure — just confirm late‑interview segments now read as
+  whole sentences, not single words. (Source: `asr.rs` `merge_short_segments`.)
+- **CoreML ANE encoder is now auto‑fetched** — no more manual `.mlmodelc` placement (see §3.1). If you
+  switch to `--features metal,coreml` for the first time and the model was **already** downloaded, just
+  **re‑run the model download once** (Settings → ASR model): it's idempotent (existing files skipped),
+  and that one re‑run triggers the encoder fetch.
+- **Diarization now requests the CoreML execution provider on macOS** (§4) and **decode threads are
+  backend‑aware** (§3.1) — both automatic, nothing to set.
+
+---
+
 ## 0. What "working" looks like (the human's e2e)
 
 So you know what to aim for. The human will do these clicks; you make each step **reachable** and report failures:
@@ -131,22 +171,26 @@ These tune the **same** model (large‑v3) — same weights, accuracy unchanged:
 
 - **Already on by default in code** (you get these just by building with `metal`): **flash attention**
   (a faster GPU attention — measured ~21% faster on CUDA; output is near‑identical, not bit‑identical, with no
-  meaningful accuracy change) and a tuned CPU **thread count** for the log‑mel/sampling front‑end.
-- **Core ML / Apple Neural Engine (the big win) — opt‑in build flag:**
+  meaningful accuracy change) and a **backend‑aware** CPU **thread count** for the log‑mel/sampling front‑end
+  (clamp [4,8] on a GPU build, all‑but‑one core on a CPU build).
+- **Core ML / Apple Neural Engine (the big win) — opt‑in build flag, now turnkey:**
   ```bash
   npm run tauri dev -- --features metal,coreml
   ```
-  This runs whisper's heavy **encoder on the ANE** on top of Metal. It needs a CoreML encoder artifact next to
-  the ggml model in the app data dir:
-  `…/com.interviewlab.app/models/ggml-large-v3-encoder.mlmodelc` (prebuilt ones are published in the Hugging
-  Face repo `ggerganov/whisper.cpp` — download `ggml-large-v3-encoder.mlmodelc.zip` and unzip it there). If the
-  artifact is **absent**, whisper logs a notice and falls back to the Metal encoder, so the build still runs —
-  it just doesn't get the ANE speedup. **The FIRST run with CoreML is slow** (the ANE compiles + caches the
-  model, ~1–2 min); subsequent runs are fast. Building `coreml` needs Xcode (the CoreML framework).
+  This runs whisper's heavy **encoder on the ANE** on top of Metal. It needs a CoreML encoder bundle next to
+  the ggml model (`…/com.interviewlab.app/models/ggml-large-v3-encoder.mlmodelc`) — and the app **now fetches
+  it for you**: on the `coreml` build, downloading an ASR model also best‑effort downloads + unzips the matching
+  `.mlmodelc` from HF `ggerganov/whisper.cpp` next to the `.bin`. **No manual placement.** (If the model was
+  already downloaded before you switched to `coreml`, re‑run the model download once — it's idempotent and that
+  re‑run triggers the encoder fetch.) If the fetch **fails or is absent**, whisper logs a notice and falls back
+  to the Metal encoder, so the build still runs — it just doesn't get the ANE speedup. **The FIRST run with
+  CoreML is slow** (the ANE compiles + caches the model, ~1–2 min); subsequent runs are fast. Building `coreml`
+  needs Xcode (the CoreML framework).
 - **If transcription is still slow:** confirm Metal actually engaged — after a transcription, the transcript's
   engine string should read `@metal`, not `@cpu`. `@cpu` means the `metal` feature/init didn't kick in (a
-  **source** issue per §6B — report it). Diarization is separate (CPU, now multi‑threaded) and on a long
-  interview can take a while; that's expected. Even when a run is slow you don't have to wait blind: you can
+  **source** issue per §6B — report it). Diarization is separate (multi‑threaded; it requests the **CoreML**
+  execution provider on macOS, falling back to CPU per‑op) and on a long interview can take a while; that's
+  expected. Even when a run is slow you don't have to wait blind: you can
   **open the interview and watch it stream live**, and a failed/killed run is **resumable from a checkpoint**
   (no re‑doing the whole file) — see **§4.1**.
 - **Quality:** accuracy is set by the model + decoder, not the platform — Metal/CoreML give near‑identical text
@@ -161,7 +205,9 @@ These tune the **same** model (large‑v3) — same weights, accuracy unchanged:
 - **Whisper (ASR):** in the app → **Settings → ASR model** → download one. Recommend **`large-v3`** (best
   quality, fine on Metal) or **`base`** (fast). Models download into the app data dir.
 - **Diarization (speaker split):** the app fetches the sherpa‑onnx ONNX models (pyannote segmentation +
-  3D‑Speaker embedding) on first use / via a "download diarization models" action. CPU, ~real‑time, no Python.
+  3D‑Speaker embedding) on first use / via a "download diarization models" action. ~real‑time, no Python;
+  multi‑threaded, and on macOS it requests the **CoreML** execution provider (ANE/GPU) with automatic CPU
+  fallback per‑op.
 
 App data dir on macOS: `~/Library/Application Support/com.interviewlab.app/`
 
@@ -367,8 +413,13 @@ Windows-only template; ignore it on macOS.) This is config, not a source bug —
 - The **Metal** path is implemented but **never run on real hardware** — Metal init / performance is unverified.
 - **Dylib bundling for a packaged `.app`** is a known TODO; **dev mode (`tauri dev`) is the supported path**
   for now (it loads the native libs from the build output). A packaged `.dmg` may fail to find the dylibs.
-- **CoreML / Apple Neural Engine** for whisper is wired as the opt-in `coreml` feature (§3.1) — needs the
-  `.mlmodelc` artifact; without it, falls back to the Metal encoder.
+- **CoreML / Apple Neural Engine** for whisper is wired as the opt-in `coreml` feature (§3.1); its
+  `.mlmodelc` artifact is **auto-fetched** at model-download time. If the fetch fails (network/HF), it falls
+  back to the Metal encoder — that's a graceful degrade, not a blocker; only report it if the ANE never
+  engages despite the bundle being present.
+- **CoreML execution provider for diarization** (macOS) is best-effort; if sherpa session-create fails on it,
+  diarization degrades to single-speaker (transcription still succeeds). A persistent diarization failure that
+  traces to the `provider = "coreml"` setting is a **source** issue (flip to `"cpu"` in `diarize.rs`) — report it.
 - `nvml` (NVIDIA‑only) is `cfg`‑gated off macOS; if you ever see an nvml symbol/link error on macOS, that's a
   **source** gating bug — report it.
 
@@ -379,7 +430,9 @@ See `docs/mac-build.md` for the engineering detail behind all of the above.
 ## 7. Quick reference
 
 ```bash
-# run (Metal GPU)
+# run (fastest: Metal GPU + ANE encoder; .mlmodelc auto-fetched on model download)
+cd interviewlab && npm run tauri dev -- --features metal,coreml
+# run (Metal GPU only, no ANE)
 cd interviewlab && npm run tauri dev -- --features metal
 # run (CPU fallback)
 cd interviewlab && npm run tauri dev
