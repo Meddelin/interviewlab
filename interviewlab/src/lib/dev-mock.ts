@@ -64,13 +64,25 @@ import type {
   GuideTemplate,
 } from "./tauri";
 import {
-  EMPTY_TEMPLATE,
   normalizeTemplate,
   renderTemplateMd,
   templateGoals,
   templateIsEmpty,
 } from "./tauri";
 import { MOCK_AUDIO_DATA_URI } from "./mock-audio";
+
+// A module-LOCAL empty template. We deliberately don't import tauri's EMPTY_TEMPLATE here: the
+// guide seed array below references it at module-EVAL time, and tauri.ts ↔ dev-mock.ts form a
+// circular import (tauri imports mockInvoke from here), so the imported const would still be in
+// its temporal dead zone when this module evaluates → a ReferenceError that blanks the app. A
+// local literal sidesteps the cycle entirely.
+const EMPTY_GUIDE_TEMPLATE: GuideTemplate = {
+  hypotheses: [],
+  tasks: [],
+  qualifying_questions: [],
+  main_blocks: [],
+  hypothesis_questions: [],
+};
 
 // Mirror the Rust resolve_guide_write: a structured template (when present) is the source of
 // truth — content_md is rendered from it + goals come from its tasks; otherwise content_md is
@@ -79,11 +91,11 @@ function resolveGuideWrite(
   contentMd: string,
   template: GuideTemplate | undefined,
 ): { content_md: string; template: GuideTemplate; goals: Goal[] } {
-  const t = template ? normalizeTemplate(template) : EMPTY_TEMPLATE;
+  const t = template ? normalizeTemplate(template) : EMPTY_GUIDE_TEMPLATE;
   if (!templateIsEmpty(t)) {
     return { content_md: renderTemplateMd(t), template: t, goals: templateGoals(t) };
   }
-  return { content_md: contentMd, template: EMPTY_TEMPLATE, goals: deriveGoals(contentMd) };
+  return { content_md: contentMd, template: EMPTY_GUIDE_TEMPLATE, goals: deriveGoals(contentMd) };
 }
 
 function cloneGuide(g: Guide): Guide {
@@ -250,7 +262,7 @@ const guides: Guide[] = [
     name: "Activation deep-dive",
     content_md: ACTIVATION_GUIDE_MD,
     goals: [],
-    template: EMPTY_TEMPLATE,
+    template: EMPTY_GUIDE_TEMPLATE,
     created_at: now - 41 * DAY,
     updated_at: now - 3 * DAY,
   },
@@ -259,7 +271,7 @@ const guides: Guide[] = [
     name: "Pricing & packaging",
     content_md: PRICING_GUIDE_MD,
     goals: [],
-    template: EMPTY_TEMPLATE,
+    template: EMPTY_GUIDE_TEMPLATE,
     created_at: now - 22 * DAY,
     updated_at: now - 20 * DAY,
   },
