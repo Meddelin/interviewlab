@@ -292,9 +292,21 @@ pub fn detect_device() -> DeviceInfo {
 
 // Read a 16-bit PCM mono WAV (exactly what our ffmpeg step at -ac 1 -ar 16000
 // produces) into the normalized f32 samples whisper expects ([-1.0, 1.0]).
-// ponytail: a ~40-line parser instead of pulling `hound` as a new dep — the input
-// format is our own and fixed (RIFF/WAVE, fmt=PCM16 mono 16k). Falls back to an
-// error (not silent garbage) if the header isn't what we wrote.
+// The one sample rate whisper.cpp + sherpa diarization operate at. Everything fed to them
+// MUST be at this rate: whisper has no idea what rate its input "really" is — it just assumes
+// 16 kHz. Hand it a 48 kHz buffer and every timestamp it emits is scaled by 48000/16000 = 3×
+// too small, so a 40-minute interview comes back as ~13 minutes of timecodes even though the
+// text and the stored audio are complete. (This was the "40-min interview becomes 10-min"
+// bug.) read_wav_16k_mono below GUARANTEES its output is at this rate.
+pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+// Read a WAV into mono f32 samples AT 16 kHz, resampling if the file isn't already 16 kHz.
+//
+// ponytail: a small parser instead of pulling `hound` as a new dep. We control the input (the
+// ffmpeg prep writes mono 16-bit PCM 16 kHz), but we DON'T blindly trust the rate: a wrong-rate
+// wav reaching whisper silently compresses the whole transcript timeline (see TARGET_SAMPLE_RATE),
+// so we read the real rate and downmix/resample as needed rather than assume. Errors (not silent
+// garbage) on anything we can't interpret.
 // pub(crate): diarize.rs reuses this exact reader (ASR + diarization share the 16k wav).
 pub(crate) fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("open wav: {e}"))?;
@@ -308,6 +320,7 @@ pub(crate) fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     let mut pos = 12usize;
     let mut bits_per_sample = 0u16;
     let mut channels = 0u16;
+    let mut sample_rate = 0u32;
     let mut data: Option<&[u8]> = None;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
@@ -317,6 +330,9 @@ pub(crate) fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
         match id {
             b"fmt " if body_end - body_start >= 16 => {
                 channels = u16::from_le_bytes([bytes[body_start + 2], bytes[body_start + 3]]);
+                sample_rate = u32::from_le_bytes([
+                    bytes[body_start + 4], bytes[body_start + 5], bytes[body_start + 6], bytes[body_start + 7],
+                ]);
                 bits_per_sample = u16::from_le_bytes([bytes[body_start + 14], bytes[body_start + 15]]);
             }
             b"data" => {
@@ -332,16 +348,62 @@ pub(crate) fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     if bits_per_sample != 16 {
         return Err(format!("expected 16-bit PCM, got {bits_per_sample}-bit"));
     }
-    if channels != 1 {
-        return Err(format!("expected mono, got {channels} channels"));
+    if channels == 0 {
+        return Err("wav fmt chunk missing (zero channels)".into());
+    }
+    if sample_rate == 0 {
+        return Err("wav fmt chunk missing (zero sample rate)".into());
     }
 
-    let mut samples = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-        samples.push(s as f32 / 32768.0);
+    // Decode interleaved i16 frames → mono f32 (average the channels; ffmpeg gives us 1, but a
+    // stray stereo file downmixes cleanly rather than erroring or reading at the wrong stride).
+    let ch = channels as usize;
+    let mono: Vec<f32> = data
+        .chunks_exact(2 * ch)
+        .map(|frame| {
+            let sum: f32 = (0..ch)
+                .map(|c| i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]) as f32 / 32768.0)
+                .sum();
+            sum / ch as f32
+        })
+        .collect();
+
+    // Resample to 16 kHz if the source isn't already. Normally a no-op (the prep writes 16 kHz),
+    // so the common path is untouched; it only triggers — and saves the timeline — if a non-16k
+    // wav ever reaches us.
+    if sample_rate == TARGET_SAMPLE_RATE {
+        Ok(mono)
+    } else {
+        log::warn!(
+            target: "interviewlab::asr",
+            "wav at {sample_rate}Hz (not {TARGET_SAMPLE_RATE}Hz) — resampling to 16k so timestamps aren't scaled by {:.3}x",
+            sample_rate as f64 / TARGET_SAMPLE_RATE as f64
+        );
+        Ok(resample_linear(&mono, sample_rate, TARGET_SAMPLE_RATE))
     }
-    Ok(samples)
+}
+
+// Linear-interpolation resample of mono f32 audio from `src_rate` to `dst_rate`. Quality is
+// fine for ASR/diarization as a safety net (the normal path is already 16 kHz so this never
+// runs); the point is to preserve DURATION exactly — out_len = in_len · dst/src — so whisper's
+// timestamps land on the true timeline instead of a scaled one.
+fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    if src_rate == dst_rate || input.is_empty() {
+        return input.to_vec();
+    }
+    let ratio = dst_rate as f64 / src_rate as f64;
+    let out_len = ((input.len() as f64) * ratio).round() as usize;
+    let last = input.len() - 1;
+    (0..out_len)
+        .map(|i| {
+            let src_pos = i as f64 / ratio;
+            let idx = src_pos.floor() as usize;
+            let frac = src_pos - idx as f64;
+            let a = input[idx.min(last)] as f64;
+            let b = input[(idx + 1).min(last)] as f64;
+            (a + (b - a) * frac) as f32
+        })
+        .collect()
 }
 
 // --- DB helpers ---------------------------------------------------------------
@@ -2018,6 +2080,79 @@ mod tests {
         for s in ["просто слова", "местоимение", "он сказал что"] {
             assert!(!ends_sentence(s), "{s:?} should NOT count as a sentence end");
         }
+    }
+
+    // --- sample-rate handling (the "40-min interview becomes 10-min" timing bug) ----
+
+    // Build a minimal PCM16 RIFF/WAVE in memory at the given rate/channels.
+    fn build_wav(sample_rate: u32, channels: u16, samples_i16: &[i16]) -> Vec<u8> {
+        let bits = 16u16;
+        let block_align = channels * (bits / 8);
+        let byte_rate = sample_rate * block_align as u32;
+        let data_len = (samples_i16.len() * 2) as u32;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_len).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&byte_rate.to_le_bytes());
+        v.extend_from_slice(&block_align.to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples_i16 {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    fn write_temp_wav(bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("ilab_wavtest_{}.wav", Uuid::new_v4()));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    // The regression: a 48 kHz wav (1 second of audio) must come back as ~16 kHz worth of
+    // samples (1 second), NOT 48000 samples that whisper would then read as 3 seconds — which
+    // is the inverse of the timeline-compression bug.
+    #[test]
+    fn read_wav_resamples_nonstandard_rate_to_16k() {
+        let one_sec_48k: Vec<i16> = (0..48_000).map(|i| ((i % 200) as i16 - 100) * 50).collect();
+        let path = write_temp_wav(&build_wav(48_000, 1, &one_sec_48k));
+        let out = read_wav_16k_mono(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!((out.len() as i64 - 16_000).abs() <= 2, "1s @48k → ~16000 samples, got {}", out.len());
+    }
+
+    // A 16 kHz wav passes through untouched; a 16 kHz STEREO wav downmixes to the same frame count.
+    #[test]
+    fn read_wav_16k_passthrough_and_stereo_downmix() {
+        let mono: Vec<i16> = (0..1600).map(|i| i as i16).collect();
+        let p = write_temp_wav(&build_wav(16_000, 1, &mono));
+        let out = read_wav_16k_mono(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(out.len(), 1600, "16k mono passes through unchanged");
+
+        let stereo: Vec<i16> = (0..3200).map(|i| i as i16).collect(); // 1600 L/R frames
+        let p2 = write_temp_wav(&build_wav(16_000, 2, &stereo));
+        let out2 = read_wav_16k_mono(&p2).unwrap();
+        std::fs::remove_file(&p2).ok();
+        assert_eq!(out2.len(), 1600, "stereo downmixes to one sample per frame");
+    }
+
+    // resample_linear preserves DURATION (out_len = in_len · dst/src) — the property that keeps
+    // whisper's timestamps on the true timeline.
+    #[test]
+    fn resample_linear_preserves_duration() {
+        let input: Vec<f32> = (0..32_000).map(|i| (i as f32 * 0.01).sin()).collect();
+        assert_eq!(resample_linear(&input, 32_000, 16_000).len(), 16_000); // halve
+        assert_eq!(resample_linear(&input, 32_000, 64_000).len(), 64_000); // double
+        assert_eq!(resample_linear(&input, 16_000, 16_000).len(), input.len()); // identity
+        assert!(resample_linear(&[], 48_000, 16_000).is_empty()); // empty stays empty
     }
 
     async fn make_interview(pool: &SqlitePool) -> String {
