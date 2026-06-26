@@ -654,6 +654,29 @@ export type RoleBreakdownGroup = {
 // The full structured synthesis document (Rust `SynthesisDoc`) stored in the CYCLE row's
 // synthesis.findings_json: goals + findings + open questions + (M10b) an executive summary
 // and an optional by-role breakdown. The diff (M9) reads the findings/goals from here.
+// A cross-interview verdict on one guide hypothesis (Rust HypothesisVerdict). `verdict` ∈
+// confirmed | partially | refuted | inconclusive.
+export type HypothesisVerdict = {
+  id: string; // H1..
+  text: string;
+  verdict: string;
+  confidence: string; // high | medium | low
+  rationale?: string;
+  evidence?: Evidence[];
+};
+
+// A cross-interview consolidated answer to one guide question (Rust QuestionAnswer). `status`
+// ∈ answered | partially | not_answered.
+export type QuestionAnswer = {
+  id: string; // Q1..
+  text: string;
+  section?: string; // qualifying | main | hypothesis
+  block?: string;
+  status: string;
+  answer?: string;
+  evidence?: Evidence[];
+};
+
 export type SynthesisDoc = {
   goals: Goal[];
   findings: Finding[];
@@ -661,6 +684,11 @@ export type SynthesisDoc = {
   // M10b additions (default empty on older rows).
   executive_summary?: string;
   by_role?: RoleBreakdownGroup[];
+  // Templated-guide additions (default empty on older rows / legacy guides).
+  hypotheses?: TemplateItem[];
+  questions?: GuideQuestion[];
+  hypothesis_verdicts?: HypothesisVerdict[];
+  question_answers?: QuestionAnswer[];
 };
 
 // A stored CYCLE synthesis row (Rust `SynthesisRow`). M10b: `content_md` is the
@@ -705,11 +733,34 @@ export type NotableQuote = {
   note: string;
 };
 
+// A per-interview answer to one guide question (Rust InterviewQuestionAnswer). `status` ∈
+// direct | indirect | not_answered.
+export type InterviewQuestionAnswer = {
+  question_id: string;
+  status: string;
+  summary?: string;
+  quotes?: InterviewQuote[];
+};
+
+// A per-interview signal on one hypothesis (Rust InterviewHypothesisSignal). `stance` ∈
+// supports | contradicts | mixed | neutral.
+export type InterviewHypothesisSignal = {
+  hypothesis_id: string;
+  stance: string;
+  note?: string;
+  quotes?: InterviewQuote[];
+};
+
 // The structured per-interview summary doc (Rust `InterviewSummaryDoc`).
 export type InterviewSummaryDoc = {
   goals: Goal[];
   by_goal: InterviewGoalSummary[];
   notable: NotableQuote[];
+  // Templated-guide additions (default empty on older rows / legacy guides).
+  hypotheses?: TemplateItem[];
+  questions?: GuideQuestion[];
+  question_answers?: InterviewQuestionAnswer[];
+  hypothesis_signals?: InterviewHypothesisSignal[];
 };
 
 // A stored per-interview summary row (Rust `InterviewSummaryRow`): structured doc +
@@ -846,12 +897,26 @@ export type DiffGoalRef = {
   text: string;
 };
 
+// One hypothesis compared wave-over-wave (Rust HypothesisDiffEntry). `shift` ∈ unchanged |
+// strengthened | weakened | new | dropped. Verdict labels are authoritative from each
+// synthesis; `why` explains the move.
+export type HypothesisDiffEntry = {
+  hypothesis_id: string;
+  text: string;
+  prev_verdict?: string | null;
+  verdict?: string | null;
+  shift: string;
+  why?: string;
+};
+
 // The full diff document (Rust `DiffDoc`) stored in diff.diff_json: the shared goals +
-// per-goal entries + a one-line summary of what changed this wave.
+// per-goal entries + a one-line summary of what changed this wave + (templated guide) the
+// hypothesis verdict shifts.
 export type DiffDoc = {
   goals: DiffGoalRef[];
   by_goal: GoalDiff[];
   summary: string;
+  hypotheses?: HypothesisDiffEntry[];
 };
 
 // A stored diff row (Rust `DiffRow`).
@@ -960,26 +1025,162 @@ export function deleteRole(id: string): Promise<void> {
 // against a chosen guide (cycle.guide_id). A guide's goals are DERIVED from content_md
 // (stable ids → clean M9 diffs) and returned parsed. Mirror of the Rust `Guide` struct
 // (src-tauri/src/guides.rs); `goals` are the derived Goal[] (same shape as M8's Goal).
+// --- Templated guide (the 5 fixed blocks) -------------------------------------
+// A structured guide the user fills by clicking "+ add": hypotheses to validate, research
+// tasks (= the synthesis goals), qualifying questions, main questions grouped by theme, and
+// hypothesis questions. Stored as `template` (Rust GuideTemplate); the backend renders
+// content_md canonically from it. Empty template → a legacy free-markdown guide.
+
+// One item in a template block (Rust TemplateItem). Ids are stamped server-side: hypotheses
+// H1.., tasks G1.. (the goal ids), every question Q1.. (global, document order).
+export type TemplateItem = {
+  id: string;
+  text: string;
+};
+
+// One themed sub-block of main questions (Rust QuestionBlock).
+export type QuestionBlock = {
+  title: string;
+  questions: TemplateItem[];
+};
+
+// The structured guide template (Rust GuideTemplate). All blocks optional/empty for a
+// free-markdown guide.
+export type GuideTemplate = {
+  hypotheses: TemplateItem[];
+  tasks: TemplateItem[];
+  qualifying_questions: TemplateItem[];
+  main_blocks: QuestionBlock[];
+  hypothesis_questions: TemplateItem[];
+};
+
+// One guide question flattened with its section context (Rust GuideQuestion).
+export type GuideQuestion = {
+  id: string;
+  text: string;
+  section: string; // "qualifying" | "main" | "hypothesis"
+  block?: string;
+};
+
+// An empty template — the starting shape for a new structured guide.
+export const EMPTY_TEMPLATE: GuideTemplate = {
+  hypotheses: [],
+  tasks: [],
+  qualifying_questions: [],
+  main_blocks: [],
+  hypothesis_questions: [],
+};
+
+export function templateIsEmpty(t: GuideTemplate | undefined | null): boolean {
+  if (!t) return true;
+  return (
+    t.hypotheses.length === 0 &&
+    t.tasks.length === 0 &&
+    t.qualifying_questions.length === 0 &&
+    t.hypothesis_questions.length === 0 &&
+    t.main_blocks.every((b) => b.questions.length === 0 && b.title.trim() === "")
+  );
+}
+
+// Re-stamp stable ids + trim/drop blanks, mirroring Rust GuideTemplate::normalized: hypotheses
+// → H1.., tasks → G1.., every question Q1.. (global, document order). One client-side source of
+// truth shared by the structured editor + the browser dev-mock (the real backend re-normalizes
+// authoritatively on write).
+export function normalizeTemplate(t: GuideTemplate): GuideTemplate {
+  const stamp = (items: TemplateItem[], prefix: string, start: number): [TemplateItem[], number] => {
+    const out: TemplateItem[] = [];
+    let n = start;
+    for (const it of items) {
+      const text = (it.text ?? "").trim();
+      if (!text) continue;
+      out.push({ id: `${prefix}${n}`, text });
+      n += 1;
+    }
+    return [out, n];
+  };
+  const [hypotheses] = stamp(t.hypotheses ?? [], "H", 1);
+  const [tasks] = stamp(t.tasks ?? [], "G", 1);
+  let q = 1;
+  const [qualifying_questions, n1] = stamp(t.qualifying_questions ?? [], "Q", q);
+  q = n1;
+  const main_blocks: QuestionBlock[] = [];
+  for (const block of t.main_blocks ?? []) {
+    const [questions, n2] = stamp(block.questions ?? [], "Q", q);
+    q = n2;
+    const title = (block.title ?? "").trim();
+    if (!title && questions.length === 0) continue;
+    main_blocks.push({ title, questions });
+  }
+  const [hypothesis_questions] = stamp(t.hypothesis_questions ?? [], "Q", q);
+  return { hypotheses, tasks, qualifying_questions, main_blocks, hypothesis_questions };
+}
+
+// The goals (Rust Goal[]) derived from a template's tasks — the synthesis spine.
+export function templateGoals(t: GuideTemplate): Goal[] {
+  return t.tasks.map((x) => ({ id: x.id, text: x.text }));
+}
+
+// Every guide question flattened with section context, in document order.
+export function templateQuestions(t: GuideTemplate): GuideQuestion[] {
+  const out: GuideQuestion[] = [];
+  for (const it of t.qualifying_questions) out.push({ id: it.id, text: it.text, section: "qualifying" });
+  for (const b of t.main_blocks)
+    for (const it of b.questions) out.push({ id: it.id, text: it.text, section: "main", block: b.title });
+  for (const it of t.hypothesis_questions) out.push({ id: it.id, text: it.text, section: "hypothesis" });
+  return out;
+}
+
+// Render a (normalized) template into the canonical markdown guide, mirroring Rust
+// render_template_md: tasks under "## Goals" so deriveGoals re-reads identical ids.
+export function renderTemplateMd(t: GuideTemplate): string {
+  if (templateIsEmpty(t)) return "";
+  const lines: string[] = [];
+  const section = (heading: string, items: TemplateItem[]) => {
+    if (items.length === 0) return;
+    lines.push(`## ${heading}`, "");
+    for (const it of items) lines.push(`- ${it.id}: ${it.text}`);
+    lines.push("");
+  };
+  section("Hypotheses", t.hypotheses);
+  section("Goals", t.tasks);
+  section("Qualifying questions", t.qualifying_questions);
+  if (t.main_blocks.some((b) => b.title.trim() !== "" || b.questions.length > 0)) {
+    lines.push("## Main questions", "");
+    t.main_blocks.forEach((b, i) => {
+      lines.push(`### ${b.title.trim() || `Block ${i + 1}`}`, "");
+      for (const it of b.questions) lines.push(`- ${it.id}: ${it.text}`);
+      lines.push("");
+    });
+  }
+  section("Hypothesis questions", t.hypothesis_questions);
+  return lines.join("\n").trimEnd();
+}
+
 export type Guide = {
   id: string;
   name: string;
   content_md: string;
   goals: Goal[];
+  template: GuideTemplate;
   created_at: number;
   updated_at: number;
 };
 
-// Create only needs a name (+ optional markdown body). Mirrors Rust CreateGuide.
+// Create needs a name (+ optional markdown body and/or structured template). Mirrors Rust
+// CreateGuide.
 export type CreateGuideInput = {
   name: string;
   content_md?: string;
+  template?: GuideTemplate;
 };
 
-// Update: id selects the row; name + content_md overwrite (goals re-derived server-side).
+// Update: id selects the row; name + content_md/template overwrite (goals + content_md
+// re-derived/re-rendered server-side).
 export type UpdateGuideInput = {
   id: string;
   name: string;
   content_md: string;
+  template?: GuideTemplate;
 };
 
 export function listGuides(): Promise<Guide[]> {

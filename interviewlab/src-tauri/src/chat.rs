@@ -255,6 +255,9 @@ pub(crate) async fn build_context(pool: &SqlitePool, cycle_id: &str) -> Result<S
             .map_err(|e| e.to_string())?;
     let (cycle_name, product_desc) = cycle.ok_or_else(|| "cycle not found".to_string())?;
     out.push_str(&format!("\n# Cycle: {cycle_name}\n"));
+    // Shared analysis principles — the SAME rules the synthesis/diff stages obey, so the chat
+    // reasons about the guide (hypotheses, every question, indirect answers) consistently.
+    out.push_str(&format!("\n## Analysis principles\n{}\n", crate::synthesis::analysis_system_prompt()));
     if !product_desc.trim().is_empty() {
         out.push_str(&format!("\n## Product\n{}\n", product_desc.trim()));
     }

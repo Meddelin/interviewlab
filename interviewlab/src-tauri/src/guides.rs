@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::synthesis::{derive_goals, Goal};
+use crate::synthesis::{derive_goals, render_template_md, Goal, GuideTemplate};
 use crate::Db;
 
 fn now_ms() -> i64 {
@@ -23,44 +23,82 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// Internal: the raw `guide` row as stored (goals_json is a JSON string pre-parse).
+// Internal: the raw `guide` row as stored (goals_json + template_json are JSON strings).
 #[derive(FromRow)]
 struct GuideRowRaw {
     id: String,
     name: String,
     content_md: String,
     goals_json: String,
+    template_json: String,
     created_at: i64,
     updated_at: i64,
 }
 
-// A guide returned to the frontend: the row + its parsed (derived) goals. We return parsed
-// `goals` so the UI can render "N goals" / the derived-goals list without re-parsing.
+// A guide returned to the frontend: the row + its parsed (derived) goals + the structured
+// `template` (empty for legacy/free-markdown guides). We return parsed `goals` so the UI can
+// render "N goals" without re-parsing, and `template` so the structured editor binds to it.
 #[derive(Serialize, Clone, Debug)]
 pub struct Guide {
     pub id: String,
     pub name: String,
     pub content_md: String,
     pub goals: Vec<Goal>,
+    pub template: GuideTemplate,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-// Parse a stored row into the returned Guide. goals_json is the cache; if it's empty/stale
-// ('[]' from the data-migration) we fall back to deriving from content_md so the UI never
-// shows zero goals for a guide that actually has them.
+// Parse a stored row into the returned Guide. When the guide carries a structured template,
+// its goals come from the template's TASKS (the stable spine); otherwise we use the cached
+// goals_json, falling back to deriving from content_md so the UI never shows zero goals for a
+// guide that actually has them.
 fn parse_guide(row: GuideRowRaw) -> Guide {
-    let mut goals: Vec<Goal> = serde_json::from_str(&row.goals_json).unwrap_or_default();
-    if goals.is_empty() {
-        goals = derive_goals(&row.content_md);
-    }
+    let template = GuideTemplate::parse(&row.template_json);
+    let goals: Vec<Goal> = if !template.is_empty() {
+        template.goals()
+    } else {
+        let cached: Vec<Goal> = serde_json::from_str(&row.goals_json).unwrap_or_default();
+        if cached.is_empty() {
+            derive_goals(&row.content_md)
+        } else {
+            cached
+        }
+    };
     Guide {
         id: row.id,
         name: row.name,
         content_md: row.content_md,
         goals,
+        template,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+// What a write stores for a guide: when a structured `template` is provided, it is the source
+// of truth — content_md is RENDERED from it canonically (so derive_goals + chat + back-compat
+// keep working) and goals come from its tasks. When no template is provided (raw-markdown
+// edit / legacy create), the incoming content_md is stored verbatim and goals are derived
+// from it. Pure so it's unit-tested without a DB.
+struct GuideWrite {
+    content_md: String,
+    template: GuideTemplate,
+    goals: Vec<Goal>,
+}
+
+fn resolve_guide_write(content_md: &str, template: &GuideTemplate) -> GuideWrite {
+    let template = template.normalized();
+    if !template.is_empty() {
+        let goals = template.goals();
+        let content_md = render_template_md(&template);
+        GuideWrite { content_md, template, goals }
+    } else {
+        GuideWrite {
+            content_md: content_md.to_string(),
+            template: GuideTemplate::default(),
+            goals: derive_goals(content_md),
+        }
     }
 }
 
@@ -69,20 +107,26 @@ pub struct CreateGuide {
     pub name: String,
     #[serde(default)]
     pub content_md: String,
+    // The structured template (empty/absent → a free-markdown guide).
+    #[serde(default)]
+    pub template: GuideTemplate,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateGuide {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub content_md: String,
+    #[serde(default)]
+    pub template: GuideTemplate,
 }
 
 // --- pool-taking helpers (the real SQL; unit-tested below) --------------------
 
 async fn list_guides_db(pool: &SqlitePool) -> Result<Vec<Guide>, sqlx::Error> {
     let rows = sqlx::query_as::<_, GuideRowRaw>(
-        "SELECT id, name, content_md, goals_json, created_at, updated_at \
+        "SELECT id, name, content_md, goals_json, template_json, created_at, updated_at \
          FROM guide ORDER BY updated_at DESC",
     )
     .fetch_all(pool)
@@ -92,7 +136,8 @@ async fn list_guides_db(pool: &SqlitePool) -> Result<Vec<Guide>, sqlx::Error> {
 
 async fn get_guide_db(pool: &SqlitePool, id: &str) -> Result<Option<Guide>, sqlx::Error> {
     let row = sqlx::query_as::<_, GuideRowRaw>(
-        "SELECT id, name, content_md, goals_json, created_at, updated_at FROM guide WHERE id = ?",
+        "SELECT id, name, content_md, goals_json, template_json, created_at, updated_at \
+         FROM guide WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -103,17 +148,20 @@ async fn get_guide_db(pool: &SqlitePool, id: &str) -> Result<Option<Guide>, sqlx
 async fn create_guide_db(pool: &SqlitePool, req: &CreateGuide) -> Result<Guide, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let ts = now_ms();
-    // Derive + cache goals at write time so reads are cheap + goal_ids are stable.
-    let goals = derive_goals(&req.content_md);
-    let goals_json = serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into());
+    // A structured template (when present) is the source of truth: content_md is rendered
+    // from it, goals come from its tasks. Otherwise the incoming content_md is stored verbatim.
+    let w = resolve_guide_write(&req.content_md, &req.template);
+    let goals_json = serde_json::to_string(&w.goals).unwrap_or_else(|_| "[]".into());
+    let template_json = serde_json::to_string(&w.template).unwrap_or_else(|_| "{}".into());
     sqlx::query(
-        "INSERT INTO guide (id, name, content_md, goals_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO guide (id, name, content_md, goals_json, template_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(req.name.trim())
-    .bind(&req.content_md)
+    .bind(&w.content_md)
     .bind(&goals_json)
+    .bind(&template_json)
     .bind(ts)
     .bind(ts)
     .execute(pool)
@@ -122,16 +170,19 @@ async fn create_guide_db(pool: &SqlitePool, req: &CreateGuide) -> Result<Guide, 
 }
 
 async fn update_guide_db(pool: &SqlitePool, req: &UpdateGuide) -> Result<Guide, sqlx::Error> {
-    // Re-derive goals from the new content so goals_json stays the source of truth + ids
-    // stay stable across edits (derive_goals keeps explicit "G1:" tags + positional ids).
-    let goals = derive_goals(&req.content_md);
-    let goals_json = serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into());
+    // Re-render content_md + re-derive goals + re-stamp template ids from the new content so
+    // goals_json/template_json stay the source of truth and ids stay stable across edits.
+    let w = resolve_guide_write(&req.content_md, &req.template);
+    let goals_json = serde_json::to_string(&w.goals).unwrap_or_else(|_| "[]".into());
+    let template_json = serde_json::to_string(&w.template).unwrap_or_else(|_| "{}".into());
     sqlx::query(
-        "UPDATE guide SET name = ?, content_md = ?, goals_json = ?, updated_at = ? WHERE id = ?",
+        "UPDATE guide SET name = ?, content_md = ?, goals_json = ?, template_json = ?, updated_at = ? \
+         WHERE id = ?",
     )
     .bind(req.name.trim())
-    .bind(&req.content_md)
+    .bind(&w.content_md)
     .bind(&goals_json)
+    .bind(&template_json)
     .bind(now_ms())
     .bind(&req.id)
     .execute(pool)
@@ -199,6 +250,7 @@ mod tests {
             &CreateGuide {
                 name: "Activation guide".into(),
                 content_md: "Goals:\n- G1: Why do accounts stall?\n- G2: Which step confuses?\n\nTarget conclusions:\n- A ranked list.".into(),
+                template: GuideTemplate::default(),
             },
         )
         .await
@@ -222,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn update_rederives_and_delete_unlinks_cycle() {
         let pool = test_pool().await;
-        let g = create_guide_db(&pool, &CreateGuide { name: "G".into(), content_md: "Goals:\n- A".into() })
+        let g = create_guide_db(&pool, &CreateGuide { name: "G".into(), content_md: "Goals:\n- A".into(), template: GuideTemplate::default() })
             .await.unwrap();
         assert_eq!(g.goals.len(), 1);
 
@@ -230,6 +282,7 @@ mod tests {
             id: g.id.clone(),
             name: "G2".into(),
             content_md: "Goals:\n- A\n- B\n- C".into(),
+            template: GuideTemplate::default(),
         }).await.unwrap();
         assert_eq!(updated.name, "G2");
         assert_eq!(updated.goals.len(), 3, "goals re-derived on update");
