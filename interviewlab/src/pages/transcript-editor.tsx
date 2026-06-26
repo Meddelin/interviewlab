@@ -12,6 +12,7 @@ import {
   Check,
   ChevronDown,
   FileText,
+  GitCompareArrows,
   ListTree,
   Loader2,
   Pause,
@@ -20,6 +21,7 @@ import {
   RotateCcw,
   Save,
   Trash2,
+  Undo2,
   Users,
   Wand2,
   X,
@@ -88,14 +90,8 @@ import { EMPTY_LIVE_ASR, useLiveAsrStore } from "@/lib/live-asr-store";
 import { LiveTranscriptView } from "@/components/live-transcript-view";
 import { mockAudioSrc } from "@/lib/dev-mock";
 import { formatTimecode } from "@/lib/format";
+import { wordDiff, textChanged } from "@/lib/word-diff";
 import { cn } from "@/lib/utils";
-
-// Version Select labels (raw arrives in M4, cleaned in M7, edited is what we write).
-const KIND_LABEL: Record<string, string> = {
-  raw: "Raw",
-  cleaned: "Cleaned",
-  edited: "Edited",
-};
 
 // A local, editable participant (id may be a client temp id until saved). `role` is now a
 // role-library id (M10a) rather than the old fixed enum; seeded ids equal the old enum
@@ -373,10 +369,13 @@ function SegmentLine({
   selected,
   canRewrite,
   rewriting,
+  baseline,
+  showDiff,
   onPlay,
   onText,
   onToggleSelect,
   onRewrite,
+  onRevert,
 }: {
   segment: Segment;
   index: number;
@@ -387,12 +386,27 @@ function SegmentLine({
   canRewrite: boolean;
   // This row's rewrite is in flight (the CLI is cleaning just this segment).
   rewriting: boolean;
+  // The original (raw) text for this segment, or null if there's no baseline to compare to.
+  baseline: string | null;
+  // Global "show changes" toggle: when on, every changed row's diff is expanded.
+  showDiff: boolean;
   onPlay: () => void;
   onText: (text: string) => void;
   onToggleSelect: (e: React.MouseEvent) => void;
   onRewrite: () => void;
+  // Restore this segment's text to its baseline (original).
+  onRevert: () => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  // Has this segment's text diverged from the original? Drives the "Changed" chip + diff.
+  const changed = baseline != null && textChanged(baseline, segment.text);
+  // Per-row diff expansion: the chip toggles just this row; the global toggle forces all open.
+  const [diffOpen, setDiffOpen] = useState(false);
+  const diffShown = changed && (showDiff || diffOpen);
+  const diffParts = useMemo(
+    () => (diffShown ? wordDiff((baseline ?? "").trim(), segment.text.trim()) : []),
+    [diffShown, baseline, segment.text],
+  );
 
   // ponytail: auto-grow the textarea to fit its content so it NEVER scrolls internally
   // (the field has overflow-hidden; we drive height from scrollHeight). We re-measure on
@@ -519,32 +533,103 @@ function SegmentLine({
           )}
         />
 
-        {/* Per-segment rewrite — the "Хуйня, переписывай" button. Re-cleans JUST this segment
-            via the CLI (plain text in, plain text out) and swaps the result into the field. This
-            is the per-segment replacement for whole-transcript cleanup: one segment in isolation,
-            so the model has nothing to drift across and hallucinates far less. A visible label on
-            every row (subtle at rest, accent on hover); a spinner while its own request runs. */}
-        {canRewrite && (
-          <button
-            type="button"
-            onClick={onRewrite}
-            disabled={rewriting}
-            title="Переписать этот сегмент через модель"
-            aria-label={`Хуйня, переписывай — переписать сегмент ${index + 1}`}
-            className={cn(
-              "mt-1 flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
-              rewriting
-                ? "border-primary/40 bg-primary/10 text-primary"
-                : "border-transparent text-muted-foreground/70 hover:border-border hover:bg-secondary/60 hover:text-primary focus-visible:border-border focus-visible:text-primary",
-            )}
-          >
-            {rewriting ? (
-              <Loader2 className="size-3 shrink-0 animate-spin" />
-            ) : (
-              <Wand2 className="size-3 shrink-0" />
-            )}
-            {rewriting ? "Переписываю…" : "Хуйня, переписывай"}
-          </button>
+        {/* Per-row controls: rewrite, a "Changed" chip (when the text diverged from the
+            original), and Revert. The chip toggles this row's inline diff; the global "Changes"
+            header toggle forces every changed row's diff open. */}
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {/* Per-segment rewrite — the "Хуйня, переписывай" button. Re-cleans JUST this segment
+              via the CLI (plain text in, plain text out) and swaps the result into the field. This
+              is the per-segment replacement for whole-transcript cleanup: one segment in isolation,
+              so the model has nothing to drift across and hallucinates far less. A spinner while
+              its own request runs. */}
+          {canRewrite && (
+            <button
+              type="button"
+              onClick={onRewrite}
+              disabled={rewriting}
+              title="Переписать этот сегмент через модель"
+              aria-label={`Хуйня, переписывай — переписать сегмент ${index + 1}`}
+              className={cn(
+                "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
+                rewriting
+                  ? "border-primary/40 bg-primary/10 text-primary"
+                  : "border-transparent text-muted-foreground/70 hover:border-border hover:bg-secondary/60 hover:text-primary focus-visible:border-border focus-visible:text-primary",
+              )}
+            >
+              {rewriting ? (
+                <Loader2 className="size-3 shrink-0 animate-spin" />
+              ) : (
+                <Wand2 className="size-3 shrink-0" />
+              )}
+              {rewriting ? "Переписываю…" : "Хуйня, переписывай"}
+            </button>
+          )}
+
+          {changed && (
+            <button
+              type="button"
+              onClick={() => setDiffOpen((o) => !o)}
+              aria-expanded={diffShown}
+              title="Показать, что изменилось относительно оригинала"
+              className={cn(
+                "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
+                diffShown
+                  ? "border-status-importing/40 bg-status-importing/10 text-status-importing"
+                  : "border-transparent text-status-importing/80 hover:border-status-importing/40 hover:bg-status-importing/10",
+              )}
+            >
+              <GitCompareArrows className="size-3 shrink-0" />
+              Изменено
+            </button>
+          )}
+
+          {changed && (
+            <button
+              type="button"
+              onClick={onRevert}
+              title="Вернуть исходный текст сегмента"
+              aria-label={`Вернуть исходный текст сегмента ${index + 1}`}
+              className="flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/70 transition-colors hover:border-border hover:bg-secondary/60 hover:text-foreground focus-visible:border-border focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              <Undo2 className="size-3 shrink-0" />
+              Вернуть
+            </button>
+          )}
+        </div>
+
+        {/* Inline word diff (GitHub-style): deletions struck through in red, insertions in
+            green. Read-only — editing happens in the textarea above; this just shows what moved
+            relative to the original transcript. */}
+        {diffShown && (
+          <div className="mt-1.5 rounded-md border border-border bg-secondary/30 px-2.5 py-1.5">
+            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              <GitCompareArrows className="size-3 shrink-0" />
+              Изменения относительно оригинала
+            </div>
+            <p className="text-[13px] leading-relaxed break-words whitespace-pre-wrap">
+              {diffParts.map((p, i) =>
+                p.type === "eq" ? (
+                  <span key={i} className="text-foreground/70">
+                    {p.value}
+                  </span>
+                ) : p.type === "del" ? (
+                  <del
+                    key={i}
+                    className="rounded-sm bg-status-error/15 text-status-error line-through decoration-status-error/60"
+                  >
+                    {p.value}
+                  </del>
+                ) : (
+                  <ins
+                    key={i}
+                    className="rounded-sm bg-status-ready/15 text-status-ready no-underline"
+                  >
+                    {p.value}
+                  </ins>
+                ),
+              )}
+            </p>
+          </div>
         )}
       </div>
     </div>
@@ -570,11 +655,14 @@ function TurnBlock({
   selected,
   canRewrite,
   rewritingIndex,
+  baselines,
+  showDiff,
   onAssignTurn,
   onPlay,
   onText,
   onToggleSelect,
   onRewrite,
+  onRevert,
 }: {
   turn: { speakerLabel: string; startMs: number; segmentIndices: number[] };
   segments: Segment[];
@@ -589,11 +677,15 @@ function TurnBlock({
   // Whether per-segment rewrite is available, and which segment index is currently rewriting.
   canRewrite: boolean;
   rewritingIndex: number | null;
+  // Per-segment original text (indexed like `segments`) + the global show-changes toggle.
+  baselines: (string | null)[];
+  showDiff: boolean;
   onAssignTurn: (label: string) => void;
   onPlay: (index: number) => void;
   onText: (index: number, text: string) => void;
   onToggleSelect: (index: number, e: React.MouseEvent) => void;
   onRewrite: (index: number) => void;
+  onRevert: (index: number) => void;
 }) {
   return (
     <div className="flex flex-col gap-0.5 py-1.5">
@@ -636,10 +728,13 @@ function TurnBlock({
             selected={selected.has(i)}
             canRewrite={canRewrite}
             rewriting={rewritingIndex === i}
+            baseline={baselines[i] ?? null}
+            showDiff={showDiff}
             onPlay={() => onPlay(i)}
             onText={(t) => onText(i, t)}
             onToggleSelect={(e) => onToggleSelect(i, e)}
             onRewrite={() => onRewrite(i)}
+            onRevert={() => onRevert(i)}
           />
         ))}
       </div>
@@ -680,6 +775,11 @@ export function TranscriptEditorPage() {
     interviewId,
     activeKind,
   );
+  // The pristine ORIGINAL (raw) transcript — the baseline the per-segment diff compares
+  // against. Loaded independently of the working version so we can show "what changed vs the
+  // original" even after the edited version is what's being shown/edited. Returns null when
+  // there's no raw version (then there's simply nothing to diff against).
+  const { data: baselineVersion } = useTranscriptVersion(interviewId, "raw");
   const { data: participantsData } = useParticipants(interviewId);
   const { data: rolesData } = useRoles();
   const roles = useMemo(() => rolesData ?? [], [rolesData]);
@@ -742,6 +842,8 @@ export function TranscriptEditorPage() {
   // Which right-pane view is shown: the transcript segments or the per-interview Summary
   // artifact (Milestone 10b).
   const [pane, setPane] = useState<"transcript" | "summary">("transcript");
+  // Global "show changes" toggle: expand every changed segment's diff vs the original at once.
+  const [showDiff, setShowDiff] = useState(false);
   const waveRef = useRef<WaveformHandle | null>(null);
 
   // Seed segments from the loaded version whenever the version changes. We coalesce the raw
@@ -840,6 +942,52 @@ export function TranscriptEditorPage() {
     }
     return out;
   }, [segments]);
+
+  // ── Per-segment diff baseline ──
+  // The original transcript, coalesced the same way the editor coalesces the working copy, so
+  // its paragraph boundaries line up with the displayed segments for a clean 1:1 comparison.
+  const baselineSegs = useMemo(
+    () => (baselineVersion ? coalesceSegments(baselineVersion.segments) : []),
+    [baselineVersion],
+  );
+  // Original text per displayed segment (indexed like `segments`), matched by MAXIMUM time
+  // overlap. Timing is immutable (spec §4.5), so overlap is a stable anchor that survives
+  // coalescing-granularity differences and any boundary shift — far more robust than matching
+  // by exact start. Falls back to the nearest paragraph when spans don't overlap. null when
+  // there's no original to compare against.
+  const baselines = useMemo<(string | null)[]>(() => {
+    if (baselineSegs.length === 0) return segments.map(() => null);
+    return segments.map((seg) => {
+      let bestText: string | null = null;
+      let bestOverlap = -Infinity;
+      for (const b of baselineSegs) {
+        const overlap =
+          Math.min(seg.end_ms, b.end_ms) - Math.max(seg.start_ms, b.start_ms);
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestText = b.text.trim();
+        }
+      }
+      return bestText;
+    });
+  }, [segments, baselineSegs]);
+
+  // How many displayed segments differ from their original (drives the header toggle + count).
+  const changedCount = useMemo(
+    () =>
+      segments.reduce((acc, s, i) => {
+        const base = baselines[i];
+        return acc + (base != null && textChanged(base, s.text) ? 1 : 0);
+      }, 0),
+    [segments, baselines],
+  );
+
+  // Restore a segment's text to its original (the Revert action on a changed row).
+  function revertSegment(index: number) {
+    const base = baselines[index];
+    if (base == null) return;
+    setText(index, base);
+  }
 
   // Resolve a segment's speaker_label → a role color + display label. A bound participant
   // wins; else a bare role id (e.g. legacy "interviewer") resolves directly against the
@@ -1069,8 +1217,6 @@ export function TranscriptEditorPage() {
     navigate(`/cycles/${cycleId}`);
   }
 
-  const availableKinds = versions?.map((v) => v.kind) ?? [];
-
   return (
     // Lives INSIDE the shell now (under the global header), so this fills its pane rather
     // than the viewport. The header below is a CONTEXTUAL SUB-TOOLBAR, not a shell replacement.
@@ -1145,27 +1291,34 @@ export function TranscriptEditorPage() {
             </span>
           )}
 
-          {/* Version Select + Save are transcript-only; the Summary view owns its own
-              Run/Save controls inside the panel (M10b). */}
+          {/* Changes toggle + Save are transcript-only; the Summary view owns its own
+              Run/Save controls inside the panel (M10b). The old raw/cleaned/edited version
+              Select is gone — all editing happens in this one window, and "what changed vs the
+              original" is now answered inline per segment instead of by switching versions. */}
           {pane === "transcript" && !isLive && (
             <>
-              {/* Version Select (raw / cleaned / edited). */}
-              <Select value={activeKind} onValueChange={setActiveKind}>
-                <SelectTrigger size="sm" className="h-7 min-w-24">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent align="end">
-                  {(["raw", "cleaned", "edited"] as const).map((k) => (
-                    <SelectItem
-                      key={k}
-                      value={k}
-                      disabled={!availableKinds.includes(k)}
-                    >
-                      {KIND_LABEL[k]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {/* Show/hide every changed segment's diff at once. Only shown when something
+                  actually differs from the original (otherwise there's nothing to compare). */}
+              {changedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowDiff((s) => !s)}
+                  aria-pressed={showDiff}
+                  title="Показать изменения относительно оригинала по всем сегментам"
+                  className={cn(
+                    "flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
+                    showDiff
+                      ? "border-status-importing/40 bg-status-importing/10 text-status-importing"
+                      : "border-border text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <GitCompareArrows className="size-3.5" />
+                  {showDiff ? "Скрыть изменения" : "Изменения"}
+                  <span className="font-numeric tabular-nums rounded bg-status-importing/20 px-1 text-[10px] text-status-importing">
+                    {changedCount}
+                  </span>
+                </button>
+              )}
 
               <Button
                 size="sm"
@@ -1333,6 +1486,8 @@ export function TranscriptEditorPage() {
                         selected={selected}
                         canRewrite={editable}
                         rewritingIndex={rewritingIndex}
+                        baselines={baselines}
+                        showDiff={showDiff}
                         onAssignTurn={(label) =>
                           assignTurn(turn.segmentIndices, label)
                         }
@@ -1340,6 +1495,7 @@ export function TranscriptEditorPage() {
                         onText={(i, t) => setText(i, t)}
                         onToggleSelect={(i, e) => toggleSelect(i, e)}
                         onRewrite={(i) => rewriteSegmentAt(i)}
+                        onRevert={(i) => revertSegment(i)}
                       />
                     );
                   })}
