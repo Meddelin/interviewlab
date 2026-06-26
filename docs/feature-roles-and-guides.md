@@ -2,6 +2,8 @@
 
 User-requested features layered on the MVP, updated per feedback. Implemented **after M9** (they change the schema and touch M2/M5/M8/M9 files). Needs migration `0002`.
 
+> **Follow-up:** the guide later gained a **structured template** (5 fixed blocks: hypotheses, tasks/goals, qualifying questions, themed main questions, hypothesis questions) and the synthesis/diff now answer the whole guide (hypothesis verdicts + per-question answers). See **[feature-guide-template.md](feature-guide-template.md)** (migration `0008`). The §3 synthesis format below is the foundation it builds on.
+
 ## 1. Custom role library — flat list, no flag
 **Today:** participant role is a fixed enum (interviewer/respondent/observer/other) in the editor (M5).
 **New:** a user-managed **flat list of roles** (CRUD): `Interviewer`, `Фронт`, `Дизайнер`, `Продакт`, … Reusable across all cycles.
