@@ -1484,7 +1484,7 @@ async fn diarize_and_store(
             Ok(turns) => {
                 crate::diarize::assign_speakers(&mut segments, &turns);
                 let n_spk = turns.iter().map(|t| t.speaker).collect::<std::collections::BTreeSet<_>>().len();
-                engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
+                engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/wespeaker-resnet34@cpu({n_spk}spk)");
                 emit_diar(app, interview_id, "done", 100, Some(n_spk as i32));
             }
             Err(e) => {
@@ -1810,7 +1810,7 @@ pub async fn rediarize_interview(
         .as_deref()
         .map(|e| e.split(" + ").next().unwrap_or(e).to_string())
         .unwrap_or_else(|| "whisper.cpp".to_string());
-    let engine = format!("{base_engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
+    let engine = format!("{base_engine} + sherpa-onnx:pyannote-seg-3.0/wespeaker-resnet34@cpu({n_spk}spk)");
     let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
     store_raw_transcript_db(&db.pool, &interview_id, raw.language.as_deref(), &engine, &segments_json)
         .await
