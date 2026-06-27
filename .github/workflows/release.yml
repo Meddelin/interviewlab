@@ -85,6 +85,14 @@ jobs:
           # pre-release; a bare vX.Y.Z publishes as a full release.
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+      # Diagnostic: list the native dylibs sherpa-onnx-sys dropped next to the binary so the
+      # macOS `frameworks` bundling list (tauri.macos.conf.json) can be verified/corrected.
+      # `always()` so it still runs if the bundling step fails on a wrong/missing dylib name.
+      - name: (macOS) list native dylibs
+        if: ${{ always() && runner.os == 'macOS' }}
+        working-directory: interviewlab/src-tauri
+        run: ls -la target/${{ matrix.rust_target }}/release/*.dylib 2>/dev/null || echo "no dylibs found"
+
   # ---------------------------------------------------------------------------------------------
   # OPTIONAL: Windows + CUDA build. GitHub-hosted runners have NO Nvidia GPU/Toolkit, so this MUST
   # run on a SELF-HOSTED runner on the RTX box (CUDA Toolkit 13.3 + Ninja + vcvars — see Cargo.toml
