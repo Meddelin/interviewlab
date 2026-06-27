@@ -30,10 +30,13 @@ jobs:
           - platform: macos-14
             args: "--target aarch64-apple-darwin --features metal,coreml"
             rust_target: aarch64-apple-darwin
-          # ---- Windows: default CPU build (no CUDA feature). sherpa native libs come via cargo build-script. ----
+          # ---- Windows: GPU (CUDA) build. nvcc compiles the whisper.cpp CUDA kernels in CI WITHOUT
+          #      a physical GPU (a GPU is only needed at runtime). Target hardware is Windows+Nvidia,
+          #      so we ship ONLY the CUDA build (no CPU variant). sherpa libs come via cargo build-script. ----
           - platform: windows-latest
-            args: ""
+            args: "--features cuda"
             rust_target: x86_64-pc-windows-msvc
+            cuda: true
 
     runs-on: ${{ matrix.platform }}
 
@@ -58,6 +61,24 @@ jobs:
         with:
           workspaces: interviewlab/src-tauri
 
+      # --- Windows GPU build toolchain: MSVC env + Ninja + CUDA Toolkit. nvcc needs no GPU to
+      #     COMPILE the kernels; the toolkit just provides nvcc + cuBLAS headers/libs. ---
+      - name: Setup MSVC (vcvars)
+        if: matrix.cuda
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Ninja
+        if: matrix.cuda
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install CUDA Toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+
       - name: Install frontend dependencies
         working-directory: interviewlab
         run: npm ci
@@ -70,6 +91,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # NO APPLE_* / APPLE_CERTIFICATE / WINDOWS_CERTIFICATE secrets — builds stay UNSIGNED on purpose.
+          # CUDA build knobs (empty on macOS → ignored). Ninja generator (the VS+CUDA generator can't
+          # resolve CudaToolkitDir reliably). The 12.6 toolkit has no native Blackwell (sm_120) SASS, so we
+          # ship real SASS for Ampere/Ada + a sm_90 VIRTUAL (PTX) arch the Blackwell driver JIT-compiles at
+          # runtime — so the one installer runs on RTX 30/40/50-series.
+          CMAKE_GENERATOR: ${{ matrix.cuda && 'Ninja' || '' }}
+          CMAKE_GENERATOR_INSTANCE: ""
+          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda && '86-real;89-real;90-virtual' || '' }}
         with:
           projectPath: interviewlab
           args: ${{ matrix.args }}
