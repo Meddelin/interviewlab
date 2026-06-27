@@ -85,9 +85,15 @@ async fn init_db(app: &tauri::AppHandle) -> Result<Db, Box<dyn std::error::Error
         .filename(&db_path)
         .create_if_missing(true)
         .foreign_keys(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // Wait up to 5s for a held write lock instead of failing instantly with SQLITE_BUSY —
+        // WAL still serializes writers, and our long synthesis/transcript writes can overlap UI reads.
+        .busy_timeout(std::time::Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
+        // Bounded pool: a handful of connections is plenty for a single-user desktop app, and the
+        // cap keeps concurrent writers queued (vs. piling onto the SQLITE_BUSY path) for one SQLite file.
+        .max_connections(5)
         .connect_with(options)
         .await
         .map_err(|e| {
@@ -201,6 +207,8 @@ pub fn run() {
             adapter::run_task,
             adapter::adapter_meta_instructions,
             adapter::plugin_manifest_schema,
+            adapter::save_plugin_manifest,
+            adapter::delete_plugin,
             cleanup::clean_transcript,
             cleanup::rewrite_segment,
             synthesis::get_synthesis,

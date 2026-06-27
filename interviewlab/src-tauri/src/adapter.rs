@@ -1255,7 +1255,11 @@ async fn spawn_once(
         .current_dir(neutral_cwd()) // neutral cwd: no stray CLAUDE.md (spec §7.2)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // On timeout the child future is dropped — make that drop actually KILL the process
+        // (tokio doesn't by default), so a stuck CLI can't outlive the watchdog as an orphan
+        // holding GPU/network limits (roadmap §H: kill_on_drop on both Commands).
+        .kill_on_drop(true);
     // Don't pop a console window on Windows for the headless CLI call.
     // tokio::process::Command exposes creation_flags inherently on Windows.
     #[cfg(windows)]
@@ -1916,6 +1920,77 @@ pub fn adapter_meta_instructions() -> String {
 #[tauri::command]
 pub fn plugin_manifest_schema() -> String {
     MANIFEST_SCHEMA.to_string()
+}
+
+// Save (create or overwrite) a user plugin manifest from the Settings UI: validate the
+// JSON against the SAME loader path (`parse_manifest`, which validates the capability
+// blocks), enforce the folder-name == id rule the loader applies on discovery, then write
+// it to `plugins/<id>/manifest.json` via the same `std::fs::write` the first-run writer uses
+// (creating the folder). A validation/IO failure is returned as a TEXT error (never panics);
+// the UI surfaces it. This is the manual counterpart to "an agent drops a folder in plugins/".
+#[tauri::command]
+pub fn save_plugin_manifest(
+    app: tauri::AppHandle,
+    id: String,
+    manifest_json: String,
+) -> Result<(), String> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("Укажите id плагина (это и имя папки).".into());
+    }
+    // Reject ids that aren't a safe single folder name (no path separators / traversal).
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("Недопустимый id плагина: `{id}`."));
+    }
+    // Validate through the loader's own path so the UI can't write a manifest that would
+    // load as "(invalid plugin)". `parse_manifest` runs serde + the capability-block checks.
+    let adapter = parse_manifest(&manifest_json)
+        .map_err(|e| format!("Манифест не прошёл валидацию: {e}"))?;
+    if adapter.id != id {
+        return Err(format!(
+            "Поле `id` в манифесте (\"{}\") должно совпадать с именем папки (\"{}\").",
+            adapter.id, id
+        ));
+    }
+    // Don't let the manual UI clobber a bundled (builtin) descriptor's folder.
+    if bundled_descriptors().iter().any(|(b, _)| *b == id) {
+        return Err(format!("`{id}` — встроенный плагин, его нельзя перезаписать вручную."));
+    }
+    let folder = plugins_dir(&app)?.join(&id);
+    std::fs::create_dir_all(&folder).map_err(|e| format!("Не удалось создать папку плагина: {e}"))?;
+    let manifest = folder.join("manifest.json");
+    // Same writer as the first-run path (ensure_bundled_on_disk): plain std::fs::write.
+    std::fs::write(&manifest, manifest_json.as_bytes())
+        .map_err(|e| format!("Не удалось записать manifest.json: {e}"))?;
+    log::info!(
+        target: "interviewlab::adapter",
+        "save_plugin_manifest: wrote {}", manifest.display()
+    );
+    Ok(())
+}
+
+// Delete a USER plugin folder (`plugins/<id>`). Builtin (bundled) ids are refused — they'd
+// just be re-written on the next first-run pass anyway, and the user means a manifest they
+// authored. Returns a text error if the folder is missing or removal fails (never panics).
+#[tauri::command]
+pub fn delete_plugin(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("Не указан id плагина.".into());
+    }
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("Недопустимый id плагина: `{id}`."));
+    }
+    if bundled_descriptors().iter().any(|(b, _)| *b == id) {
+        return Err(format!("`{id}` — встроенный плагин, его нельзя удалить."));
+    }
+    let folder = plugins_dir(&app)?.join(&id);
+    if !folder.exists() {
+        return Err(format!("Папка плагина `{id}` не найдена."));
+    }
+    std::fs::remove_dir_all(&folder).map_err(|e| format!("Не удалось удалить плагин: {e}"))?;
+    log::info!(target: "interviewlab::adapter", "delete_plugin: removed {}", folder.display());
+    Ok(())
 }
 
 // feature-cli-plugins.md §9 — "Onboard a new CLI as a plugin". The standalone, in-app
