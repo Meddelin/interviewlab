@@ -55,6 +55,17 @@ use crate::Db;
 // Tauri event the Diff tab subscribes to for progress (single-stage: diffing → done).
 pub const DIFF_PROGRESS_EVENT: &str = "diff://progress";
 
+// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / glossary.rs / diff.rs so it
+// can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
+// константой во все стадии"). Do NOT diverge the wording per file.
+const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
+    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
+    better than guessing.\n\
+    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
+    numbers, and NO markdown headings inside string fields of the JSON.";
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -449,10 +460,14 @@ fn build_diff_input(
     current: &[DiffFindingInput],
     previous: &[DiffFindingInput],
     hypotheses: &[DiffHypothesisInput],
+    // The cycle glossary (term→canonical, with aliases), the AUTHORITY for term spellings so the
+    // diff prose stays terminologically consistent with synthesis/cleanup.
+    glossary: &Value,
 ) -> Value {
-    json!({
+    let mut input = json!({
         "task": "cycle-diff",
         "system": crate::synthesis::analysis_system_prompt(),
+        "rules": UNIFIED_LLM_RULES,
         "instructions": "You are comparing two research waves at the level of CONCLUSIONS — \
             this is a FINDINGS-LEVEL diff, NOT a text diff. \
             (A) For EACH goal, align the current wave's findings with the previous wave's findings \
@@ -463,18 +478,27 @@ fn build_diff_input(
             wave), or `unchanged` (the same conclusion with no material shift). Give every entry a \
             short `why`; for `changed`, say WHAT shifted. Reference findings by id: set `finding_id` \
             to the CURRENT finding's id (leave \"\" for `dropped`) and `prev_finding_id` to the \
-            PREVIOUS finding's id (leave \"\" for `new`). \
+            PREVIOUS finding's id (leave \"\" for `new`); these ids are kept as clickable deep-links \
+            back to the synthesis cards, so they MUST be real ids from the inputs (the evidence \
+            already lives in the synthesis — do NOT restate quotes here). \
             (B) For EACH hypothesis in `hypotheses`, write a one-line `why` in `hypotheses` \
             explaining how its verdict moved between waves (e.g. why it firmed up from partially \
             to confirmed, or what new evidence weakened it) — keyed by `hypothesis_id`. The verdict \
             labels themselves are fixed; you only explain the change. \
+            When a `glossary` is provided, use its canonical spellings for any term in your prose. \
             Use ONLY the goal_ids / finding ids / hypothesis ids provided. End with a one-line \
             `summary` of what changed this wave. Return ONLY JSON matching the schema.",
         "goals": goals,
         "current_findings": current,
         "previous_findings": previous,
         "hypotheses": hypotheses
-    })
+    });
+    // Curated glossary (the spelling authority): only present when non-empty so an empty glossary
+    // stays out of the prompt. Inherited from the unified rules — canonical forms in the prose.
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
+    }
+    input
 }
 
 // --- assembly / invariant enforcement (the heart of M9, pure + unit-tested) ---
@@ -629,13 +653,15 @@ async fn diff_syntheses(
     adapter: &crate::adapter::Adapter,
     // The user's diff-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
+    // The cycle glossary rendered for the prompt (spelling authority); `[]` when none.
+    glossary: &Value,
 ) -> Result<DiffDoc, String> {
     let goals = shared_goals(&current.goals, &previous.goals);
     let cur_inputs = to_diff_inputs(current);
     let prev_inputs = to_diff_inputs(previous);
     let hyp_inputs = to_hypothesis_inputs(&current.hypothesis_verdicts, &previous.hypothesis_verdicts);
 
-    let input = build_diff_input(&goals, &cur_inputs, &prev_inputs, &hyp_inputs);
+    let input = build_diff_input(&goals, &cur_inputs, &prev_inputs, &hyp_inputs, glossary);
     let schema = diff_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -860,12 +886,22 @@ pub async fn run_diff(
 
     // The user's diff-bucket model override (None → the plugin's manifest default).
     let model_override = crate::adapter::task_model_override(&db.pool, "cycle-diff").await;
+
+    // Cycle glossary (cycle → product → terms): the spelling authority for the diff prose, so
+    // terminology stays consistent with synthesis/cleanup. Best-effort: a missing/empty glossary
+    // just yields `[]` (omitted from the prompt) — the diff never gates on it.
+    let glossary = crate::glossary::render_for_prompt(
+        &crate::glossary::glossary_for_cycle_db(&db.pool, &cycle_id)
+            .await
+            .unwrap_or_default(),
+    );
+
     log::info!(
         target: "interviewlab::diff",
         "run_diff: cycle='{cycle_id}' vs prev='{prev_id}' — {} current / {} previous finding(s), adapter='{}'",
         current.doc.findings.len(), previous.doc.findings.len(), adapter.id
     );
-    match diff_syntheses(&current.doc, &previous.doc, &adapter, model_override.as_deref()).await {
+    match diff_syntheses(&current.doc, &previous.doc, &adapter, model_override.as_deref(), &glossary).await {
         Ok(doc) => {
             let row_id = store_diff_db(&db.pool, &cycle_id, &prev_id, &doc).await.map_err(|e| {
                 log::error!(target: "interviewlab::diff", "[E-DIFF-STORE] run_diff: cycle='{cycle_id}': diff produced but STORING it failed: {e}");
@@ -1287,7 +1323,7 @@ mod tests {
             ..Default::default()
         };
 
-        let doc = diff_syntheses(&current, &previous, &adapter, None)
+        let doc = diff_syntheses(&current, &previous, &adapter, None, &json!([]))
             .await
             .expect("real diff should succeed");
 
@@ -1404,7 +1440,7 @@ mod tests {
             previous.doc.findings.len()
         );
 
-        let doc = diff_syntheses(&current.doc, &previous.doc, &adapter, None)
+        let doc = diff_syntheses(&current.doc, &previous.doc, &adapter, None, &json!([]))
             .await
             .expect("real diff should succeed");
 

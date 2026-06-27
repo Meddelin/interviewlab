@@ -1045,17 +1045,33 @@ fn reduce_schema() -> Value {
 
 // --- prompt inputs ------------------------------------------------------------
 
+// The single block of cross-stage rules, inserted with IDENTICAL text into every guide-grounded
+// stage's `instructions` (extract + reduce). ponytail: kept as inline literal text repeated per
+// stage — NOT a shared const/module yet — so it can be trivially hoisted into one Rust constant
+// in a later refactor pass (req: "вставь одинаковый текст … НЕ создавай общий модуль").
+const STAGE_RULES: &str = " \
+    Unified rules (apply to every stage): \
+    (a) OUTPUT LANGUAGE = the language of the interview; do NOT translate terms. \
+    (b) ANTI-HALLUCINATION: never invent names, numbers, or quotes; \"not established / no answer\" \
+    is better than guessing. \
+    (c) TERMINOLOGY: use the canonical spellings from the `glossary` (when provided) — both in your \
+    prose and inside quotes. \
+    (d) ARTIFACT STYLE: neutral analytical tone, no filler, one consistent format for quotes and \
+    numbers, and NO markdown headings inside string JSON fields.";
+
 fn build_extract_input(
     product_desc: &str,
+    glossary: &Value,
+    guide: &str,
     goals: &[Goal],
     hypotheses: &[TemplateItem],
     questions: &[GuideQuestion],
     interview: &InterviewInput,
 ) -> Value {
-    json!({
+    let mut input = json!({
         "task": "cycle-synthesis-extract",
         "system": analysis_system_prompt(),
-        "instructions": "You are summarizing ONE user-research interview, structured by the guide. \
+        "instructions": format!("You are summarizing ONE user-research interview, structured by the guide. \
             (1) For EACH goal, extract the concrete, goal-relevant `points` THIS interview supports, each with \
             short VERBATIM quotes (original language — never translate) + the `segment_id`. \
             (2) For EVERY guide question in `questions`, output a `question_answers` entry: set `status` to \
@@ -1066,28 +1082,45 @@ fn build_extract_input(
             `supports`, `contradicts`, `mixed`, or `neutral` (neutral = this interview says nothing about it), \
             with a short `note` + quotes. \
             (4) ALSO list any `notable` quotes or surprises (each with `segment_id`, `quote`, one-line `note`). \
+            Use `guide` (the full guide markdown) to understand the INTENT behind each goal/question — why it \
+            is asked and what target conclusions it expects — not only the structured list. \
             Weight RESPONDENT statements over interviewer prompts. Use ONLY the goal_ids / question_id / \
-            hypothesis_id provided. Return ONLY JSON matching the schema.",
+            hypothesis_id provided. Return ONLY JSON matching the schema.{STAGE_RULES}"),
         "product_desc": product_desc,
         "goals": goals,
         "hypotheses": hypotheses,
         "questions": questions,
         "interview": interview
-    })
+    });
+    // Full guide markdown so MAP sees the intent ("зачем этот вопрос"), not just the goal/question
+    // list. Only when non-empty so a blank guide doesn't bloat the prompt.
+    if !guide.trim().is_empty() {
+        input["guide"] = json!(guide.trim());
+    }
+    // Curated glossary (the entity phrase-list) as the AUTHORITY for term spellings in quotes —
+    // same path + omission discipline cleanup.rs uses. Only present when non-empty.
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
+    }
+    input
 }
 
 fn build_reduce_input(
     product_desc: &str,
+    glossary: &Value,
     guide: &str,
     goals: &[Goal],
     hypotheses: &[TemplateItem],
     questions: &[GuideQuestion],
     extractions: &[InterviewExtraction],
+    // Compact summary of the PREVIOUS wave's synthesis (executive_summary + findings by goal_id),
+    // or Value::Null when this is the first wave / no prev synthesis exists.
+    prev_wave: &Value,
 ) -> Value {
-    json!({
+    let mut input = json!({
         "task": "cycle-synthesis-reduce",
         "system": analysis_system_prompt(),
-        "instructions": "You are synthesizing ACROSS all interviews in a research wave, STRICTLY FOLLOWING the \
+        "instructions": format!("You are synthesizing ACROSS all interviews in a research wave, STRICTLY FOLLOWING the \
             guide. Using the per-interview extractions below, produce: \
             (1) a 2-4 sentence `executive_summary` of the wave; \
             (2) `hypothesis_verdicts` — one entry for EVERY hypothesis in `hypotheses`: a `verdict` \
@@ -1100,14 +1133,46 @@ fn build_reduce_input(
             (4) cross-interview FINDINGS — each bound to one `goal_id`, with a `statement`, `confidence`, \
             `support_count`, `evidence`, and a short `recommendation`; \
             (5) `open_questions` the wave did not resolve; and (6) an optional `by_role` breakdown per goal. \
-            Use ONLY the goal_ids / hypothesis_id / question_id provided. Return ONLY JSON matching the schema.",
+            If `previous_wave` is present, treat it ONLY as continuity context — confirm, extend, or revise \
+            it based on THIS wave's evidence; do NOT copy it, and never cite the previous wave as evidence \
+            for THIS wave's findings. \
+            Use ONLY the goal_ids / hypothesis_id / question_id provided. Return ONLY JSON matching the schema.{STAGE_RULES}"),
         "product_desc": product_desc,
         "guide": guide,
         "goals": goals,
         "hypotheses": hypotheses,
         "questions": questions,
         "interviews": extractions
-    })
+    });
+    // Curated glossary as the AUTHORITY for term spellings — only when non-empty (same discipline
+    // as cleanup.rs / the extract stage).
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
+    }
+    // Previous-wave continuity context (executive_summary + prior findings by goal_id). Only when
+    // present so a first wave doesn't carry a null/empty block.
+    if !prev_wave.is_null() {
+        input["previous_wave"] = prev_wave.clone();
+    }
+    input
+}
+
+// Build the COMPACT previous-wave continuity block from the prior wave's stored synthesis doc:
+// its executive summary + findings reduced to {goal_id, statement, confidence} (we drop evidence
+// quotes — those belong to the PREVIOUS wave's interviews and must never be cited for THIS wave).
+// Returns Value::Null when there's nothing worth carrying (no summary + no findings). Pure.
+fn prev_wave_block(prev: &SynthesisDoc) -> Value {
+    let findings: Vec<Value> = prev
+        .findings
+        .iter()
+        .filter(|f| !f.statement.trim().is_empty())
+        .map(|f| json!({ "goal_id": f.goal_id, "statement": f.statement.trim(), "confidence": f.confidence }))
+        .collect();
+    let summary = prev.executive_summary.trim();
+    if summary.is_empty() && findings.is_empty() {
+        return Value::Null;
+    }
+    json!({ "executive_summary": summary, "findings": findings })
 }
 
 // --- assembly / invariant enforcement (the heart of M8, pure + unit-tested) ---
@@ -1884,6 +1949,28 @@ async fn gather_interview(
     }))
 }
 
+// The compact previous-wave continuity block for a cycle, or Value::Null when there's no prior
+// wave to carry. Resolves cycle.prev_cycle_id (same column diff.rs aligns waves on) → the prev
+// cycle's stored synthesis (get_synthesis_db) → prev_wave_block. Best-effort: any DB error / a
+// missing prev synthesis just yields Null so synthesis runs exactly as a first wave.
+async fn prev_wave_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Value {
+    let prev_id: Option<String> = sqlx::query_scalar("SELECT prev_cycle_id FROM cycle WHERE id = ?")
+        .bind(cycle_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let Some(prev_id) = prev_id else {
+        return Value::Null;
+    };
+    match get_synthesis_db(pool, &prev_id).await {
+        Ok(Some(row)) => prev_wave_block(&row.doc),
+        _ => Value::Null,
+    }
+}
+
 // Interview id → title for a cycle, for evidence refs in the rendered markdown.
 async fn interview_titles_db(pool: &SqlitePool, cycle_id: &str) -> Result<HashMap<String, String>, String> {
     let rows: Vec<(String, String)> =
@@ -2104,6 +2191,8 @@ async fn save_interview_markdown_db(pool: &SqlitePool, interview_id: &str, conte
 async fn extract_one(
     adapter: &crate::adapter::Adapter,
     product_desc: &str,
+    glossary: &Value,
+    guide: &str,
     goals: &[Goal],
     hypotheses: &[TemplateItem],
     questions: &[GuideQuestion],
@@ -2111,7 +2200,7 @@ async fn extract_one(
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> (ExtractOutput, InterviewExtraction) {
-    let input = build_extract_input(product_desc, goals, hypotheses, questions, interview);
+    let input = build_extract_input(product_desc, glossary, guide, goals, hypotheses, questions, interview);
     let schema = extract_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -2158,16 +2247,19 @@ async fn extract_one(
 async fn reduce(
     adapter: &crate::adapter::Adapter,
     product_desc: &str,
+    glossary: &Value,
     guide: &str,
     goals: &[Goal],
     hypotheses: &[TemplateItem],
     questions: &[GuideQuestion],
     extractions: &[InterviewExtraction],
     valid_segments: &HashMap<String, usize>,
+    // Compact previous-wave continuity block (Value::Null when this is the first wave).
+    prev_wave: &Value,
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> Result<SynthesisDoc, String> {
-    let input = build_reduce_input(product_desc, guide, goals, hypotheses, questions, extractions);
+    let input = build_reduce_input(product_desc, glossary, guide, goals, hypotheses, questions, extractions, prev_wave);
     let schema = reduce_schema();
 
     // The model comes from the user override or the plugin's per-task manifest default
@@ -2233,10 +2325,13 @@ async fn synthesize_cycle(
     app: Option<&tauri::AppHandle>,
     cycle_id: &str,
     product_desc: &str,
+    glossary: &Value,
     guide: &str,
     template: &GuideTemplate,
     adapter: &crate::adapter::Adapter,
     interviews: &[InterviewInput],
+    // Compact previous-wave continuity block (Value::Null when this is the first wave).
+    prev_wave: &Value,
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
 ) -> Result<CycleSynthesisResult, String> {
@@ -2284,7 +2379,7 @@ async fn synthesize_cycle(
             let hypotheses = &hypotheses;
             let questions = &questions;
             async move {
-                let (output, extraction) = extract_one(adapter, product_desc, goals, hypotheses, questions, iv, model_override).await;
+                let (output, extraction) = extract_one(adapter, product_desc, glossary, guide, goals, hypotheses, questions, iv, model_override).await;
                 let summary = assemble_interview_summary(goals, hypotheses, questions, iv.segments.len(), &output);
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
@@ -2305,7 +2400,7 @@ async fn synthesize_cycle(
     if let Some(app) = app {
         emit_progress(app, cycle_id, "reduce", total, total, 85, None);
     }
-    let doc = reduce(adapter, product_desc, guide, &goals, &hypotheses, &questions, &extractions, &valid_segments, model_override).await?;
+    let doc = reduce(adapter, product_desc, glossary, guide, &goals, &hypotheses, &questions, &extractions, &valid_segments, prev_wave, model_override).await?;
 
     Ok(CycleSynthesisResult { doc, summaries })
 }
@@ -2373,6 +2468,13 @@ pub async fn run_interview_summary(
         .await?
         .unwrap_or_default();
     let guide = effective_guide_db(&db.pool, &cycle_id).await?.unwrap_or_default();
+    // Curated glossary (the entity phrase-list) as the AUTHORITY for term spellings in quotes —
+    // same interview→cycle→product path the cleanup/ASR stages use. Best-effort: empty → omitted.
+    let glossary = crate::glossary::render_for_prompt(
+        &crate::glossary::glossary_for_interview_db(&db.pool, &interview_id)
+            .await
+            .unwrap_or_default(),
+    );
     let template = effective_guide_template_db(&db.pool, &cycle_id).await?;
     let goals = if !template.is_empty() { template.goals() } else { derive_goals(&guide) };
     let hypotheses = template.hypotheses.clone();
@@ -2404,7 +2506,7 @@ pub async fn run_interview_summary(
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     let model_override =
         crate::adapter::task_model_override(&db.pool, "cycle-synthesis-extract").await;
-    let (output, _extraction) = extract_one(&adapter, &product_desc, &goals, &hypotheses, &questions, &iv, model_override.as_deref()).await;
+    let (output, _extraction) = extract_one(&adapter, &product_desc, &glossary, &guide, &goals, &hypotheses, &questions, &iv, model_override.as_deref()).await;
     let doc = assemble_interview_summary(&goals, &hypotheses, &questions, iv.segments.len(), &output);
     let content_md = render_interview_markdown(&doc, &title);
     let model_meta = json!({ "adapter": adapter.id, "goals": doc.goals.len() }).to_string();
@@ -2474,11 +2576,20 @@ pub async fn run_synthesis(
             .await
             .map_err(|e| e.to_string())?;
 
+    // PERF: gather each interview's transcript + role map CONCURRENTLY (bounded by
+    // SYNTHESIS_CONCURRENCY) instead of the old strictly-sequential N+1 loop (2+ queries per
+    // interview, awaited in series). join_all_ordered preserves the created_at order, so the
+    // resulting `interviews` Vec stays identical to the serial version.
     let mut interviews: Vec<InterviewInput> = Vec::new();
-    for (id, title) in &interview_rows {
-        if let Some(iv) = gather_interview(&db.pool, id, title).await? {
-            if !iv.segments.is_empty() {
-                interviews.push(iv);
+    for chunk in interview_rows.chunks(SYNTHESIS_CONCURRENCY.max(1)) {
+        let futs = chunk
+            .iter()
+            .map(|(id, title)| gather_interview(&db.pool, id, title));
+        for gathered in join_all_ordered(futs).await {
+            if let Some(iv) = gathered? {
+                if !iv.segments.is_empty() {
+                    interviews.push(iv);
+                }
             }
         }
     }
@@ -2488,6 +2599,21 @@ pub async fn run_synthesis(
         emit_progress(&app, &cycle_id, "error", 0, 0, 0, Some(msg.clone()));
         return Err(msg);
     }
+
+    // Curated glossary for the cycle: it lives on the cycle's product, so it's one per cycle. We
+    // reuse the existing interview→cycle→product resolution path (glossary_for_interview_db) via
+    // any interview in the cycle — they all share the cycle's product. Best-effort: a missing
+    // product / empty glossary yields `[]` (omitted from the prompts), never gating synthesis.
+    let glossary = crate::glossary::render_for_prompt(
+        &crate::glossary::glossary_for_interview_db(&db.pool, &interviews[0].id)
+            .await
+            .unwrap_or_default(),
+    );
+
+    // Previous-wave continuity context: if the cycle links a prev_cycle_id with a stored
+    // synthesis, carry a COMPACT summary of it into the reduce (confirm/extend/revise, do NOT
+    // copy). Best-effort: any failure / no prev synthesis → Null (first-wave behavior unchanged).
+    let prev_wave = prev_wave_for_cycle(&db.pool, &cycle_id).await;
 
     // Resolve the adapter (explicit id → that one; else the active one).
     let id = match adapter_id {
@@ -2499,7 +2625,7 @@ pub async fn run_synthesis(
     // The user's synthesis-bucket model override (None → the plugin's manifest default).
     let model_override = crate::adapter::task_model_override(&db.pool, "cycle-synthesis").await;
     log::info!(target: "interviewlab::synthesis", "run_synthesis: cycle='{cycle_id}' ('{name}'): {} interview(s), adapter='{}'", interviews.len(), adapter.id);
-    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &guide, &template, &adapter, &interviews, model_override.as_deref()).await {
+    match synthesize_cycle(Some(&app), &cycle_id, &product_desc, &glossary, &guide, &template, &adapter, &interviews, &prev_wave, model_override.as_deref()).await {
         Ok(result) => {
             // Persist each per-interview summary (the MAP artifacts).
             for (iv_id, title, summary) in &result.summaries {
@@ -3107,7 +3233,8 @@ mod tests {
             title: "P01".into(),
             segments: vec![],
         };
-        let extract = build_extract_input(product, &goals, &[], &[], &iv);
+        let empty_glossary = json!([]);
+        let extract = build_extract_input(product, &empty_glossary, "Goals:\n- G1", &goals, &[], &[], &iv);
         assert_eq!(
             extract["product_desc"], product,
             "extract prompt carries the product context"
@@ -3116,7 +3243,9 @@ mod tests {
             extract["system"], analysis_system_prompt(),
             "extract prompt carries the shared analysis system prompt"
         );
-        let reduce = build_reduce_input(product, "Goals:\n- G1", &goals, &[], &[], &[]);
+        assert_eq!(extract["guide"], "Goals:\n- G1", "extract carries the full guide markdown");
+        assert!(extract.get("glossary").is_none(), "empty glossary is omitted from extract");
+        let reduce = build_reduce_input(product, &empty_glossary, "Goals:\n- G1", &goals, &[], &[], &[], &Value::Null);
         assert_eq!(
             reduce["product_desc"], product,
             "reduce prompt carries the product context"
@@ -3125,6 +3254,46 @@ mod tests {
             reduce["system"], analysis_system_prompt(),
             "reduce prompt carries the shared analysis system prompt"
         );
+        assert!(reduce.get("previous_wave").is_none(), "no previous_wave on a first wave");
+
+        // Glossary + previous-wave continuity flow in when present, omitted when empty/null.
+        let glossary = json!([{ "canonical": "Acme" }]);
+        let prev = json!({ "executive_summary": "wave 1 summary", "findings": [] });
+        let extract2 = build_extract_input(product, &glossary, "", &goals, &[], &[], &iv);
+        assert_eq!(extract2["glossary"], glossary, "glossary flows into the extract prompt");
+        assert!(extract2.get("guide").is_none(), "blank guide is omitted from extract");
+        let reduce2 = build_reduce_input(product, &glossary, "g", &goals, &[], &[], &[], &prev);
+        assert_eq!(reduce2["glossary"], glossary, "glossary flows into the reduce prompt");
+        assert_eq!(reduce2["previous_wave"], prev, "previous-wave continuity flows into the reduce prompt");
+
+        // The unified cross-stage rules block is present, IDENTICAL, in both stages.
+        assert!(extract["instructions"].as_str().unwrap().contains(STAGE_RULES));
+        assert!(reduce["instructions"].as_str().unwrap().contains(STAGE_RULES));
+    }
+
+    #[test]
+    fn prev_wave_block_is_compact_and_drops_evidence() {
+        // A prior wave's doc with a finding carrying evidence quotes.
+        let prev = SynthesisDoc {
+            goals: goals3(),
+            findings: vec![Finding {
+                id: "F1".into(), goal_id: "G1".into(), statement: "  users churn early  ".into(),
+                confidence: "high".into(), support_count: 3,
+                evidence: vec![Evidence { interview_id: "iv1".into(), segment_id: 0, quote: "prev quote".into() }],
+                recommendation: "do x".into(),
+            }],
+            executive_summary: "  wave one summary  ".into(),
+            ..Default::default()
+        };
+        let block = prev_wave_block(&prev);
+        assert_eq!(block["executive_summary"], "wave one summary", "summary trimmed");
+        assert_eq!(block["findings"][0]["goal_id"], "G1");
+        assert_eq!(block["findings"][0]["statement"], "users churn early", "finding statement trimmed");
+        // Evidence quotes (which belong to the PREVIOUS wave's interviews) are NOT carried.
+        assert!(block["findings"][0].get("evidence").is_none(), "prev evidence is dropped");
+
+        // An empty prior wave yields Null (no block on a first-ish wave).
+        assert!(prev_wave_block(&SynthesisDoc::default()).is_null());
     }
 
     #[tokio::test]
@@ -3314,7 +3483,7 @@ mod tests {
             ],
         };
 
-        let result = synthesize_cycle(None, "m10b-verify", product_desc, guide, &GuideTemplate::default(), &adapter, &[iv1.clone(), iv2.clone()], None)
+        let result = synthesize_cycle(None, "m10b-verify", product_desc, &json!([]), guide, &GuideTemplate::default(), &adapter, &[iv1.clone(), iv2.clone()], &Value::Null, None)
             .await
             .expect("real synthesis should succeed");
         let doc = &result.doc;
@@ -3478,7 +3647,11 @@ mod tests {
             println!("synthesizing {name}: {} interviews via claude ...", interviews.len());
 
             let template = effective_guide_template_db(&pool, cycle_id).await.unwrap();
-            let result = synthesize_cycle(None, cycle_id, &product_desc, &guide, &template, &adapter, &interviews, None)
+            let glossary = crate::glossary::render_for_prompt(
+                &crate::glossary::glossary_for_interview_db(&pool, &interviews[0].id).await.unwrap_or_default(),
+            );
+            let prev_wave = prev_wave_for_cycle(&pool, cycle_id).await;
+            let result = synthesize_cycle(None, cycle_id, &product_desc, &glossary, &guide, &template, &adapter, &interviews, &prev_wave, None)
                 .await
                 .expect("real synthesis should succeed");
 
