@@ -248,7 +248,15 @@ function WorkArea() {
   // <main> is the skip-link target. Only one WorkArea mounts at a time (the panel-open /
   // panel-closed branches are mutually exclusive), so the id stays unique.
   return (
-    <main id="main" className={cn("h-full w-full", !isEditor && "px-6 py-6 lg:px-8")}>
+    <main
+      id="main"
+      className={cn(
+        "h-full w-full",
+        // Center content in a capped column so it isn't pinned to the left with dead
+        // space on wide/ultrawide screens (Linear-style). Editor stays full-bleed.
+        !isEditor && "mx-auto max-w-screen-xl px-6 py-6 lg:px-8",
+      )}
+    >
       <Outlet />
     </main>
   );
