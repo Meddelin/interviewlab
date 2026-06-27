@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
+  Copy,
   Cpu,
   Download,
   Loader2,
@@ -13,6 +14,8 @@ import {
   Zap,
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { isMac } from "@/lib/platform";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,6 +111,72 @@ function Bar({ pct }: { pct: number }) {
         className="h-full rounded-full bg-primary transition-[width] duration-150"
         style={{ width: `${Math.max(0, Math.min(100, pct))}%` }}
       />
+    </div>
+  );
+}
+
+// "Get the GPU build" call-to-action: shown when a supported GPU is present but this
+// build runs on CPU. openUrl is the Tauri opener plugin; the browser preview has no
+// plugin, so we fall back to window.open. winget (CUDA Toolkit) is Windows-only.
+const GPU_RELEASES_URL = "https://github.com/Meddelin/interviewlab/releases";
+const CUDA_WINGET_CMD = "winget install -e --id Nvidia.CUDA";
+
+async function openReleases() {
+  try {
+    await openUrl(GPU_RELEASES_URL);
+  } catch {
+    // ponytail: browser preview has no opener plugin — plain window.open is enough.
+    window.open(GPU_RELEASES_URL, "_blank");
+  }
+}
+
+function DeviceGpuCallout({
+  gpuName,
+  cudaBuild,
+}: {
+  gpuName: string | null;
+  cudaBuild: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const showWinget = !isMac && !cudaBuild;
+  return (
+    <div className="mt-1 flex flex-col gap-2 rounded-md border border-primary/30 bg-primary/5 p-2.5">
+      <p className="text-xs leading-relaxed text-foreground">
+        {gpuName ?? "GPU"} detected, but this build runs on CPU. Install the GPU
+        version to accelerate recognition.
+      </p>
+      <Button size="sm" className="self-start" onClick={openReleases}>
+        <Download className="size-3.5" />
+        Download GPU version
+      </Button>
+      {showWinget && (
+        <div className="flex flex-col gap-1.5 pt-0.5">
+          <span className="text-xs text-muted-foreground">
+            Or install the CUDA Toolkit:
+          </span>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
+              {CUDA_WINGET_CMD}
+            </code>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                await navigator.clipboard.writeText(CUDA_WINGET_CMD);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+            >
+              {copied ? (
+                <CheckCircle2 className="size-3.5" />
+              ) : (
+                <Copy className="size-3.5" />
+              )}
+              Copy
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -246,7 +315,11 @@ function TranscriptionTab() {
                 ) : (
                   <Cpu className="size-3" />
                 )}
-                {device.use_gpu ? "CUDA" : "CPU"}
+                {device.use_gpu
+                  ? device.device === "metal"
+                    ? "Metal"
+                    : "CUDA"
+                  : "CPU"}
               </Badge>
               {device.gpu_name && (
                 <span className="text-xs text-muted-foreground">
@@ -255,6 +328,18 @@ function TranscriptionTab() {
               )}
             </div>
             <span className="text-xs text-muted-foreground">{device.detail}</span>
+            {device.use_gpu && (
+              <span className="flex items-center gap-1 text-xs font-medium text-primary">
+                <Zap className="size-3" />
+                GPU active ({device.device === "metal" ? "Apple Metal" : "CUDA"})
+              </span>
+            )}
+            {device.recommendation === "get_gpu_build" && (
+              <DeviceGpuCallout
+                gpuName={device.gpu_name}
+                cudaBuild={device.cuda_build}
+              />
+            )}
           </div>
         )}
       </div>

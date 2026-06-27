@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowRight,
   CheckCircle2,
+  Copy,
   Cpu,
   Download,
   Loader2,
@@ -12,6 +13,8 @@ import {
   Zap,
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { isMac } from "@/lib/platform";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -108,6 +111,20 @@ function WelcomeStep() {
   );
 }
 
+// "Скачать GPU-версию" → open the releases page. openUrl is the Tauri opener plugin;
+// in the browser preview the plugin isn't present, so fall back to window.open.
+const GPU_RELEASES_URL = "https://github.com/Meddelin/interviewlab/releases";
+async function openReleases() {
+  try {
+    await openUrl(GPU_RELEASES_URL);
+  } catch {
+    // ponytail: browser preview has no opener plugin — plain window.open is enough.
+    window.open(GPU_RELEASES_URL, "_blank");
+  }
+}
+
+const CUDA_WINGET_CMD = "winget install -e --id Nvidia.CUDA";
+
 function DeviceStep() {
   const { data: device, isPending } = useAsrDevice();
   return (
@@ -127,7 +144,11 @@ function DeviceStep() {
               ) : (
                 <Cpu className="size-3" />
               )}
-              {device.use_gpu ? "CUDA" : "CPU"}
+              {device.use_gpu
+                ? device.device === "metal"
+                  ? "Metal"
+                  : "CUDA"
+                : "CPU"}
             </Badge>
             {device.gpu_name && (
               <span className="text-xs text-muted-foreground">
@@ -136,6 +157,69 @@ function DeviceStep() {
             )}
           </div>
           <span className="text-xs text-muted-foreground">{device.detail}</span>
+          {device.use_gpu && (
+            <span className="flex items-center gap-1 text-xs font-medium text-primary">
+              <Zap className="size-3" />
+              GPU активен ({device.device === "metal" ? "Apple Metal" : "CUDA"})
+            </span>
+          )}
+          {device.recommendation === "get_gpu_build" && (
+            <GpuBuildCallout gpuName={device.gpu_name} cudaBuild={device.cuda_build} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Shown when a supported GPU is present but THIS build runs on CPU: offer the GPU
+// download + (Windows + CUDA needed) the CUDA Toolkit install command.
+function GpuBuildCallout({
+  gpuName,
+  cudaBuild,
+}: {
+  gpuName: string | null;
+  cudaBuild: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  // winget only on Windows, and only when this build needs CUDA (not a Metal build).
+  const showWinget = !isMac && !cudaBuild;
+  return (
+    <div className="mt-1 flex flex-col gap-2 rounded-md border border-primary/30 bg-primary/5 p-2.5">
+      <p className="text-xs leading-relaxed text-foreground">
+        {gpuName ?? "GPU"} обнаружен, но эта сборка работает на CPU. Установите
+        GPU-версию для ускорения распознавания.
+      </p>
+      <Button size="sm" className="self-start" onClick={openReleases}>
+        <Download className="size-3.5" />
+        Скачать GPU-версию
+      </Button>
+      {showWinget && (
+        <div className="flex flex-col gap-1.5 pt-0.5">
+          <span className="text-xs text-muted-foreground">
+            Или установите CUDA Toolkit:
+          </span>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
+              {CUDA_WINGET_CMD}
+            </code>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                await navigator.clipboard.writeText(CUDA_WINGET_CMD);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+            >
+              {copied ? (
+                <CheckCircle2 className="size-3.5" />
+              ) : (
+                <Copy className="size-3.5" />
+              )}
+              Копировать
+            </Button>
+          </div>
         </div>
       )}
     </div>

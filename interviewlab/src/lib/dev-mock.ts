@@ -1732,14 +1732,17 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     // --- ASR (Milestone 4) ---------------------------------------------------
 
     case "asr_device": {
-      // The browser preview can't probe a GPU; report the CPU fallback the same
-      // way a CUDA-less build would (matches Rust detect_device on a CPU build).
+      // The browser preview can't probe a GPU. We seed a "get_gpu_build" state (a
+      // supported Nvidia GPU on a CPU-only build) so the Device-step / Settings
+      // "install GPU build" call-to-action is visible in the design preview.
       const info: DeviceInfo = {
         device: "cpu",
         use_gpu: false,
-        gpu_name: null,
+        gpu_name: "NVIDIA GeForce RTX 5080",
         cuda_build: false,
-        detail: "Browser preview — device probe runs only in the desktop app (CPU).",
+        detail:
+          "Browser preview — an Nvidia GPU was detected, but this build runs on CPU. Install the GPU version to accelerate recognition.",
+        recommendation: "get_gpu_build",
       };
       return Promise.resolve(info as T);
     }

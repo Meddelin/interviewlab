@@ -128,11 +128,13 @@ export function deleteInterview(id: string): Promise<void> {
 
 // Detected ASR device for the Transcription settings Badge (Rust `DeviceInfo`).
 export type DeviceInfo = {
-  device: string; // "cuda" | "cpu"
+  device: string; // "cuda" | "metal" | "cpu"
   use_gpu: boolean;
   gpu_name: string | null;
   cuda_build: boolean;
   detail: string;
+  // "gpu_active" | "get_gpu_build" | "cpu_only_no_gpu" — what the Device UI should offer.
+  recommendation: string;
 };
 
 // One selectable Whisper model in the catalog (Rust `ModelInfo`).

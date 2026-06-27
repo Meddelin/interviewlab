@@ -190,6 +190,12 @@ pub struct DeviceInfo {
     pub gpu_name: Option<String>, // e.g. "NVIDIA GeForce RTX 5080" when an Nvidia GPU is present
     pub cuda_build: bool,      // whether this binary was compiled with the cuda feature
     pub detail: String,        // human-readable reason for the chosen device
+    // What the UI should offer the user (drives the Device step's action button):
+    //   "gpu_active"      — GPU is in use (CUDA or Metal); nothing to do.
+    //   "get_gpu_build"   — a supported GPU is present but THIS build can't use it →
+    //                       offer to download the GPU-accelerated build (heavy-dep install).
+    //   "cpu_only_no_gpu" — no supported GPU; CPU is the only option, nothing to offer.
+    pub recommendation: String,
 }
 
 // True only when compiled with the `cuda` Cargo feature (whisper.cpp CUDA backend).
@@ -249,12 +255,23 @@ pub fn detect_device() -> DeviceInfo {
         (false, None) => "No Nvidia GPU detected — using CPU.".to_string(),
     };
 
+    let recommendation = if use_gpu {
+        "gpu_active"
+    } else if gpu.is_some() {
+        // A supported Nvidia GPU is present but this build is CPU-only → offer the GPU build.
+        "get_gpu_build"
+    } else {
+        "cpu_only_no_gpu"
+    }
+    .to_string();
+
     DeviceInfo {
         device: if use_gpu { "cuda".into() } else { "cpu".into() },
         use_gpu,
         gpu_name: gpu,
         cuda_build: build,
         detail,
+        recommendation,
     }
 }
 
@@ -274,6 +291,7 @@ pub fn detect_device() -> DeviceInfo {
             gpu_name: Some("Apple Silicon GPU".into()),
             cuda_build: false,
             detail: "Metal backend (Apple Silicon) built — using the GPU.".to_string(),
+            recommendation: "gpu_active".into(),
         }
     } else {
         DeviceInfo {
@@ -281,9 +299,11 @@ pub fn detect_device() -> DeviceInfo {
             use_gpu: false,
             gpu_name: None,
             cuda_build: false,
-            detail: "CPU build on macOS — rebuild with `--features metal` for GPU \
-                     acceleration on Apple Silicon."
+            detail: "CPU build on macOS — install the Metal (Apple Silicon) build for \
+                     GPU acceleration."
                 .to_string(),
+            // A CPU-only build on Apple Silicon → offer the GPU (Metal) build.
+            recommendation: "get_gpu_build".into(),
         }
     }
 }
