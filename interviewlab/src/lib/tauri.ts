@@ -510,6 +510,21 @@ export function pluginManifestSchema(): Promise<string> {
   return invoke<string>("plugin_manifest_schema");
 }
 
+// Save (create or overwrite) a USER plugin manifest from the Settings UI. The backend
+// validates `manifestJson` through the loader's own path (rejecting anything that would
+// load as "(invalid plugin)") and writes plugins/<id>/manifest.json. Rejects builtin ids.
+export function savePluginManifest(
+  id: string,
+  manifestJson: string,
+): Promise<void> {
+  return invoke<void>("save_plugin_manifest", { id, manifestJson });
+}
+
+// Delete a USER plugin folder (plugins/<id>). Builtin (bundled) ids are refused server-side.
+export function deletePlugin(id: string): Promise<void> {
+  return invoke<void>("delete_plugin", { id });
+}
+
 // Read the active adapter id (default 'claude-code').
 export function getActiveAdapter(): Promise<string> {
   return invoke<string>("get_active_adapter");

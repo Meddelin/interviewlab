@@ -66,6 +66,7 @@ import {
 import { useInterviews } from "@/lib/interview-queries";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUiStore } from "@/lib/ui-store";
+import { mod } from "@/lib/platform";
 
 // Suggested starter questions for the empty state (mirrors the synthesis-tab empty state).
 const STARTERS = [
@@ -327,7 +328,7 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
                 <PanelRightClose className="size-4" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="left">Close (⌘J)</TooltipContent>
+            <TooltipContent side="left">Close ({mod("J")})</TooltipContent>
           </Tooltip>
         </div>
 

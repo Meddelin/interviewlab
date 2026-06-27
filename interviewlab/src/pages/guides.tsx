@@ -21,6 +21,7 @@ import {
   useUpdateGuide,
 } from "@/lib/guide-queries";
 import { relativeTime } from "@/lib/format";
+import { mod } from "@/lib/platform";
 import {
   EMPTY_TEMPLATE,
   templateGoals,
@@ -193,7 +194,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
         <Button size="sm" onClick={save} disabled={!dirty || updateGuide.isPending}>
           {updateGuide.isPending ? "Saving…" : "Save"}
           <kbd className="ml-1 hidden font-numeric text-[10px] text-primary-foreground/70 sm:inline">
-            ⌘S
+            {mod("S")}
           </kbd>
         </Button>
       </div>

@@ -2168,6 +2168,13 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       return Promise.resolve(MOCK_MANIFEST_SCHEMA as T);
     }
 
+    // ponytail: browser preview has no plugins folder; accept the writes as no-ops so
+    // the Settings form's Save/Delete don't error-toast outside Tauri.
+    case "save_plugin_manifest":
+    case "delete_plugin": {
+      return Promise.resolve(undefined as T);
+    }
+
     // --- M8 cycle synthesis ----------------------------------------------------
 
     case "get_synthesis": {

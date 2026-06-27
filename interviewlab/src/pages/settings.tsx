@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -9,6 +9,7 @@ import {
   Plus,
   RefreshCw,
   TerminalSquare,
+  Trash2,
   Zap,
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -38,13 +39,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { useAsrDevice, useModels } from "@/lib/asr-queries";
 import {
   adapterKeys,
   useActiveAdapter,
   useAdapterMeta,
   useAdapters,
+  useDeletePlugin,
   usePluginManifestSchema,
+  useSavePluginManifest,
   useTaskModel,
 } from "@/lib/adapter-queries";
 import { useUiStore } from "@/lib/ui-store";
@@ -502,6 +507,17 @@ function AdapterCard({
   });
   const badge = probe ? probeBadge(probe.status) : null;
 
+  // Delete a user (non-builtin) plugin, with a confirm. Builtin plugins show no button.
+  const del = useDeletePlugin();
+  function handleDelete() {
+    if (!window.confirm(`Удалить плагин «${adapter.name}»? Папка plugins/${adapter.id} будет удалена.`))
+      return;
+    del.mutate(adapter.id, {
+      onSuccess: () => toast.success("Плагин удалён"),
+      onError: (e) => toast.error(`Не удалось удалить. ${String(e)}`),
+    });
+  }
+
   // Malformed manifest: surface the id + validation error so the user can fix the file.
   if (!adapter.ok) {
     return (
@@ -523,13 +539,29 @@ function AdapterCard({
             </CardDescription>
           )}
         </CardHeader>
-        {adapter.source && (
-          <CardContent>
+        <CardContent className="flex flex-col gap-2">
+          {adapter.source && (
             <span className="font-numeric text-[10px] text-muted-foreground">
               {adapter.source}
             </span>
-          </CardContent>
-        )}
+          )}
+          {!adapter.builtin && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start text-destructive"
+              onClick={handleDelete}
+              disabled={del.isPending}
+            >
+              {del.isPending ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="size-3.5" />
+              )}
+              Удалить
+            </Button>
+          )}
+        </CardContent>
       </Card>
     );
   }
@@ -562,7 +594,7 @@ function AdapterCard({
             </span>
           ))}
           {adapter.runs_external_program && (
-            <span className="rounded-full border border-amber-500/40 px-2 py-0.5 font-numeric text-[10px] text-amber-600 dark:text-amber-400">
+            <span className="rounded-full border border-status-importing/40 px-2 py-0.5 font-numeric text-[10px] text-status-importing">
               runs external program
             </span>
           )}
@@ -587,48 +619,374 @@ function AdapterCard({
               {badge.label}
             </Badge>
           )}
+          {!adapter.builtin && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto text-muted-foreground hover:text-destructive"
+              onClick={handleDelete}
+              disabled={del.isPending}
+              title="Удалить плагин"
+            >
+              {del.isPending ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="size-3.5" />
+              )}
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>
   );
 }
 
-// The "Add a CLI plugin" dialog: explains the plugin folder convention and shows the
-// agent-facing meta-instruction doc (Guide) + the manifest JSON Schema (Schema) so any
-// AI agent can author — and self-validate — a new plugin.
+// The descriptor-level form state the manual builder collects. Args/probe are entered as
+// space-or-newline-separated tokens (the common shape); `models` is one "id label" per line.
+type PluginForm = {
+  id: string;
+  name: string;
+  vendor: string;
+  version: string;
+  command: string;
+  args: string; // the batch task args template (one token per line / space-separated)
+  probeArgs: string; // the probe args (e.g. "--version")
+  resultPath: string; // io.result_extract.json_path (the envelope field, e.g. "result")
+  capabilities: Capability[];
+  models: string; // one "id label…" per line (optional)
+};
+
+const EMPTY_PLUGIN_FORM: PluginForm = {
+  id: "",
+  name: "",
+  vendor: "",
+  version: "",
+  command: "",
+  args: "-p {prompt} --output-format json",
+  probeArgs: "--version",
+  resultPath: "result",
+  capabilities: ["batch-tasks"],
+  models: "",
+};
+
+// All capabilities the form can tick. Batch-tasks is the descriptor-tier sweet spot; the
+// others (streaming/multi-turn/tool-use) need chat/tools blocks the simple form can't author,
+// so for those the user is steered to the raw-JSON escape hatch.
+const ALL_CAPS: Capability[] = ["batch-tasks", "streaming", "multi-turn", "tool-use"];
+
+// Split a whitespace/newline-separated token string into an args array (preserving {prompt}).
+function splitTokens(s: string): string[] {
+  return s
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+// Build a manifest JSON object from the form. Mirrors the descriptor schema in adapter.rs:
+// the seven pipeline task names all share the one args template (as the bundled plugins do),
+// so a single CLI invocation shape powers cleanup/synthesis/diff. Only blocks for ticked
+// capabilities are emitted (orthogonality). The result is pretty-printed for the editor.
+function buildManifestFromForm(f: PluginForm): string {
+  const caps = f.capabilities.length ? f.capabilities : ["batch-tasks"];
+  const manifest: Record<string, unknown> = {
+    manifest_version: 1,
+    id: f.id.trim(),
+    name: f.name.trim() || f.id.trim(),
+    version: f.version.trim() || "1.0",
+    vendor: f.vendor.trim(),
+    command: f.command.trim(),
+    capabilities: caps,
+    probe: { args: splitTokens(f.probeArgs), expect_exit_code: 0 },
+    auth: { type: "session", env: [], note: "" },
+  };
+  if (caps.includes("batch-tasks")) {
+    const args = splitTokens(f.args);
+    const taskNames = [
+      "ping",
+      "transcript-cleanup",
+      "cycle-synthesis",
+      "cycle-synthesis-extract",
+      "cycle-synthesis-reduce",
+      "glossary-extract",
+      "cycle-diff",
+    ];
+    manifest.io = {
+      payload_via: "stdin",
+      prompt_via: "arg",
+      result_extract: { format: "json", json_path: f.resultPath.trim() || "result" },
+      timeout_sec: 600,
+      max_stdin_bytes: 10000000,
+    };
+    manifest.tasks = Object.fromEntries(
+      taskNames.map((t) => [t, { args_template: args }]),
+    );
+  }
+  // Optional models block: one "id label words…" per line.
+  const modelLines = f.models
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (modelLines.length) {
+    manifest.models = {
+      available: modelLines.map((line) => {
+        const [id, ...rest] = line.split(/\s+/);
+        return rest.length ? { id, label: rest.join(" ") } : { id };
+      }),
+    };
+  }
+  return JSON.stringify(manifest, null, 2);
+}
+
+// The "Add a CLI plugin" dialog. Three modes: a descriptor-level FORM that builds the
+// manifest for the common batch-tasks CLI, a raw-JSON escape hatch (pre-filled from the form,
+// for advanced chat/tool-use tiers), and the read-only agent Guide + Schema. Form/JSON write
+// via save_plugin_manifest; Test CLI reuses the probe once the plugin is saved.
 function AddAdapterDialog() {
   const { data: meta, isPending: metaPending } = useAdapterMeta();
   const { data: schema, isPending: schemaPending } = usePluginManifestSchema();
+  const save = useSavePluginManifest();
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState<PluginForm>(EMPTY_PLUGIN_FORM);
+  // The raw-JSON editor buffer. Kept separate so the user's hand-edits survive; it's
+  // (re)seeded from the form when the user switches to the JSON tab via "Собрать из формы".
+  const [rawJson, setRawJson] = useState<string>("");
+  const [probe, setProbe] = useState<ProbeResult | null>(null);
+
+  const set = <K extends keyof PluginForm>(k: K, v: PluginForm[K]) =>
+    setForm((f) => ({ ...f, [k]: v }));
+  const toggleCap = (c: Capability) =>
+    setForm((f) => ({
+      ...f,
+      capabilities: f.capabilities.includes(c)
+        ? f.capabilities.filter((x) => x !== c)
+        : [...f.capabilities, c],
+    }));
+
+  // Reset everything when the dialog closes (so re-opening starts clean).
+  function onOpenChange(next: boolean) {
+    setOpen(next);
+    if (!next) {
+      setForm(EMPTY_PLUGIN_FORM);
+      setRawJson("");
+      setProbe(null);
+    }
+  }
+
+  // Save the manifest (from the active editor). `source` picks form vs raw JSON.
+  async function handleSave(source: "form" | "raw") {
+    const id = form.id.trim();
+    if (!id) {
+      toast.error("Укажите id плагина");
+      return;
+    }
+    const manifestJson = source === "raw" ? rawJson : buildManifestFromForm(form);
+    try {
+      await save.mutateAsync({ id, manifestJson });
+      toast.success("Плагин сохранён");
+    } catch (e) {
+      toast.error(`Не удалось сохранить. ${String(e)}`);
+    }
+  }
+
+  // Test CLI: saves the current manifest first (the probe resolves the plugin by id from
+  // disk), then runs the probe. Surfaces a clear status badge inline.
+  async function handleTest() {
+    const id = form.id.trim();
+    if (!id) {
+      toast.error("Укажите id плагина");
+      return;
+    }
+    try {
+      const manifestJson = rawJson.trim() ? rawJson : buildManifestFromForm(form);
+      await save.mutateAsync({ id, manifestJson });
+      const r = await testCli(id);
+      setProbe(r);
+    } catch (e) {
+      toast.error(`Не удалось протестировать. ${String(e)}`);
+    }
+  }
+
+  const badge = probe ? probeBadge(probe.status) : null;
+
   return (
-    <Dialog>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>
         <Button variant="outline" size="sm">
           <Plus className="size-3.5" />
-          Add plugin…
+          Добавить плагин…
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-h-[80vh] gap-3 overflow-hidden sm:max-w-2xl">
+      <DialogContent className="max-h-[85vh] gap-3 overflow-hidden sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Add a CLI plugin</DialogTitle>
+          <DialogTitle>Добавить CLI-плагин</DialogTitle>
           <DialogDescription>
-            A plugin is a folder{" "}
-            <code className="font-numeric text-[11px]">plugins/&lt;id&gt;/manifest.json</code>{" "}
-            the app auto-discovers — no source changes. Hand the guide below to any AI
-            agent (e.g. Claude Code) to author one, drop the folder in{" "}
-            <code className="font-numeric text-[11px]">plugins/</code>, then click{" "}
-            <span className="font-medium text-foreground">Rescan plugins</span>. The
-            agent can self-validate against the manifest schema.
+            Плагин — это папка{" "}
+            <code className="font-numeric text-[11px]">plugins/&lt;id&gt;/manifest.json</code>.
+            Заполните форму ниже, чтобы создать её прямо из приложения, либо отдайте
+            гайд («Для агента») локальному ИИ-агенту.
           </DialogDescription>
         </DialogHeader>
-        <Tabs defaultValue="guide" className="min-h-0 gap-3 overflow-hidden">
+        <Tabs defaultValue="form" className="min-h-0 gap-3 overflow-hidden">
           <TabsList variant="line" className="border-b border-border pb-0">
-            <TabsTrigger value="guide">Guide</TabsTrigger>
-            <TabsTrigger value="schema">Schema</TabsTrigger>
+            <TabsTrigger value="form">Форма</TabsTrigger>
+            <TabsTrigger value="raw">Сырой JSON</TabsTrigger>
+            <TabsTrigger value="agent">Для агента</TabsTrigger>
           </TabsList>
+
+          {/* --- Descriptor-level form --- */}
           <TabsContent
-            value="guide"
-            className="max-h-[60vh] overflow-y-auto rounded-md border border-border bg-muted/30 p-4"
+            value="form"
+            className="flex max-h-[62vh] flex-col gap-3 overflow-y-auto pr-1"
           >
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="id (= имя папки)">
+                <Input
+                  value={form.id}
+                  onChange={(e) => set("id", e.target.value)}
+                  placeholder="my-cli"
+                />
+              </Field>
+              <Field label="Название">
+                <Input
+                  value={form.name}
+                  onChange={(e) => set("name", e.target.value)}
+                  placeholder="My CLI"
+                />
+              </Field>
+              <Field label="Команда (бинарь на PATH)">
+                <Input
+                  value={form.command}
+                  onChange={(e) => set("command", e.target.value)}
+                  placeholder="mycli"
+                />
+              </Field>
+              <Field label="Вендор (опц.)">
+                <Input
+                  value={form.vendor}
+                  onChange={(e) => set("vendor", e.target.value)}
+                  placeholder="Acme"
+                />
+              </Field>
+              <Field label="Версия (опц.)">
+                <Input
+                  value={form.version}
+                  onChange={(e) => set("version", e.target.value)}
+                  placeholder="1.0"
+                />
+              </Field>
+              <Field label="Probe-команда (после бинаря)">
+                <Input
+                  value={form.probeArgs}
+                  onChange={(e) => set("probeArgs", e.target.value)}
+                  placeholder="--version"
+                />
+              </Field>
+            </div>
+
+            <Field label="Аргументы задачи (с плейсхолдером {prompt})">
+              <Input
+                value={form.args}
+                onChange={(e) => set("args", e.target.value)}
+                placeholder="-p {prompt} --output-format json"
+                className="font-numeric text-xs"
+              />
+            </Field>
+
+            <Field label="Поле JSON-конверта с результатом (result_extract.json_path)">
+              <Input
+                value={form.resultPath}
+                onChange={(e) => set("resultPath", e.target.value)}
+                placeholder="result"
+                className="w-40 font-numeric text-xs"
+              />
+            </Field>
+
+            <Field label="Возможности">
+              <div className="flex flex-wrap gap-3">
+                {ALL_CAPS.map((c) => (
+                  <label
+                    key={c}
+                    className="flex items-center gap-1.5 text-xs text-foreground"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.capabilities.includes(c)}
+                      onChange={() => toggleCap(c)}
+                      className="size-3.5 accent-primary"
+                    />
+                    {CAPABILITY_LABELS[c]}
+                  </label>
+                ))}
+              </div>
+              {form.capabilities.some((c) => c !== "batch-tasks") && (
+                <span className="text-[11px] text-status-importing">
+                  Для streaming / multi-turn / tool-use заполните блоки chat/tools во
+                  вкладке «Сырой JSON».
+                </span>
+              )}
+            </Field>
+
+            <Field label="Модели (опц., по одной в строке: «id подпись»)">
+              <Textarea
+                value={form.models}
+                onChange={(e) => set("models", e.target.value)}
+                placeholder={"haiku Haiku (fast)\nsonnet Sonnet (balanced)"}
+                className="h-20 font-numeric text-xs"
+              />
+            </Field>
+
+            <DialogActions
+              badge={badge}
+              probe={probe}
+              pending={save.isPending}
+              onTest={handleTest}
+              onSave={() => handleSave("form")}
+            />
+          </TabsContent>
+
+          {/* --- Raw JSON escape hatch --- */}
+          <TabsContent
+            value="raw"
+            className="flex max-h-[62vh] flex-col gap-3 overflow-y-auto pr-1"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">
+                Полный манифест. Для продвинутых тиров (chat / adapter-program).
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setRawJson(buildManifestFromForm(form))}
+              >
+                Собрать из формы
+              </Button>
+            </div>
+            <Textarea
+              value={rawJson}
+              onChange={(e) => setRawJson(e.target.value)}
+              placeholder='{ "id": "my-cli", … }'
+              className="h-72 font-numeric text-[11px]"
+            />
+            <DialogActions
+              badge={badge}
+              probe={probe}
+              pending={save.isPending}
+              onTest={handleTest}
+              onSave={() => handleSave("raw")}
+            />
+          </TabsContent>
+
+          {/* --- Read-only agent guide + schema --- */}
+          <TabsContent
+            value="agent"
+            className="max-h-[62vh] overflow-y-auto rounded-md border border-border bg-muted/30 p-4"
+          >
+            <p className="mb-3 text-[11px] text-muted-foreground">
+              Отдайте этот гайд локальному ИИ-агенту (например, Claude Code), чтобы он
+              сам собрал плагин и положил папку в{" "}
+              <code className="font-numeric">plugins/</code>, затем нажмите «Rescan
+              plugins».
+            </p>
             {metaPending || !meta ? (
               <Skeleton className="h-64 w-full" />
             ) : (
@@ -636,22 +994,84 @@ function AddAdapterDialog() {
                 {meta}
               </pre>
             )}
-          </TabsContent>
-          <TabsContent
-            value="schema"
-            className="max-h-[60vh] overflow-y-auto rounded-md border border-border bg-muted/30 p-4"
-          >
-            {schemaPending || !schema ? (
-              <Skeleton className="h-64 w-full" />
-            ) : (
-              <pre className="whitespace-pre-wrap font-numeric text-[11px] leading-relaxed text-foreground/90">
-                {schema}
-              </pre>
-            )}
+            <div className="mt-4 border-t border-border pt-3">
+              <span className="text-xs font-medium text-foreground">
+                Схема манифеста
+              </span>
+              {schemaPending || !schema ? (
+                <Skeleton className="mt-2 h-48 w-full" />
+              ) : (
+                <pre className="mt-2 whitespace-pre-wrap font-numeric text-[11px] leading-relaxed text-foreground/90">
+                  {schema}
+                </pre>
+              )}
+            </div>
           </TabsContent>
         </Tabs>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// A labelled form field (label above the control).
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+// The shared Test CLI / Save action row (with the inline probe badge) used by both editors.
+function DialogActions({
+  badge,
+  probe,
+  pending,
+  onTest,
+  onSave,
+}: {
+  badge: { variant: "default" | "secondary" | "outline" | "destructive"; icon: ReactNode; label: string } | null;
+  probe: ProbeResult | null;
+  pending: boolean;
+  onTest: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="sticky bottom-0 flex flex-col gap-2 border-t border-border bg-background pt-3">
+      <div className="flex items-center gap-2">
+        <Button variant="outline" size="sm" onClick={onTest} disabled={pending}>
+          {pending ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <TerminalSquare className="size-3.5" />
+          )}
+          Test CLI
+        </Button>
+        <Button size="sm" onClick={onSave} disabled={pending}>
+          {pending ? <Loader2 className="size-3.5 animate-spin" /> : null}
+          Сохранить
+        </Button>
+        {badge && (
+          <Badge variant={badge.variant}>
+            {badge.icon}
+            {badge.label}
+          </Badge>
+        )}
+      </div>
+      {probe && (
+        <span className="text-[11px] text-muted-foreground">
+          {probe.detail}
+          {probe.version ? ` (${probe.version})` : ""}
+        </span>
+      )}
+    </div>
   );
 }
 

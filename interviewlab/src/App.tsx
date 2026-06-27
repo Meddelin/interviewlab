@@ -3,6 +3,7 @@ import { Search, Sparkles } from "lucide-react";
 import { NavLink, Outlet, useMatch } from "react-router-dom";
 import { BackendStatus } from "@/components/backend-status";
 import { CommandPalette } from "@/components/command-palette";
+import { OnboardingWizard } from "@/components/onboarding-wizard";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { CycleChatPanel } from "@/components/cycle-chat-panel";
 import {
@@ -12,6 +13,7 @@ import {
 } from "@/components/ui/resizable";
 import { useUiStore } from "@/lib/ui-store";
 import { useLiveAsr } from "@/lib/use-live-asr";
+import { mod } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 // React Router shell (M2): App is the layout; nested routes render in <Outlet />.
@@ -62,7 +64,7 @@ function AskAiButton({ cycleId }: { cycleId: string }) {
           chatOpen ? "text-primary-foreground/70" : "text-primary/60",
         )}
       >
-        ⌘J
+        {mod("J")}
       </kbd>
     </button>
   );
@@ -92,6 +94,9 @@ function Header({ cycleId }: { cycleId: string | null }) {
           <NavLink
             key={item.to}
             to={item.to}
+            // NavLink sets aria-current="page" on the active link automatically; the
+            // explicit prop documents that wayfinding contract (default is "page").
+            aria-current="page"
             className={({ isActive }) =>
               cn(
                 "rounded-md px-2.5 py-1 transition-colors",
@@ -126,7 +131,7 @@ function Header({ cycleId }: { cycleId: string | null }) {
           <Search className="size-3.5" />
           <span>Search</span>
           <kbd className="font-numeric text-[10px] tracking-wide text-muted-foreground/80">
-            ⌘K
+            {mod("K")}
           </kbd>
         </button>
         <BackendStatus />
@@ -179,6 +184,14 @@ function App() {
   return (
     // Full-height shell: a compact header + a full-width work area below it.
     <div className="flex h-svh min-h-0 flex-col">
+      {/* Skip-link: first focusable element, visually hidden until focused (keyboard
+          users Tab to it, then jump straight past the header nav to the content). */}
+      <a
+        href="#main"
+        className="sr-only focus-visible:not-sr-only focus-visible:absolute focus-visible:top-2 focus-visible:left-2 focus-visible:z-50 focus-visible:rounded-md focus-visible:border focus-visible:border-border focus-visible:bg-popover focus-visible:px-3 focus-visible:py-1.5 focus-visible:text-sm focus-visible:text-foreground focus-visible:shadow-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+      >
+        Перейти к содержимому
+      </a>
       <Header cycleId={cycleId} />
 
       {/* The work area docks the chat panel against the WHOLE content (any cycle screen).
@@ -219,6 +232,9 @@ function App() {
       )}
 
       <CommandPalette />
+      {/* First-run guided setup — mounted once at the shell; self-gates on a localStorage
+          flag, so it only surfaces until the user finishes or skips it. */}
+      <OnboardingWizard />
     </div>
   );
 }
@@ -229,10 +245,12 @@ function App() {
 // shrink within flex instead of forcing the intrinsic width.
 function WorkArea() {
   const isEditor = useMatch("/cycles/:cycleId/interviews/:interviewId");
+  // <main> is the skip-link target. Only one WorkArea mounts at a time (the panel-open /
+  // panel-closed branches are mutually exclusive), so the id stays unique.
   return (
-    <div className={cn("h-full w-full", !isEditor && "px-6 py-6 lg:px-8")}>
+    <main id="main" className={cn("h-full w-full", !isEditor && "px-6 py-6 lg:px-8")}>
       <Outlet />
-    </div>
+    </main>
   );
 }
 

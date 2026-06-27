@@ -1,10 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   adapterMetaInstructions,
+  deletePlugin,
   getActiveAdapter,
   getTaskModel,
   listAdapters,
   pluginManifestSchema,
+  savePluginManifest,
   type TaskModelBucket,
 } from "@/lib/tauri";
 
@@ -50,5 +52,31 @@ export function usePluginManifestSchema() {
   return useQuery({
     queryKey: adapterKeys.schema,
     queryFn: pluginManifestSchema,
+  });
+}
+
+// Invalidate the plugin list + active selection after a manual create/edit/delete so the
+// cards grid + active Select re-read the freshly written/removed manifest.
+function invalidateAdapters(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: adapterKeys.list });
+  qc.invalidateQueries({ queryKey: adapterKeys.active });
+}
+
+// Save (create or overwrite) a user plugin manifest from the manual form / raw-JSON editor.
+export function useSavePluginManifest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, manifestJson }: { id: string; manifestJson: string }) =>
+      savePluginManifest(id, manifestJson),
+    onSuccess: () => invalidateAdapters(qc),
+  });
+}
+
+// Delete a user plugin folder (builtin ids are refused server-side).
+export function useDeletePlugin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deletePlugin(id),
+    onSuccess: () => invalidateAdapters(qc),
   });
 }

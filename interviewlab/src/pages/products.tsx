@@ -21,6 +21,7 @@ import {
   useUpdateProduct,
 } from "@/lib/product-queries";
 import { relativeTime } from "@/lib/format";
+import { mod } from "@/lib/platform";
 import type { Product } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
@@ -172,7 +173,7 @@ function ProductEditor({ product }: { product: Product }) {
         <Button size="sm" onClick={save} disabled={!dirty || updateProduct.isPending}>
           {updateProduct.isPending ? "Saving…" : "Save"}
           <kbd className="ml-1 hidden font-numeric text-[10px] text-primary-foreground/70 sm:inline">
-            ⌘S
+            {mod("S")}
           </kbd>
         </Button>
       </div>
