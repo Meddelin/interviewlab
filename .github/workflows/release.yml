@@ -81,7 +81,9 @@ jobs:
             bypass — see docs/release.md.
           # workflow_dispatch builds attach to a DRAFT (no real tag); tag pushes publish.
           releaseDraft: ${{ github.ref_type != 'tag' }}
-          prerelease: false
+          # Tags with a pre-release suffix (e.g. v2.0.0-alpha.1, -rc.1) publish as a GitHub
+          # pre-release; a bare vX.Y.Z publishes as a full release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # ---------------------------------------------------------------------------------------------
   # OPTIONAL: Windows + CUDA build. GitHub-hosted runners have NO Nvidia GPU/Toolkit, so this MUST
