@@ -1,15 +1,17 @@
 import { useState } from "react";
-import { BookText, Check, Pencil, Plus, Trash2, X } from "lucide-react";
+import { BookText, Check, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
+  useAddGlossaryTerms,
   useCreateGlossaryTerm,
   useDeleteGlossaryTerm,
   useGlossaryTerms,
   useUpdateGlossaryTerm,
 } from "@/lib/glossary-queries";
+import { GLOSSARY_SEED } from "@/lib/glossary-seed";
 import type { GlossaryTerm } from "@/lib/tauri";
 import { useT } from "@/lib/i18n";
 
@@ -34,6 +36,10 @@ const STR = {
     loading: "Загрузка…",
     empty:
       "Пока нет терминов. Добавьте англицизмы, аббревиатуры и названия продуктов, которые распознаются неверно — или сгенерируйте их из интервью на вкладке «Интервью».",
+    importBase: "Базовый набор",
+    importBaseTitle: "Добавить готовый словарь IT/продуктовых терминов с русскими особенностями",
+    imported: (n: number) => (n > 0 ? `Добавлено терминов: ${n}` : "Все термины уже в глоссарии"),
+    importFailed: (e: string) => `Не удалось импортировать набор. ${e}`,
   },
   en: {
     canonicalPlaceholderFull: "Canonical spelling (e.g. API, Jira, дедлайн)",
@@ -55,6 +61,10 @@ const STR = {
     loading: "Loading…",
     empty:
       "No terms yet. Add the anglicisms, acronyms, and product names that get mis-transcribed — or auto-suggest them from an interview on the Interviews tab.",
+    importBase: "Starter set",
+    importBaseTitle: "Add a ready-made IT / product glossary tuned for Russian speech",
+    imported: (n: number) => (n > 0 ? `Added ${n} term${n === 1 ? "" : "s"}` : "All terms are already in the glossary"),
+    importFailed: (e: string) => `Couldn't import the set. ${e}`,
   },
 };
 
@@ -180,6 +190,7 @@ function TermRow({ productId, term }: { productId: string; term: GlossaryTerm })
 export function GlossaryPanel({ productId }: { productId: string }) {
   const { data: terms, isPending } = useGlossaryTerms(productId);
   const create = useCreateGlossaryTerm(productId);
+  const addTerms = useAddGlossaryTerms(productId);
   const t = useT(STR);
   const [canonical, setCanonical] = useState("");
   const [aliases, setAliases] = useState("");
@@ -196,16 +207,39 @@ export function GlossaryPanel({ productId }: { productId: string }) {
     }
   }
 
+  // One-click: bulk-add the curated IT/product starter glossary (backend dedups against
+  // existing terms, so re-importing only adds what's new).
+  async function importSeed() {
+    try {
+      const added = await addTerms.mutateAsync(GLOSSARY_SEED);
+      toast.success(t.imported(added.length));
+    } catch (e) {
+      toast.error(t.importFailed(String(e)));
+    }
+  }
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-card/40 p-3">
       <div className="flex flex-col gap-0.5">
-        <span className="flex items-center gap-2 text-sm font-medium text-foreground">
-          <BookText className="size-4 text-muted-foreground" />
-          {t.glossary}
-          {terms && terms.length > 0 && (
-            <span className="font-numeric text-xs text-muted-foreground">({terms.length})</span>
-          )}
-        </span>
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <BookText className="size-4 text-muted-foreground" />
+            {t.glossary}
+            {terms && terms.length > 0 && (
+              <span className="font-numeric text-xs text-muted-foreground">({terms.length})</span>
+            )}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={importSeed}
+            disabled={addTerms.isPending}
+            title={t.importBaseTitle}
+          >
+            <Sparkles className="size-3.5" />
+            {t.importBase}
+          </Button>
+        </div>
         <p className="text-xs text-muted-foreground">{t.description}</p>
       </div>
 
