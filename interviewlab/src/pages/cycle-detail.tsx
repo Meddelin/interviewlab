@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
-import { Link, useLocation, useParams } from "react-router-dom";
-import { ArrowUpRight, Target } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Link,
+  useBlocker,
+  useLocation,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
+import { ArrowUpRight, ChevronRight, Target } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -97,6 +103,44 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
     setPrevCycleId(cycle.prev_cycle_id ?? NO_PREV);
   }, [cycle]);
 
+  // Dirty = a local buffer diverges from the loaded cycle. Compared field-by-field so a
+  // re-seed (after Save invalidates the query) clears it without extra bookkeeping.
+  const dirty = useMemo(() => {
+    if (!cycle) return false;
+    return (
+      name !== cycle.name ||
+      productDesc !== cycle.product_desc ||
+      productId !== (cycle.product_id ?? NO_PRODUCT) ||
+      guide !== cycle.guide ||
+      guideId !== (cycle.guide_id ?? NO_GUIDE) ||
+      prevCycleId !== (cycle.prev_cycle_id ?? NO_PREV)
+    );
+  }, [cycle, name, productDesc, productId, guide, guideId, prevCycleId]);
+
+  // Warn on window close/reload while there are unsaved Overview edits.
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  // Guard in-app navigation away from a dirty Overview (back, breadcrumb, Cmd+K, links).
+  // ponytail: a native confirm() matches the existing guard pattern (guides.tsx:148,
+  // cycle-chat-panel.tsx:309) — no AlertDialog plumbing needed.
+  const blocker = useBlocker(dirty);
+  useEffect(() => {
+    if (blocker.state !== "blocked") return;
+    if (window.confirm("Discard unsaved changes to this cycle?")) {
+      blocker.proceed();
+    } else {
+      blocker.reset();
+    }
+  }, [blocker]);
+
   if (isPending || !cycle) {
     return (
       <div className="flex flex-col gap-6 pt-2">
@@ -133,7 +177,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
   }
 
   return (
-    <div className="flex max-w-2xl flex-col gap-7 pt-2">
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-7 pt-2 2xl:max-w-3xl">
       <Field label="Name">
         <Input
           value={name}
@@ -308,15 +352,43 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
   );
 }
 
+const TABS = ["overview", "interviews", "synthesis", "diff"] as const;
+
 export function CycleDetailPage() {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { data: cycle } = useCycle(id);
 
-  // Controlled tab so a chat finding-citation (#finding-Fn) can switch to the Synthesis
-  // tab — where the synthesis tab's own effect then scrolls the finding into view (M11).
-  const [tab, setTab] = useState("overview");
+  // Active tab is mirrored in ?tab= for deep-linking. The query param is the source of
+  // truth; an unknown/missing value falls back to overview.
+  const tabParam = searchParams.get("tab") ?? "";
+  const tab = (TABS as readonly string[]).includes(tabParam)
+    ? tabParam
+    : "overview";
+
+  // Switching tabs writes ?tab= via the router; this IS a navigation, so leaving a dirty
+  // Overview is caught by that tab's own useBlocker (no separate confirm needed here).
+  const setTab = useCallback(
+    (next: string) => {
+      setSearchParams(
+        (prev) => {
+          const sp = new URLSearchParams(prev);
+          if (next === "overview") sp.delete("tab");
+          else sp.set("tab", next);
+          return sp;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // A chat finding-citation (#finding-Fn) deep-links into the Synthesis tab — where the
+  // synthesis tab's own effect then scrolls the finding into view (M11).
   useEffect(() => {
     if (location.hash.startsWith("#finding-")) setTab("synthesis");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.hash, location.key]);
 
   if (!id) return null;
@@ -325,7 +397,29 @@ export function CycleDetailPage() {
   // persist on EVERY cycle screen incl. the transcript editor. This page is now just the
   // cycle's tabs; the shell docks the panel against the whole content area.
   return (
-    <div className="flex h-full min-h-0 flex-col gap-5">
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-screen-xl flex-col gap-5 2xl:max-w-screen-2xl">
+      {/* Quiet wayfinding above the tabs: Cycles / {name}, Linear-style — no heavy H1. */}
+      <div className="flex flex-col gap-1">
+        <nav
+          aria-label="Breadcrumb"
+          className="flex items-center gap-1 text-xs text-muted-foreground"
+        >
+          <Link
+            to="/cycles"
+            className="rounded-sm transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+          >
+            Cycles
+          </Link>
+          <ChevronRight className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+          <span className="truncate text-foreground/80">
+            {cycle?.name ?? "…"}
+          </span>
+        </nav>
+        <h1 className="truncate text-sm font-medium tracking-[-0.01em] text-foreground">
+          {cycle?.name ?? " "}
+        </h1>
+      </div>
+
       <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1 gap-5">
         <TabsList variant="line" className="border-b border-border pb-0">
           <TabsTrigger value="overview">Overview</TabsTrigger>

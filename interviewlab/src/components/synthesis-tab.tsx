@@ -3,7 +3,10 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  Copy,
+  Download,
   FileText,
+  Info,
   LayoutList,
   Lightbulb,
   Loader2,
@@ -49,6 +52,28 @@ import {
 import { mockOnSynthesisProgress } from "@/lib/dev-mock";
 import { absoluteDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
+
+// ponytail: file-local copy/export helpers (no shared util module — same two helpers are
+// duplicated in diff-tab.tsx; factoring out a common module is deferred to the export layer).
+async function copyMarkdown(md: string) {
+  try {
+    await navigator.clipboard.writeText(md);
+    toast.success("Скопировано в буфер обмена");
+  } catch (e) {
+    toast.error(`Не удалось скопировать. ${String(e)}`);
+  }
+}
+
+// Download a markdown string as a .md file via a Blob + transient anchor.
+function exportMarkdown(md: string, filename: string) {
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 // Confidence → badge styling. Muted palette to fit the Linear bar: high reads in the
 // accent, medium neutral, low quiet.
@@ -205,7 +230,8 @@ function GoalSection({
           No findings surfaced for this goal in this wave.
         </p>
       ) : (
-        <div className="flex flex-col gap-3 pl-6">
+        // Wide: lay findings out as a multi-column card grid (one column on narrow).
+        <div className="grid grid-cols-1 gap-3 pl-6 xl:grid-cols-2 2xl:grid-cols-3">
           {findings.map((f) => (
             <FindingCard
               key={f.id}
@@ -450,6 +476,18 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     setEditorKey((k) => k + 1);
   }, [storedMd]);
 
+  // Guard the unsaved markdown draft: warn on window close/reload while dirty. (Router-level
+  // navigation guard is deferred — it needs a shared blocker the whole app opts into.)
+  useEffect(() => {
+    if (!dirty) return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
   // Subscribe to synthesis progress; clear on a terminal stage + refresh the synthesis.
   useEffect(() => {
     function onProgress(p: SynthesisProgress) {
@@ -593,6 +631,30 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
               </button>
             </div>
           )}
+          {hasSynthesis && (
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => copyMarkdown(draft || storedMd)}
+                title="Скопировать как Markdown"
+              >
+                <Copy className="size-3.5" />
+                Копировать .md
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  exportMarkdown(draft || storedMd, "synthesis.md")
+                }
+                title="Скачать как .md"
+              >
+                <Download className="size-3.5" />
+                Экспорт
+              </Button>
+            </>
+          )}
           <Button size="sm" onClick={handleRun} disabled={running}>
             {running ? (
               <>
@@ -627,7 +689,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
         <EmptyState goals={groupGoals} running={running} />
       ) : view === "artifact" ? (
         // The editable cycle markdown artifact (Plate). Edit + Save (the user owns it).
-        <div className="flex max-w-3xl flex-col gap-3">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">
               The editable report. Re-running regenerates it; your edits are saved.
@@ -642,6 +704,19 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
               {saveArtifact.isPending ? "Saving…" : "Save"}
             </Button>
           </div>
+          {/* MIN caveat (theme C): manual markdown edits never flow back into findings_json,
+              so Diff/Chat keep reading the machine version. No edit-timestamp field exists, so
+              this is a static caveat rather than a conditional one. */}
+          <div className="flex items-start gap-2 rounded-md border border-border bg-secondary/30 px-3 py-2">
+            <Info
+              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/70"
+              aria-hidden="true"
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              Ручные правки этого текста не попадают в Diff и Чат — там
+              используется машинная версия findings.
+            </p>
+          </div>
           <MarkdownEditor
             key={editorKey}
             value={draft}
@@ -655,7 +730,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
       ) : (
         // The structured view (read-only): hypotheses verdicts → per-question answers →
         // findings-by-goal (the data the diff compares).
-        <div className="flex max-w-2xl flex-col gap-8">
+        <div className="mx-auto flex w-full max-w-2xl flex-col gap-8 xl:max-w-6xl">
           {(doc?.hypothesis_verdicts?.length ?? 0) > 0 && (
             <HypothesesSection
               verdicts={doc!.hypothesis_verdicts!}

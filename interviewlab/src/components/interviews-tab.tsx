@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BookText,
   FileAudio,
@@ -30,13 +30,14 @@ import {
   useDeleteInterview,
   useInterviews,
 } from "@/lib/interview-queries";
-import { useModels } from "@/lib/asr-queries";
+import { asrKeys, useModels } from "@/lib/asr-queries";
 import { useUiStore } from "@/lib/ui-store";
 import {
   ASR_PROGRESS_EVENT,
   cancelTranscription,
   CLEANUP_PROGRESS_EVENT,
   cleanTranscript,
+  diarizationModelsPresent,
   DIAR_PROGRESS_EVENT,
   IN_TAURI,
   importTranscriptFile,
@@ -81,6 +82,13 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const navigate = useNavigate();
   const { data: interviews, isPending } = useInterviews(cycleId);
   const { data: models } = useModels();
+  // Whether the speaker-diarization model files are on disk — same small bool read
+  // Settings uses (settings.tsx:127). Lets us warn before a Transcribe run that would
+  // skip diarization because the model isn't downloaded yet.
+  const { data: diarPresent } = useQuery({
+    queryKey: asrKeys.diarPresent,
+    queryFn: diarizationModelsPresent,
+  });
   const addFiles = useAddInterviewFiles(cycleId);
   const deleteInterview = useDeleteInterview(cycleId);
   const qc = useQueryClient();
@@ -272,11 +280,34 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // Transcribe one interview with the Settings-chosen model + language. Optimistically
   // flips the row to 'transcribing'; the asr://progress stream + invalidation do the rest.
   async function transcribe(row: InterviewRow) {
+    // Re-running on an already-processed interview overwrites the transcript and any
+    // manual edits / speaker labels — guard it (ponytail: native confirm, like delete).
+    if (
+      row.status !== "new" &&
+      !confirm(
+        `Перетранскрибировать «${row.title}»? Это перезапишет существующий транскрипт и ручные правки/разметку спикеров.`,
+      )
+    )
+      return;
     if (!selectedModel?.downloaded) {
       toast.error(
         `The "${selectedModel?.label ?? asrModelId}" model isn't downloaded yet — get it in Settings → Transcription.`,
       );
       return;
+    }
+    // Diarization is best-effort: if its model isn't on disk the transcript still runs,
+    // just without speaker labels. Hint (non-blocking) with a jump to Settings so the
+    // user can grab it. diarPresent === undefined → status not loaded yet, don't nag.
+    if (diarPresent === false) {
+      toast.warning(
+        "Модель диаризации не скачана — спикеры (S1/S2…) не будут размечены.",
+        {
+          action: {
+            label: "Настройки",
+            onClick: () => navigate("/settings"),
+          },
+        },
+      );
     }
     setAsrProgress((prev) => ({ ...prev, [row.id]: 0 }));
     try {
@@ -345,6 +376,12 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // fresh S1/S2/… labels (the editor re-reads them on open). ponytail: no optimistic row
   // badge — re-diarize is quick and doesn't change the interview's status.
   async function rediarize(row: InterviewRow) {
+    if (
+      !confirm(
+        `Заново разметить спикеров в «${row.title}»? Это перезапишет существующую разметку спикеров и ручные правки.`,
+      )
+    )
+      return;
     try {
       const speakers = await rediarizeInterview(row.id, expectedSpeakers);
       toast.success(
@@ -359,6 +396,15 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // Run the "no grammar errors" cleanup pass (spec §6.7). Optimistically flips the row
   // to 'cleaning'; the cleanup://progress stream + invalidation do the rest.
   async function clean(row: InterviewRow) {
+    // First Clean on a raw transcript is non-destructive enough; but Re-clean over a
+    // cleaned/edited version overwrites manual edits — guard those.
+    if (
+      (row.status === "cleaned" || row.status === "edited") &&
+      !confirm(
+        `Очистить заново «${row.title}»? Это перезапишет существующий очищенный текст и ручные правки.`,
+      )
+    )
+      return;
     setCleanProgress((prev) => ({ ...prev, [row.id]: 0 }));
     try {
       await cleanTranscript(row.id);
@@ -669,7 +715,20 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                 className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                 onClick={(e) => {
                   e.stopPropagation();
-                  deleteInterview.mutate(row.original.id);
+                  // ponytail: native confirm() guard, same pattern as guides.tsx:148
+                  // / cycle-chat-panel.tsx:309 — no AlertDialog needed for a destructive
+                  // one-off. Toast confirms after; undo is out of scope (hard delete).
+                  if (
+                    !confirm(
+                      `Удалить «${row.original.title}»? Это нельзя отменить — удалятся транскрипт, правки и саммари.`,
+                    )
+                  )
+                    return;
+                  deleteInterview.mutate(row.original.id, {
+                    onSuccess: () => toast.success("Удалено"),
+                    onError: (e) =>
+                      toast.error(`Не удалось удалить. ${String(e)}`),
+                  });
                 }}
               >
                 <Trash2 className="size-4" />
@@ -693,42 +752,70 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
 
   const importing =
     interviews?.filter((i) => i.status === "importing").length ?? 0;
+  // Once the list has interviews, collapse the big dropzone into a slim strip so it
+  // doesn't eat vertical space (ui-backlog #4). Full zone only on the empty list.
+  const hasInterviews = !!interviews && interviews.length > 0;
 
   return (
     <div className="flex flex-col gap-4 pt-2">
       {/* Calm dashed dropzone — obvious target, unobtrusive chrome. The native
           drag-drop listener above covers the whole window; this is the affordance. */}
-      <div
-        className={cn(
-          "flex flex-col items-center gap-2.5 rounded-lg border border-dashed px-6 py-8 text-center transition-colors",
-          isDragOver
-            ? "border-primary bg-primary/5"
-            : "border-border hover:border-border-strong",
-        )}
-      >
-        <span className="flex size-9 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
-          <Upload className="size-4" />
-        </span>
-        <div className="flex flex-col gap-0.5">
-          <p className="text-sm font-medium text-foreground">
-            Drag audio or video files here
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Each file becomes an interview, normalized to 16 kHz audio. Already
-            have a diarized transcript? Use a row's <em>Import .txt</em> to attach
-            it instead of transcribing.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handlePick}
-          disabled={addFiles.isPending}
+      {hasInterviews ? (
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 rounded-lg border border-dashed px-3 py-2 text-left transition-colors",
+            isDragOver
+              ? "border-primary bg-primary/5"
+              : "border-border hover:border-border-strong",
+          )}
         >
-          <Upload className="size-4" />
-          Add files
-        </Button>
-      </div>
+          <span className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Upload className="size-3.5 shrink-0" />
+            Drag audio or video files here, or
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handlePick}
+            disabled={addFiles.isPending}
+          >
+            <Upload className="size-4" />
+            Add files
+          </Button>
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "flex flex-col items-center gap-2.5 rounded-lg border border-dashed px-6 py-8 text-center transition-colors",
+            isDragOver
+              ? "border-primary bg-primary/5"
+              : "border-border hover:border-border-strong",
+          )}
+        >
+          <span className="flex size-9 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
+            <Upload className="size-4" />
+          </span>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-sm font-medium text-foreground">
+              Drag audio or video files here
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Each file becomes an interview, normalized to 16 kHz audio. Already
+              have a diarized transcript? Use a row's <em>Import .txt</em> to
+              attach it instead of transcribing.
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handlePick}
+            disabled={addFiles.isPending}
+          >
+            <Upload className="size-4" />
+            Add files
+          </Button>
+        </div>
+      )}
 
       {/* Live ingest progress while files are being prepared (no spinner). */}
       {importing > 0 && (

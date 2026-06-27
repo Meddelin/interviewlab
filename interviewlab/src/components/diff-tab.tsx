@@ -3,6 +3,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
+  Copy,
+  Download,
   GitCompareArrows,
   Loader2,
   Minus,
@@ -18,6 +20,7 @@ import { diffKeys, useDiff, useDiffStatus, useRunDiff } from "@/lib/diff-queries
 import {
   DIFF_PROGRESS_EVENT,
   IN_TAURI,
+  type DiffDoc,
   type DiffEntry,
   type DiffGoalRef,
   type DiffProgress,
@@ -30,6 +33,62 @@ import {
 import { mockOnDiffProgress } from "@/lib/dev-mock";
 import { absoluteDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
+
+// ponytail: file-local copy/export helpers (same two as synthesis-tab.tsx — a shared util
+// module is deferred to the dedicated export layer in the roadmap).
+async function copyMarkdown(md: string) {
+  try {
+    await navigator.clipboard.writeText(md);
+    toast.success("Скопировано в буфер обмена");
+  } catch (e) {
+    toast.error(`Не удалось скопировать. ${String(e)}`);
+  }
+}
+
+function exportMarkdown(md: string, filename: string) {
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Diff has no stored content_md (only the structured doc), so render a plain-markdown
+// projection of the doc for copy/export. Mirrors the on-screen structure.
+function renderDiffMarkdown(doc: DiffDoc): string {
+  const lines: string[] = ["# Что изменилось vs предыдущей волны", ""];
+  if (doc.summary) lines.push(doc.summary, "");
+  if (doc.hypotheses?.length) {
+    lines.push("## Гипотезы", "");
+    for (const h of doc.hypotheses) {
+      lines.push(
+        `- **${h.hypothesis_id}** ${h.text} — ${h.shift}` +
+          (h.prev_verdict || h.verdict
+            ? ` (${h.prev_verdict ?? "—"} → ${h.verdict ?? "—"})`
+            : ""),
+      );
+      if (h.why) lines.push(`  - ${h.why}`);
+    }
+    lines.push("");
+  }
+  for (const goal of doc.goals) {
+    const group = doc.by_goal.find((g) => g.goal_id === goal.id);
+    lines.push(`## ${goal.id} ${goal.text}`, "");
+    const entries = group?.entries ?? [];
+    if (entries.length === 0) {
+      lines.push("_Нет findings для сравнения._", "");
+      continue;
+    }
+    for (const e of entries) {
+      lines.push(`- [${e.status}] ${e.statement}`);
+      if (e.why) lines.push(`  - ${e.why}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd() + "\n";
+}
 
 // status → label + the status-color vocabulary (index.css). Reuses the same family the
 // rest of the app uses: new=ready/green (fresh conclusion), changed=importing/amber
@@ -192,7 +251,8 @@ function GoalDiffSection({
           No findings to compare for this goal.
         </p>
       ) : (
-        <div className="flex flex-col gap-3 pl-6">
+        // Wide: lay diff entries out as a multi-column grid (one column on narrow).
+        <div className="grid grid-cols-1 gap-3 pl-6 xl:grid-cols-2 2xl:grid-cols-3">
           {ordered.map((e, i) => (
             <DiffEntryRow
               key={`${e.status}-${e.finding_id ?? ""}-${e.prev_finding_id ?? ""}-${i}`}
@@ -329,21 +389,47 @@ export function DiffTab({ cycleId }: { cycleId: string }) {
                 : "A findings-level diff of your conclusions, grouped by goal."}
           </p>
         </div>
-        {canRun && (
-          <Button size="sm" onClick={handleRun} disabled={running}>
-            {running ? (
-              <>
-                <Loader2 className="size-4 animate-spin" />
-                Comparing…
-              </>
-            ) : (
-              <>
-                <GitCompareArrows className="size-4" />
-                {hasDiff ? "Re-run diff" : "Run diff"}
-              </>
-            )}
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {hasDiff && (
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => copyMarkdown(renderDiffMarkdown(diff!.doc))}
+                title="Скопировать как Markdown"
+              >
+                <Copy className="size-3.5" />
+                Копировать .md
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  exportMarkdown(renderDiffMarkdown(diff!.doc), "diff.md")
+                }
+                title="Скачать как .md"
+              >
+                <Download className="size-3.5" />
+                Экспорт
+              </Button>
+            </>
+          )}
+          {canRun && (
+            <Button size="sm" onClick={handleRun} disabled={running}>
+              {running ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Comparing…
+                </>
+              ) : (
+                <>
+                  <GitCompareArrows className="size-4" />
+                  {hasDiff ? "Re-run diff" : "Run diff"}
+                </>
+              )}
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Live progress line during a run. */}
@@ -363,7 +449,7 @@ export function DiffTab({ cycleId }: { cycleId: string }) {
           prevName={status?.prev_cycle_name ?? null}
         />
       ) : hasDiff ? (
-        <div className="flex max-w-2xl flex-col gap-7">
+        <div className="mx-auto flex w-full max-w-2xl flex-col gap-7 xl:max-w-6xl">
           {/* One-line summary + a status tally of the whole wave. */}
           <div className="flex flex-col gap-3 rounded-lg border border-border bg-secondary/30 px-4 py-3">
             {diff!.doc.summary && (

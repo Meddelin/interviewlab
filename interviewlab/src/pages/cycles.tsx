@@ -2,18 +2,14 @@ import { useNavigate } from "react-router-dom";
 import { Waves } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { NewCycleDialog } from "@/components/new-cycle-dialog";
-import { StatusDot } from "@/components/status-dot";
 import { useCycles } from "@/lib/cycle-queries";
 import { relativeTime, absoluteDate } from "@/lib/format";
 import type { Cycle } from "@/lib/tauri";
 
-// A cycle is a "wave" of interviews — the subject's framing. Newer waves read as
-// active; older ones settle to idle. Derived only from fields the cycle already has.
-function waveStatus(cycle: Cycle): "processing" | "idle" {
-  const ageMs = Date.now() - cycle.updated_at;
-  return ageMs < 7 * 24 * 60 * 60 * 1000 ? "processing" : "idle";
-}
-
+// ponytail: the old status dot derived processing/idle from record age (updated_at < 7d),
+// which is a lie — it told nothing about real work. The honest interview-count metadata
+// isn't on the Cycle type (would need a backend/list_cycles change, out of scope here), so
+// the dot is removed rather than faked. The "wave N" index already carries quiet metadata.
 function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
   const navigate = useNavigate();
   const open = () => navigate(`/cycles/${cycle.id}`);
@@ -31,8 +27,6 @@ function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
       }}
       className="group flex h-12 cursor-pointer items-center gap-3 border-b border-border px-3 transition-colors last:border-b-0 hover:bg-secondary/40 focus-visible:bg-secondary/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
     >
-      <StatusDot kind={waveStatus(cycle)} label={false} />
-
       <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
         {cycle.name}
       </span>
@@ -56,7 +50,9 @@ export function CyclesPage() {
   const { data: cycles, isPending, isError, error, refetch } = useCycles();
 
   return (
-    <div className="flex flex-col gap-5">
+    // Wide: cap the list so rows don't stretch into a dead gap between the name (left) and
+    // the timestamp (right) on ultrawide; centered with mx-auto, a touch wider at 2xl.
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 2xl:max-w-4xl">
       <header className="flex items-center justify-between gap-4">
         <div className="flex flex-col gap-0.5">
           <h1 className="text-lg font-semibold tracking-[-0.02em] text-foreground">
@@ -77,7 +73,6 @@ export function CyclesPage() {
               key={i}
               className="flex h-12 items-center gap-3 border-b border-border px-3 last:border-b-0"
             >
-              <Skeleton className="size-1.5 rounded-full" />
               <Skeleton className="h-4 w-48" />
               <Skeleton className="ml-auto h-3 w-16" />
             </div>
