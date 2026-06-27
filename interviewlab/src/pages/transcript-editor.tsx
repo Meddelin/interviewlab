@@ -94,6 +94,7 @@ import { formatTimecode } from "@/lib/format";
 import { mod } from "@/lib/platform";
 import { wordDiff, textChanged } from "@/lib/word-diff";
 import { cn } from "@/lib/utils";
+import { useT, tr, currentLang } from "@/lib/i18n";
 
 // A local, editable participant (id may be a client temp id until saved). `role` is now a
 // role-library id (M10a) rather than the old fixed enum; seeded ids equal the old enum
@@ -122,9 +123,11 @@ function lookupRole(roles: Role[], id: string | undefined): Role | undefined {
   return roles.find((r) => r.id === id);
 }
 
-// ponytail: tiny inline RU plural for "сегмент" (1 сегмент / 2 сегмента / 5 сегментов).
-// Local to this file — no shared i18n module (that's a deferred central-dictionary task).
+// ponytail: tiny inline plural for "segment" — RU has three forms
+// (1 сегмент / 2 сегмента / 5 сегментов), EN two (segment / segments).
+// Reads the current UI language straight from the store (non-hook callers below).
 function pluralSegments(n: number): string {
+  if (currentLang() === "en") return n === 1 ? "segment" : "segments";
   const mod10 = n % 10;
   const mod100 = n % 100;
   if (mod10 === 1 && mod100 !== 11) return "сегмент";
@@ -164,6 +167,20 @@ function coalesceSegments(segs: Segment[]): Segment[] {
 // Per-segment speaker reassignment via Popover + Command (spec §4.3). Lists the
 // interview's participants (by their bound speaker_label) plus a quick "set role"
 // fallback for segments whose label has no participant yet.
+const SPEAKER_PICKER_STR = {
+  ru: {
+    assignPlaceholder: "Назначить спикера…",
+    noParticipants: "Пока нет участников.",
+    participants: "Участники",
+    assignRoleDirectly: "Назначить роль напрямую",
+  },
+  en: {
+    assignPlaceholder: "Assign speaker…",
+    noParticipants: "No participants yet.",
+    participants: "Participants",
+    assignRoleDirectly: "Assign role directly",
+  },
+};
 function SpeakerPicker({
   current,
   participants,
@@ -177,6 +194,7 @@ function SpeakerPicker({
   onPick: (speakerLabel: string) => void;
   children: React.ReactNode;
 }) {
+  const t = useT(SPEAKER_PICKER_STR);
   const [open, setOpen] = useState(false);
   // Participants with a bound speaker label are the primary choices.
   const bound = participants.filter((p) => p.speaker_label);
@@ -185,11 +203,11 @@ function SpeakerPicker({
       <PopoverTrigger asChild>{children}</PopoverTrigger>
       <PopoverContent align="start" className="w-64 p-0">
         <Command>
-          <CommandInput placeholder="Назначить спикера…" className="h-9" />
+          <CommandInput placeholder={t.assignPlaceholder} className="h-9" />
           <CommandList>
-            <CommandEmpty>Пока нет участников.</CommandEmpty>
+            <CommandEmpty>{t.noParticipants}</CommandEmpty>
             {bound.length > 0 && (
-              <CommandGroup heading="Участники">
+              <CommandGroup heading={t.participants}>
                 {bound.map((p) => {
                   const role = lookupRole(roles, p.role);
                   return (
@@ -210,7 +228,7 @@ function SpeakerPicker({
                 })}
               </CommandGroup>
             )}
-            <CommandGroup heading="Назначить роль напрямую">
+            <CommandGroup heading={t.assignRoleDirectly}>
               {roles.map((role) => (
                 <CommandItem
                   key={role.id}
@@ -237,6 +255,28 @@ function SpeakerPicker({
 // ─── Participants panel (left pane) ────────────────────────────────────────────
 // Define participants (name + role) and bind each to a transcript speaker label
 // (manual diarization, spec §4.5). The whole list is owned here and saved on Save.
+const PARTICIPANTS_PANEL_STR = {
+  ru: {
+    title: "Участники и спикеры",
+    add: "Добавить",
+    emptyState:
+      "Пока нет участников. Добавьте интервьюера и респондента, затем привяжите каждого к спикеру.",
+    name: "Имя",
+    removeParticipant: "Удалить участника",
+    speaker: "Спикер",
+    noSpeaker: "Без спикера",
+  },
+  en: {
+    title: "Participants & speakers",
+    add: "Add",
+    emptyState:
+      "No participants yet. Add an interviewer and a respondent, then bind each to a speaker.",
+    name: "Name",
+    removeParticipant: "Remove participant",
+    speaker: "Speaker",
+    noSpeaker: "No speaker",
+  },
+};
 function ParticipantsPanel({
   participants,
   speakerLabels,
@@ -248,6 +288,7 @@ function ParticipantsPanel({
   roles: Role[];
   onChange: (next: DraftParticipant[]) => void;
 }) {
+  const t = useT(PARTICIPANTS_PANEL_STR);
   function update(id: string, patch: Partial<DraftParticipant>) {
     onChange(participants.map((p) => (p.id === id ? { ...p, ...patch } : p)));
   }
@@ -276,18 +317,17 @@ function ParticipantsPanel({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <Users className="size-3.5" />
-          <span>Участники и спикеры</span>
+          <span>{t.title}</span>
         </div>
         <Button variant="ghost" size="xs" onClick={add} className="text-muted-foreground">
           <Plus className="size-3" />
-          Добавить
+          {t.add}
         </Button>
       </div>
 
       {participants.length === 0 ? (
         <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-          Пока нет участников. Добавьте интервьюера и респондента, затем привяжите каждого
-          к спикеру.
+          {t.emptyState}
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
@@ -307,14 +347,14 @@ function ParticipantsPanel({
                 />
                 <Input
                   value={p.display_name}
-                  placeholder="Имя"
+                  placeholder={t.name}
                   onChange={(e) => update(p.id, { display_name: e.target.value })}
                   className="h-7 flex-1 border-transparent bg-transparent px-1.5 text-sm shadow-none focus-visible:border-input"
                 />
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label="Удалить участника"
+                  aria-label={t.removeParticipant}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/p:opacity-100 focus-visible:opacity-100"
                   onClick={() => remove(p.id)}
                 >
@@ -346,11 +386,11 @@ function ParticipantsPanel({
                   }
                 >
                   <SelectTrigger size="sm" className="h-7 flex-1">
-                    <SelectValue placeholder="Спикер" />
+                    <SelectValue placeholder={t.speaker} />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value={NONE}>
-                      <span className="text-muted-foreground">Без спикера</span>
+                      <span className="text-muted-foreground">{t.noSpeaker}</span>
                     </SelectItem>
                     {speakerLabels.map((label) => (
                       <SelectItem key={label} value={label}>
@@ -373,6 +413,44 @@ function ParticipantsPanel({
 // checkbox + its own auto-growing textarea. The speaker chip now lives at the TURN level
 // (see TurnBlock), so a micro-segment no longer repeats it — the row just carries text +
 // timing + per-segment controls. Multi-select (checkbox + bulk-assign bar) stays available.
+const SEGMENT_LINE_STR = {
+  ru: {
+    deselectSegment: (n: number) => `Снять выделение сегмента ${n}`,
+    selectSegment: (n: number) => `Выделить сегмент ${n}`,
+    pause: "Пауза",
+    playFromHere: "Воспроизвести с этого момента",
+    playFrom: (tc: string) => `Воспроизвести с ${tc}`,
+    editSegmentText: (n: number) => `Редактировать текст сегмента ${n}`,
+    rewriteSegmentTitle: "Переписать этот сегмент через модель",
+    rewriteSegmentAria: (n: number) => `Переписать сегмент ${n}`,
+    rewriting: "Переписываю…",
+    rewriteSegment: "Переписать сегмент",
+    showChangesTitle: "Показать, что изменилось относительно оригинала",
+    changed: "Изменено",
+    revertTitle: "Вернуть исходный текст сегмента",
+    revertAria: (n: number) => `Вернуть исходный текст сегмента ${n}`,
+    revert: "Вернуть",
+    changesVsOriginal: "Изменения относительно оригинала",
+  },
+  en: {
+    deselectSegment: (n: number) => `Deselect segment ${n}`,
+    selectSegment: (n: number) => `Select segment ${n}`,
+    pause: "Pause",
+    playFromHere: "Play from here",
+    playFrom: (tc: string) => `Play from ${tc}`,
+    editSegmentText: (n: number) => `Edit segment ${n} text`,
+    rewriteSegmentTitle: "Rewrite this segment with the model",
+    rewriteSegmentAria: (n: number) => `Rewrite segment ${n}`,
+    rewriting: "Rewriting…",
+    rewriteSegment: "Rewrite segment",
+    showChangesTitle: "Show what changed from the original",
+    changed: "Changed",
+    revertTitle: "Restore the segment's original text",
+    revertAria: (n: number) => `Restore segment ${n} original text`,
+    revert: "Revert",
+    changesVsOriginal: "Changes from the original",
+  },
+};
 function SegmentLine({
   segment,
   index,
@@ -417,6 +495,7 @@ function SegmentLine({
   onKeyDown: (e: React.KeyboardEvent) => void;
   onFocus: () => void;
 }) {
+  const t = useT(SEGMENT_LINE_STR);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   // Has this segment's text diverged from the original? Drives the "Changed" chip + diff.
   const changed = baseline != null && textChanged(baseline, segment.text);
@@ -497,7 +576,7 @@ function SegmentLine({
         type="button"
         role="checkbox"
         aria-checked={selected}
-        aria-label={selected ? `Снять выделение сегмента ${index + 1}` : `Выделить сегмент ${index + 1}`}
+        aria-label={selected ? t.deselectSegment(index + 1) : t.selectSegment(index + 1)}
         onClick={onToggleSelect}
         className={cn(
           "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-[5px] border-2 transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
@@ -517,8 +596,8 @@ function SegmentLine({
           type="button"
           onClick={onPlay}
           className="group/play flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 -ml-1 font-numeric text-xs text-muted-foreground tabular-nums transition-colors hover:bg-secondary/60 hover:text-primary focus-visible:text-primary focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-          title={playing ? "Пауза" : "Воспроизвести с этого момента"}
-          aria-label={playing ? "Пауза" : `Воспроизвести с ${formatTimecode(segment.start_ms)}`}
+          title={playing ? t.pause : t.playFromHere}
+          aria-label={playing ? t.pause : t.playFrom(formatTimecode(segment.start_ms))}
         >
           {playing ? (
             <Pause className="size-3 shrink-0 text-primary" />
@@ -552,7 +631,7 @@ function SegmentLine({
           }}
           rows={1}
           spellCheck={false}
-          aria-label={`Редактировать текст сегмента ${index + 1}`}
+          aria-label={t.editSegmentText(index + 1)}
           className={cn(
             "block w-full cursor-text resize-none overflow-hidden rounded-md border bg-transparent px-2 py-1 -mx-2 -my-1 text-[13.5px] leading-relaxed text-foreground/90 outline-none transition-colors placeholder:text-muted-foreground",
             "border-transparent group-hover/seg:border-border group-hover/seg:bg-background/60",
@@ -574,8 +653,8 @@ function SegmentLine({
               type="button"
               onClick={onRewrite}
               disabled={rewriting}
-              title="Переписать этот сегмент через модель"
-              aria-label={`Переписать сегмент ${index + 1}`}
+              title={t.rewriteSegmentTitle}
+              aria-label={t.rewriteSegmentAria(index + 1)}
               className={cn(
                 "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
                 rewriting
@@ -588,7 +667,7 @@ function SegmentLine({
               ) : (
                 <Wand2 className="size-3 shrink-0" />
               )}
-              {rewriting ? "Переписываю…" : "Переписать сегмент"}
+              {rewriting ? t.rewriting : t.rewriteSegment}
             </button>
           )}
 
@@ -597,7 +676,7 @@ function SegmentLine({
               type="button"
               onClick={() => setDiffOpen((o) => !o)}
               aria-expanded={diffShown}
-              title="Показать, что изменилось относительно оригинала"
+              title={t.showChangesTitle}
               className={cn(
                 "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                 diffShown
@@ -606,7 +685,7 @@ function SegmentLine({
               )}
             >
               <GitCompareArrows className="size-3 shrink-0" />
-              Изменено
+              {t.changed}
             </button>
           )}
 
@@ -614,12 +693,12 @@ function SegmentLine({
             <button
               type="button"
               onClick={onRevert}
-              title="Вернуть исходный текст сегмента"
-              aria-label={`Вернуть исходный текст сегмента ${index + 1}`}
+              title={t.revertTitle}
+              aria-label={t.revertAria(index + 1)}
               className="flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/70 transition-colors hover:border-border hover:bg-secondary/60 hover:text-foreground focus-visible:border-border focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
             >
               <Undo2 className="size-3 shrink-0" />
-              Вернуть
+              {t.revert}
             </button>
           )}
         </div>
@@ -631,7 +710,7 @@ function SegmentLine({
           <div className="mt-1.5 rounded-md border border-border bg-secondary/30 px-2.5 py-1.5">
             <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
               <GitCompareArrows className="size-3 shrink-0" />
-              Изменения относительно оригинала
+              {t.changesVsOriginal}
             </div>
             <p className="text-[13px] leading-relaxed break-words whitespace-pre-wrap">
               {diffParts.map((p, i) =>
@@ -669,6 +748,10 @@ function SegmentLine({
 // segments via the SpeakerPicker → onAssignTurn), with the turn's segments listed under it
 // (each its own SegmentLine). This is what makes the transcript read as an alternating
 // dialogue instead of a wall of tiny rows. Timing + segment count are untouched.
+const TURN_BLOCK_STR = {
+  ru: { assignSpeaker: "Назначить спикера для этой реплики" },
+  en: { assignSpeaker: "Assign a speaker for this turn" },
+};
 function TurnBlock({
   turn,
   segments,
@@ -721,6 +804,7 @@ function TurnBlock({
   onSegmentKeyDown: (index: number, e: React.KeyboardEvent) => void;
   onSegmentFocus: (index: number) => void;
 }) {
+  const t = useT(TURN_BLOCK_STR);
   return (
     <div className="flex flex-col gap-0.5 py-1.5">
       {/* Turn header: the single speaker chip for the whole run. Picking a new speaker
@@ -735,7 +819,7 @@ function TurnBlock({
           <button
             type="button"
             className="w-fit rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-            title="Назначить спикера для этой реплики"
+            title={t.assignSpeaker}
           >
             <RoleChip
               color={roleColor}
@@ -782,12 +866,89 @@ function TurnBlock({
 }
 
 // ─── The editor page ───────────────────────────────────────────────────────────
+const PAGE_STR = {
+  ru: {
+    // toasts / confirm (used in callbacks via tr)
+    segmentRewritten: "Сегмент переписан",
+    noChanges: "Без изменений",
+    rewriteFailed: (e: string) => `Не удалось переписать. ${e}`,
+    modelNotDownloaded: "Модель не скачана — Настройки → Транскрипция.",
+    retranscribeFailed: (e: string) => `Не удалось перетранскрибировать фрагмент. ${e}`,
+    resumeFailed: (e: string) => `Не удалось продолжить. ${e}`,
+    saveSuccess: "Правки транскрипта сохранены",
+    saveFailed: (e: string) => `Не удалось сохранить. ${e}`,
+    leaveConfirm: "Уйти без сохранения? Изменения потеряются.",
+    // toolbar / body (used in JSX via t)
+    backToCycle: "Назад к циклу",
+    transcriptFallbackTitle: "Транскрипт",
+    unsavedChanges: "Несохранённые изменения",
+    transcript: "Транскрипт",
+    summary: "Саммари",
+    diarizing: "Диаризация…",
+    transcribing: "Транскрибирование…",
+    showAllDiffsTitle: "Показать изменения относительно оригинала по всем сегментам",
+    hideChanges: "Скрыть изменения",
+    changes: "Изменения",
+    saving: "Сохранение…",
+    save: "Сохранить",
+    transcriptionStoppedAt: (tc: string) => `Транскрипция прервалась на ${tc}`,
+    partialSavedHint: " — сохранён частичный результат. Можно продолжить с этого места.",
+    resume: "Продолжить",
+    recording: "Запись",
+    noAudio: "Для этого интервью нет подготовленного аудио.",
+    unassignedSuffix: "без назначенной роли",
+    noSegmentsInVersion: "В этой версии нет сегментов.",
+    transcriptSegments: "Сегменты транскрипта",
+    selectedLabel: "Выделено",
+    assignSpeaker: "Назначить спикера",
+    retranscribeSelectionTitle: "Перетранскрибировать выделенный фрагмент аудио заново",
+    retranscribe: "Перетранскрибировать",
+    clear: "Сбросить",
+  },
+  en: {
+    segmentRewritten: "Segment rewritten",
+    noChanges: "No changes",
+    rewriteFailed: (e: string) => `Couldn't rewrite. ${e}`,
+    modelNotDownloaded: "Model not downloaded — Settings → Transcription.",
+    retranscribeFailed: (e: string) => `Couldn't re-transcribe the fragment. ${e}`,
+    resumeFailed: (e: string) => `Couldn't resume. ${e}`,
+    saveSuccess: "Transcript edits saved",
+    saveFailed: (e: string) => `Couldn't save. ${e}`,
+    leaveConfirm: "Leave without saving? Your changes will be lost.",
+    backToCycle: "Back to cycle",
+    transcriptFallbackTitle: "Transcript",
+    unsavedChanges: "Unsaved changes",
+    transcript: "Transcript",
+    summary: "Summary",
+    diarizing: "Diarizing…",
+    transcribing: "Transcribing…",
+    showAllDiffsTitle: "Show changes from the original across all segments",
+    hideChanges: "Hide changes",
+    changes: "Changes",
+    saving: "Saving…",
+    save: "Save",
+    transcriptionStoppedAt: (tc: string) => `Transcription stopped at ${tc}`,
+    partialSavedHint: " — a partial result was saved. You can continue from here.",
+    resume: "Resume",
+    recording: "Recording",
+    noAudio: "No prepared audio for this interview.",
+    unassignedSuffix: "with no assigned role",
+    noSegmentsInVersion: "This version has no segments.",
+    transcriptSegments: "Transcript segments",
+    selectedLabel: "Selected",
+    assignSpeaker: "Assign speaker",
+    retranscribeSelectionTitle: "Re-transcribe the selected audio fragment from scratch",
+    retranscribe: "Re-transcribe",
+    clear: "Clear",
+  },
+};
 export function TranscriptEditorPage() {
   const { cycleId, interviewId } = useParams<{
     cycleId: string;
     interviewId: string;
   }>();
   const navigate = useNavigate();
+  const t = useT(PAGE_STR);
 
   // Cycle (for the breadcrumb context above the title — quiet wayfinding).
   const { data: cycle } = useCycle(cycleId);
@@ -1097,12 +1258,12 @@ export function TranscriptEditorPage() {
         const next = cleaned.trim();
         if (next && next !== original.trim()) {
           setText(index, next);
-          toast.success("Сегмент переписан");
+          toast.success(tr(PAGE_STR).segmentRewritten);
         } else {
-          toast("Без изменений");
+          toast(tr(PAGE_STR).noChanges);
         }
       } catch (e) {
-        toast.error(`Не удалось переписать. ${String(e)}`);
+        toast.error(tr(PAGE_STR).rewriteFailed(String(e)));
       } finally {
         setRewritingIndex(null);
       }
@@ -1241,7 +1402,7 @@ export function TranscriptEditorPage() {
     const endMs = Math.max(...idxs.map((i) => segments[i]?.end_ms ?? 0));
     if (endMs <= startMs) return;
     if (!models?.find((m) => m.id === asrModelId)?.downloaded) {
-      toast.error("Модель не скачана — Настройки → Транскрипция.");
+      toast.error(tr(PAGE_STR).modelNotDownloaded);
       return;
     }
     clearSelection();
@@ -1255,7 +1416,7 @@ export function TranscriptEditorPage() {
         expectedSpeakers,
       );
     } catch (e) {
-      toast.error(`Не удалось перетранскрибировать фрагмент. ${String(e)}`);
+      toast.error(tr(PAGE_STR).retranscribeFailed(String(e)));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interviewId, selected, segments, models, asrModelId, asrLanguage, expectedSpeakers]);
@@ -1266,7 +1427,7 @@ export function TranscriptEditorPage() {
     try {
       await resumeTranscription(interviewId, asrLanguage, expectedSpeakers);
     } catch (e) {
-      toast.error(`Не удалось продолжить. ${String(e)}`);
+      toast.error(tr(PAGE_STR).resumeFailed(String(e)));
     }
   }, [interviewId, asrLanguage, expectedSpeakers]);
 
@@ -1313,9 +1474,9 @@ export function TranscriptEditorPage() {
       });
       setDirty(false);
       setActiveKind("edited");
-      toast.success("Правки транскрипта сохранены");
+      toast.success(tr(PAGE_STR).saveSuccess);
     } catch (e) {
-      toast.error(`Не удалось сохранить. ${String(e)}`);
+      toast.error(tr(PAGE_STR).saveFailed(String(e)));
     }
   }, [interviewId, participants, segments, version?.language, saveMutation, roles]);
 
@@ -1338,7 +1499,7 @@ export function TranscriptEditorPage() {
   // this makes the dirty state actually BLOCK an accidental exit instead of silently
   // dropping the work. Native confirm() matches the existing pattern (guides.tsx:148).
   function goBack() {
-    if (dirty && !confirm("Уйти без сохранения? Изменения потеряются.")) return;
+    if (dirty && !confirm(tr(PAGE_STR).leaveConfirm)) return;
     navigate(`/cycles/${cycleId}`);
   }
 
@@ -1364,7 +1525,7 @@ export function TranscriptEditorPage() {
           variant="ghost"
           size="icon-sm"
           onClick={goBack}
-          aria-label="Назад к циклу"
+          aria-label={t.backToCycle}
           className="text-muted-foreground"
         >
           <ArrowLeft className="size-4" />
@@ -1382,13 +1543,13 @@ export function TranscriptEditorPage() {
             </span>
           )}
           <span className="truncate text-sm font-medium text-foreground">
-            {interview?.title ?? "Транскрипт"}
+            {interview?.title ?? t.transcriptFallbackTitle}
           </span>
           {dirty && (
             <span
               className="size-1.5 shrink-0 rounded-full bg-status-importing"
-              title="Несохранённые изменения"
-              aria-label="Несохранённые изменения"
+              title={t.unsavedChanges}
+              aria-label={t.unsavedChanges}
             />
           )}
         </div>
@@ -1407,7 +1568,7 @@ export function TranscriptEditorPage() {
               )}
             >
               <ListTree className="size-3.5" />
-              Транскрипт
+              {t.transcript}
             </button>
             <button
               type="button"
@@ -1420,7 +1581,7 @@ export function TranscriptEditorPage() {
               )}
             >
               <FileText className="size-3.5" />
-              Саммари
+              {t.summary}
             </button>
           </div>
 
@@ -1435,7 +1596,7 @@ export function TranscriptEditorPage() {
           {pane === "transcript" && isLive && (
             <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
               <Loader2 className="size-3.5 animate-spin" />
-              <span>{live.diarActive ? "Диаризация…" : "Транскрибирование…"}</span>
+              <span>{live.diarActive ? t.diarizing : t.transcribing}</span>
             </span>
           )}
 
@@ -1452,7 +1613,7 @@ export function TranscriptEditorPage() {
                   type="button"
                   onClick={() => setShowDiff((s) => !s)}
                   aria-pressed={showDiff}
-                  title="Показать изменения относительно оригинала по всем сегментам"
+                  title={t.showAllDiffsTitle}
                   className={cn(
                     "flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                     showDiff
@@ -1461,7 +1622,7 @@ export function TranscriptEditorPage() {
                   )}
                 >
                   <GitCompareArrows className="size-3.5" />
-                  {showDiff ? "Скрыть изменения" : "Изменения"}
+                  {showDiff ? t.hideChanges : t.changes}
                   <span className="font-numeric tabular-nums rounded bg-status-importing/20 px-1 text-[10px] text-status-importing">
                     {changedCount}
                   </span>
@@ -1474,7 +1635,7 @@ export function TranscriptEditorPage() {
                 disabled={!dirty || saveMutation.isPending || !editable}
               >
                 <Save className="size-3.5" />
-                {saveMutation.isPending ? "Сохранение…" : "Сохранить"}
+                {saveMutation.isPending ? t.saving : t.save}
                 <kbd className="ml-1 hidden font-numeric text-[10px] text-primary-foreground/70 sm:inline">
                   {mod("S")}
                 </kbd>
@@ -1492,16 +1653,13 @@ export function TranscriptEditorPage() {
           <RotateCcw className="size-4 shrink-0 text-status-importing" />
           <div className="min-w-0 flex-1 text-xs">
             <span className="font-medium text-foreground">
-              Транскрипция прервалась на {formatTimecode(checkpoint.processed_ms)}
+              {t.transcriptionStoppedAt(formatTimecode(checkpoint.processed_ms))}
             </span>
-            <span className="text-muted-foreground">
-              {" "}
-              — сохранён частичный результат. Можно продолжить с этого места.
-            </span>
+            <span className="text-muted-foreground">{t.partialSavedHint}</span>
           </div>
           <Button size="sm" onClick={doResume}>
             <RotateCcw className="size-3.5" />
-            Продолжить
+            {t.resume}
           </Button>
         </div>
       )}
@@ -1514,7 +1672,7 @@ export function TranscriptEditorPage() {
             <section className="flex flex-col gap-3">
               <div className="flex items-baseline justify-between">
                 <span className="text-xs font-medium text-muted-foreground">
-                  Запись
+                  {t.recording}
                 </span>
                 {interview?.format && (
                   <span className="font-numeric text-[11px] text-muted-foreground/70 uppercase">
@@ -1531,9 +1689,7 @@ export function TranscriptEditorPage() {
                   onPlayingChange={setIsPlaying}
                 />
               ) : (
-                <p className="text-xs text-muted-foreground">
-                  Для этого интервью нет подготовленного аудио.
-                </p>
+                <p className="text-xs text-muted-foreground">{t.noAudio}</p>
               )}
             </section>
 
@@ -1552,7 +1708,7 @@ export function TranscriptEditorPage() {
             {unassignedCount > 0 && (
               <p className="flex items-center gap-1.5 rounded-md bg-status-importing/10 px-2.5 py-1.5 text-xs text-status-importing">
                 <span className="size-1.5 rounded-full bg-status-importing" />
-                {unassignedCount} {pluralSegments(unassignedCount)} без назначенной роли
+                {unassignedCount} {pluralSegments(unassignedCount)} {t.unassignedSuffix}
               </p>
             )}
           </div>
@@ -1606,7 +1762,7 @@ export function TranscriptEditorPage() {
               ) : segments.length === 0 ? (
                 <div className="flex h-full items-center justify-center">
                   <p className="text-sm text-muted-foreground">
-                    В этой версии нет сегментов.
+                    {t.noSegmentsInVersion}
                   </p>
                 </div>
               ) : (
@@ -1618,7 +1774,7 @@ export function TranscriptEditorPage() {
                 <div
                   role="listbox"
                   aria-multiselectable="true"
-                  aria-label="Сегменты транскрипта"
+                  aria-label={t.transcriptSegments}
                   className="flex max-w-5xl flex-col gap-1"
                 >
                   {turns.map((turn) => {
@@ -1666,7 +1822,7 @@ export function TranscriptEditorPage() {
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-4">
                 <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-border bg-popover/95 px-2 py-1.5 shadow-lg shadow-black/20 backdrop-blur supports-[backdrop-filter]:bg-popover/80">
                   <span className="pl-1.5 text-xs text-foreground">
-                    Выделено{" "}
+                    {t.selectedLabel}{" "}
                     <span className="font-numeric tabular-nums font-medium">
                       {selected.size}
                     </span>
@@ -1680,7 +1836,7 @@ export function TranscriptEditorPage() {
                   >
                     <Button size="xs" variant="secondary" disabled={!editable}>
                       <Users className="size-3" />
-                      Назначить спикера
+                      {t.assignSpeaker}
                       <ChevronDown className="size-3 opacity-70" />
                     </Button>
                   </SpeakerPicker>
@@ -1690,10 +1846,10 @@ export function TranscriptEditorPage() {
                     size="xs"
                     variant="secondary"
                     onClick={retranscribeSelection}
-                    title="Перетранскрибировать выделенный фрагмент аудио заново"
+                    title={t.retranscribeSelectionTitle}
                   >
                     <RotateCcw className="size-3" />
-                    Перетранскрибировать
+                    {t.retranscribe}
                   </Button>
                   <Button
                     size="xs"
@@ -1702,7 +1858,7 @@ export function TranscriptEditorPage() {
                     className="text-muted-foreground"
                   >
                     <X className="size-3" />
-                    Сбросить
+                    {t.clear}
                   </Button>
                 </div>
               </div>

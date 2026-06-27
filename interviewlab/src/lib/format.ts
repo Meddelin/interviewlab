@@ -1,25 +1,43 @@
 // Small, dependency-free formatters for the domain's data: timecodes, durations,
 // and relative dates. Numbers render mono/tabular at the call site (font-numeric).
 
+import { tr } from "@/lib/i18n";
+
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
-// "2h ago", "3d ago", "just now" — compact relative time for list metadata.
+const STR = {
+  ru: {
+    justNow: "только что",
+    minAgo: (m: number) => `${m} мин назад`,
+    hAgo: (h: number) => `${h} ч назад`,
+    dAgo: (d: number) => `${d} дн назад`,
+  },
+  en: {
+    justNow: "just now",
+    minAgo: (m: number) => `${m}m ago`,
+    hAgo: (h: number) => `${h}h ago`,
+    dAgo: (d: number) => `${d}d ago`,
+  },
+} as const;
+
+// "2 ч назад", "3 дн назад", "только что" — compact relative time for list metadata.
 export function relativeTime(ms: number, now = Date.now()): string {
+  const t = tr(STR);
   const diff = now - ms;
-  if (diff < 45 * 1000) return "just now";
+  if (diff < 45 * 1000) return t.justNow;
   if (diff < HOUR) {
     const m = Math.round(diff / MIN);
-    return `${m}m ago`;
+    return t.minAgo(m);
   }
   if (diff < DAY) {
     const h = Math.round(diff / HOUR);
-    return `${h}h ago`;
+    return t.hAgo(h);
   }
   if (diff < 30 * DAY) {
     const d = Math.round(diff / DAY);
-    return `${d}d ago`;
+    return t.dAgo(d);
   }
   // Older than a month: fall back to an absolute, unambiguous date.
   return new Date(ms).toLocaleDateString(undefined, {

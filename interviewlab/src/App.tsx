@@ -5,6 +5,7 @@ import { BackendStatus } from "@/components/backend-status";
 import { CommandPalette } from "@/components/command-palette";
 import { OnboardingWizard } from "@/components/onboarding-wizard";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { LanguageToggle } from "@/components/language-toggle";
 import { CycleChatPanel } from "@/components/cycle-chat-panel";
 import {
   ResizableHandle,
@@ -15,15 +16,47 @@ import { useUiStore } from "@/lib/ui-store";
 import { useLiveAsr } from "@/lib/use-live-asr";
 import { mod } from "@/lib/platform";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    nav: {
+      cycles: "Циклы",
+      guides: "Гайды",
+      products: "Продукты",
+      settings: "Настройки",
+    },
+    askAi: "Спросить AI",
+    workspace: "InterviewLab",
+    primaryNav: "Основная навигация",
+    openPalette: "Открыть командную палитру",
+    search: "Поиск",
+    skipToContent: "Перейти к содержимому",
+  },
+  en: {
+    nav: {
+      cycles: "Cycles",
+      guides: "Guides",
+      products: "Products",
+      settings: "Settings",
+    },
+    askAi: "Ask AI",
+    workspace: "InterviewLab",
+    primaryNav: "Primary",
+    openPalette: "Open command palette",
+    search: "Search",
+    skipToContent: "Skip to content",
+  },
+};
 
 // React Router shell (M2): App is the layout; nested routes render in <Outlet />.
 // ponytail: Cycles / Guides / Settings are too few items to justify a left sidebar,
 // so the shell is a compact TOP HEADER nav and the work area gets the full width.
-const NAV: { to: string; label: string }[] = [
-  { to: "/cycles", label: "Cycles" },
-  { to: "/guides", label: "Guides" },
-  { to: "/products", label: "Products" },
-  { to: "/settings", label: "Settings" },
+const NAV: { to: string; key: "cycles" | "guides" | "products" | "settings" }[] = [
+  { to: "/cycles", key: "cycles" },
+  { to: "/guides", key: "guides" },
+  { to: "/products", key: "products" },
+  { to: "/settings", key: "settings" },
 ];
 
 // The current cycle id, if the route is within a cycle (detail OR transcript editor).
@@ -41,6 +74,7 @@ function useCurrentCycleId(): string | null {
 // reachable on EVERY cycle screen (incl. the transcript editor). Pressed = panel open.
 // Still one of three triggers (this CTA + Cmd+K "Chat about this cycle" + ⌘J).
 function AskAiButton({ cycleId }: { cycleId: string }) {
+  const t = useT(STR);
   const chatOpen = useUiStore((s) => s.chatOpenByCycle[cycleId] ?? false);
   const toggleChat = useUiStore((s) => s.toggleChat);
 
@@ -57,7 +91,7 @@ function AskAiButton({ cycleId }: { cycleId: string }) {
       )}
     >
       <Sparkles className="size-3.5" />
-      Ask AI
+      {t.askAi}
       <kbd
         className={cn(
           "font-numeric text-[10px]",
@@ -74,6 +108,7 @@ function AskAiButton({ cycleId }: { cycleId: string }) {
 // the cycle-scoped Ask AI CTA (cycle routes only), the Search ⌘K affordance, the
 // backend-status dot, and the theme toggle.
 function Header({ cycleId }: { cycleId: string | null }) {
+  const t = useT(STR);
   const setCommandOpen = useUiStore((s) => s.setCommandOpen);
 
   return (
@@ -84,12 +119,12 @@ function Header({ cycleId }: { cycleId: string | null }) {
           IL
         </span>
         <span className="hidden text-sm font-semibold tracking-tight sm:inline">
-          InterviewLab
+          {t.workspace}
         </span>
       </div>
 
       {/* Quiet header links — active item marked with the accent, not a heavy pill. */}
-      <nav aria-label="Primary" className="flex items-center gap-1 text-sm">
+      <nav aria-label={t.primaryNav} className="flex items-center gap-1 text-sm">
         {NAV.map((item) => (
           <NavLink
             key={item.to}
@@ -108,7 +143,7 @@ function Header({ cycleId }: { cycleId: string | null }) {
           >
             {({ isActive }) => (
               <span className="relative">
-                {item.label}
+                {t.nav[item.key]}
                 {isActive && (
                   <span className="absolute -bottom-[13px] left-0 h-0.5 w-full rounded-full bg-primary" />
                 )}
@@ -126,15 +161,16 @@ function Header({ cycleId }: { cycleId: string | null }) {
           type="button"
           onClick={() => setCommandOpen(true)}
           className="hidden items-center gap-2 rounded-md border border-border bg-secondary/40 px-2 py-1 text-xs text-muted-foreground transition-colors hover:border-border-strong hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none sm:flex"
-          aria-label="Open command palette"
+          aria-label={t.openPalette}
         >
           <Search className="size-3.5" />
-          <span>Search</span>
+          <span>{t.search}</span>
           <kbd className="font-numeric text-[10px] tracking-wide text-muted-foreground/80">
             {mod("K")}
           </kbd>
         </button>
         <BackendStatus />
+        <LanguageToggle />
         <ThemeToggle />
       </div>
     </header>
@@ -142,6 +178,7 @@ function Header({ cycleId }: { cycleId: string | null }) {
 }
 
 function App() {
+  const t = useT(STR);
   const cycleId = useCurrentCycleId();
 
   // Capture live transcription/diarization progress globally so opening an interview
@@ -190,7 +227,7 @@ function App() {
         href="#main"
         className="sr-only focus-visible:not-sr-only focus-visible:absolute focus-visible:top-2 focus-visible:left-2 focus-visible:z-50 focus-visible:rounded-md focus-visible:border focus-visible:border-border focus-visible:bg-popover focus-visible:px-3 focus-visible:py-1.5 focus-visible:text-sm focus-visible:text-foreground focus-visible:shadow-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
       >
-        Перейти к содержимому
+        {t.skipToContent}
       </a>
       <Header cycleId={cycleId} />
 

@@ -52,6 +52,168 @@ import {
 import { mockOnDiarModelProgress, mockOnModelProgress } from "@/lib/dev-mock";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { useT, tr } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    welcomeIntro:
+      "InterviewLab — локальная мастерская для исследовательских интервью. Транскрипция, разметка спикеров и работа с ИИ выполняются на вашей машине.",
+    welcomeDesc:
+      "Этот короткий мастер за минуту доведёт приложение до рабочего состояния: проверим устройство, скачаем модель распознавания и подключим локальный ИИ-CLI. Любой шаг можно пропустить и настроить позже в «Настройках».",
+    speed: {
+      fastest: "очень быстрая",
+      fast: "быстрая",
+      medium: "средняя",
+      slow: "медленная",
+      slowest: "самая медленная",
+    } as Record<ModelInfo["speed"], string>,
+    accuracy: {
+      lowest: "низкая",
+      basic: "базовая",
+      good: "хорошая",
+      high: "высокая",
+      highest: "максимальная",
+    } as Record<ModelInfo["accuracy"], string>,
+    sizeGb: (n: string) => `${n} ГБ`,
+    sizeMb: (n: number) => `${n} МБ`,
+    deviceHint:
+      "Whisper использует GPU, когда доступны сборка с CUDA и видеокарта Nvidia, иначе работает на CPU.",
+    cpu: "CPU",
+    gpuActive: (engine: string) => `GPU активен (${engine})`,
+    appleMetal: "Apple Metal",
+    multilingualBadge: "🌍 Многоязычная",
+    englishOnly: "Только английский",
+    speedLabel: (v: string) => `Скорость: ${v}`,
+    accuracyLabel: (v: string) => `Точность: ${v}`,
+    modelHint:
+      "large-v3 — самая точная (лучше всего для русского). На слабых машинах или CPU выберите base / medium — они быстрее и легче.",
+    cpuRecommend:
+      "Устройство работает на CPU — для быстрого старта рекомендуем base или medium.",
+    selectModel: "Выберите модель",
+    multilingualShort: "🌍 многоязычная",
+    en: "EN",
+    downloaded: "Скачана",
+    downloadModel: "Скачать модель",
+    downloading: (pct: number) => `Скачивание… ${pct}%`,
+    modelDownloadFailed: (err: string) => `Не удалось скачать модель: ${err}`,
+    modelDownloaded: "Модель скачана",
+    downloadStartFailed: (err: string) =>
+      `Не удалось запустить скачивание. ${err}`,
+    diarHint:
+      "Диаризация размечает, кто говорил в каждом сегменте (S1, S2, …) локально. Нужны отдельные файлы моделей. Этот шаг можно пропустить — включить позже в «Настройках».",
+    diarInstalled: "Модели установлены",
+    diarNotDownloaded: "Не скачаны",
+    diarDownload: "Скачать модели спикеров",
+    diarStartLabel: "Запуск…",
+    diarDownloadFailed: (err: string) =>
+      `Не удалось скачать модель диаризации: ${err}`,
+    diarDownloaded: "Модели диаризации скачаны",
+    cliHintBefore: "Локальный ИИ-CLI выполняет очистку, синтез и сравнение версий. Claude Code использует вашу сессию ",
+    cliHintAfter: " — ключ API не нужен.",
+    pluginNotSelected: "Плагин не выбран",
+    rescan: "Пересканировать",
+    rescanned: "Плагины пересканированы",
+    rescanFailed: (err: string) => `Пересканирование не удалось. ${err}`,
+    noPlugins:
+      "Плагины не найдены. Установите локальный ИИ-CLI (например, Claude Code), затем нажмите «Пересканировать». Добавить свой плагин можно в «Настройках» → «AI CLI».",
+    activePlugin: "Активный плагин: ",
+    doneIntro:
+      "Готово — приложение настроено. Создайте цикл, импортируйте запись интервью и запустите транскрипцию.",
+    doneDesc:
+      "Всё, что здесь настроено, всегда доступно в «Настройках» — можно поменять модель, включить диаризацию или сменить ИИ-CLI в любой момент.",
+    meta: {
+      welcome: { title: "Добро пожаловать в InterviewLab", description: "Настройка за минуту" },
+      device: { title: "Устройство", description: "На чём будет работать распознавание" },
+      model: { title: "Модель распознавания", description: "Скачайте модель Whisper" },
+      diarization: { title: "Диаризация (опционально)", description: "Разметка спикеров" },
+      cli: { title: "Подключение ИИ-CLI", description: "Локальный движок для задач с ИИ" },
+      done: { title: "Всё готово", description: "Можно начинать работу" },
+    } as Record<Step, { title: string; description: string }>,
+    setupLater: "Настроить позже",
+    back: "Назад",
+    finishStart: "Начать работу",
+    next: "Далее",
+  },
+  en: {
+    welcomeIntro:
+      "InterviewLab is a local workbench for research interviews. Transcription, speaker labeling, and AI work all run on your machine.",
+    welcomeDesc:
+      "This short wizard gets the app working in a minute: we'll check your device, download a recognition model, and connect a local AI CLI. You can skip any step and set it up later in Settings.",
+    speed: {
+      fastest: "fastest",
+      fast: "fast",
+      medium: "medium",
+      slow: "slow",
+      slowest: "slowest",
+    } as Record<ModelInfo["speed"], string>,
+    accuracy: {
+      lowest: "lowest",
+      basic: "basic",
+      good: "good",
+      high: "high",
+      highest: "highest",
+    } as Record<ModelInfo["accuracy"], string>,
+    sizeGb: (n: string) => `${n} GB`,
+    sizeMb: (n: number) => `${n} MB`,
+    deviceHint:
+      "Whisper uses the GPU when a CUDA build and an Nvidia card are available; otherwise it runs on the CPU.",
+    cpu: "CPU",
+    gpuActive: (engine: string) => `GPU active (${engine})`,
+    appleMetal: "Apple Metal",
+    multilingualBadge: "🌍 Multilingual",
+    englishOnly: "English only",
+    speedLabel: (v: string) => `Speed: ${v}`,
+    accuracyLabel: (v: string) => `Accuracy: ${v}`,
+    modelHint:
+      "large-v3 is the most accurate (best for Russian). On weaker machines or CPU, choose base / medium — they're faster and lighter.",
+    cpuRecommend:
+      "Your device runs on the CPU — for a quick start we recommend base or medium.",
+    selectModel: "Select a model",
+    multilingualShort: "🌍 multilingual",
+    en: "EN",
+    downloaded: "Downloaded",
+    downloadModel: "Download model",
+    downloading: (pct: number) => `Downloading… ${pct}%`,
+    modelDownloadFailed: (err: string) => `Failed to download the model: ${err}`,
+    modelDownloaded: "Model downloaded",
+    downloadStartFailed: (err: string) =>
+      `Failed to start the download. ${err}`,
+    diarHint:
+      "Diarization labels who spoke in each segment (S1, S2, …) locally. It needs separate model files. You can skip this step and enable it later in Settings.",
+    diarInstalled: "Models installed",
+    diarNotDownloaded: "Not downloaded",
+    diarDownload: "Download speaker models",
+    diarStartLabel: "Starting…",
+    diarDownloadFailed: (err: string) =>
+      `Failed to download the diarization model: ${err}`,
+    diarDownloaded: "Diarization models downloaded",
+    cliHintBefore: "A local AI CLI handles cleanup, synthesis, and version comparison. Claude Code uses your ",
+    cliHintAfter: " session — no API key needed.",
+    pluginNotSelected: "No plugin selected",
+    rescan: "Rescan",
+    rescanned: "Plugins rescanned",
+    rescanFailed: (err: string) => `Rescan failed. ${err}`,
+    noPlugins:
+      "No plugins found. Install a local AI CLI (e.g. Claude Code), then click “Rescan”. You can add your own plugin in Settings → AI CLI.",
+    activePlugin: "Active plugin: ",
+    doneIntro:
+      "Done — the app is set up. Create a cycle, import an interview recording, and start transcription.",
+    doneDesc:
+      "Everything set up here is always available in Settings — you can change the model, enable diarization, or switch the AI CLI at any time.",
+    meta: {
+      welcome: { title: "Welcome to InterviewLab", description: "Set up in a minute" },
+      device: { title: "Device", description: "Where recognition will run" },
+      model: { title: "Recognition model", description: "Download a Whisper model" },
+      diarization: { title: "Diarization (optional)", description: "Speaker labeling" },
+      cli: { title: "Connect an AI CLI", description: "Local engine for AI tasks" },
+      done: { title: "All set", description: "You're ready to start" },
+    } as Record<Step, { title: string; description: string }>,
+    setupLater: "Set up later",
+    back: "Back",
+    finishStart: "Start working",
+    next: "Next",
+  },
+};
 
 // First-run onboarding wizard (§ v2 "простая установка"): a once-through guide that takes
 // a fresh user from zero to a working app in a minute — device check, ASR model download,
@@ -89,54 +251,36 @@ type Step = (typeof STEPS)[number];
 // --- Step bodies --------------------------------------------------------------
 
 function WelcomeStep() {
+  const t = useT(STR);
   return (
     <div className="flex flex-col gap-3 pt-1">
       <div className="flex size-11 items-center justify-center rounded-xl bg-primary/15 text-primary">
         <Sparkles className="size-5" />
       </div>
       <p className="text-sm leading-relaxed text-foreground">
-        InterviewLab — локальная мастерская для исследовательских интервью.
-        Транскрипция, разметка спикеров и работа с ИИ выполняются на вашей
-        машине.
+        {t.welcomeIntro}
       </p>
       <p className="text-sm leading-relaxed text-muted-foreground">
-        Этот короткий мастер за минуту доведёт приложение до рабочего
-        состояния: проверим устройство, скачаем модель распознавания и подключим
-        локальный ИИ-CLI. Любой шаг можно пропустить и настроить позже в
-        «Настройках».
+        {t.welcomeDesc}
       </p>
     </div>
   );
 }
 
-// Human-readable model characteristics, shared by the picker list + the selected-model card.
-// Russian tiers for the onboarding UI. Mirrors the Rust ModelInfo speed/accuracy vocabulary.
-const SPEED_RU: Record<ModelInfo["speed"], string> = {
-  fastest: "очень быстрая",
-  fast: "быстрая",
-  medium: "средняя",
-  slow: "медленная",
-  slowest: "самая медленная",
-};
-const ACCURACY_RU: Record<ModelInfo["accuracy"], string> = {
-  lowest: "низкая",
-  basic: "базовая",
-  good: "хорошая",
-  high: "высокая",
-  highest: "максимальная",
-};
-
 function formatSize(approxMb: number): string {
-  return approxMb >= 1000 ? `${(approxMb / 1000).toFixed(1)} ГБ` : `${approxMb} МБ`;
+  const t = tr(STR);
+  return approxMb >= 1000
+    ? t.sizeGb((approxMb / 1000).toFixed(1))
+    : t.sizeMb(approxMb);
 }
 
 function DeviceStep() {
+  const t = useT(STR);
   const { data: device, isPending } = useAsrDevice();
   return (
     <div className="flex flex-col gap-3 pt-1">
       <p className="text-sm text-muted-foreground">
-        Whisper использует GPU, когда доступны сборка с CUDA и видеокарта Nvidia,
-        иначе работает на CPU.
+        {t.deviceHint}
       </p>
       {isPending || !device ? (
         <Skeleton className="h-5 w-44" />
@@ -153,7 +297,7 @@ function DeviceStep() {
                 ? device.device === "metal"
                   ? "Metal"
                   : "CUDA"
-                : "CPU"}
+                : t.cpu}
             </Badge>
             {device.gpu_name && (
               <span className="text-xs text-muted-foreground">
@@ -165,7 +309,7 @@ function DeviceStep() {
           {device.use_gpu && (
             <span className="flex items-center gap-1 text-xs font-medium text-primary">
               <Zap className="size-3" />
-              GPU активен ({device.device === "metal" ? "Apple Metal" : "CUDA"})
+              {t.gpuActive(device.device === "metal" ? t.appleMetal : "CUDA")}
             </span>
           )}
         </div>
@@ -177,16 +321,17 @@ function DeviceStep() {
 // Characteristics card for the selected model: size, language, quantization, speed,
 // accuracy (RU tiers) + the human note. Compact, shadcn Badge styling.
 function ModelSpecCard({ model }: { model: ModelInfo }) {
+  const t = useT(STR);
   return (
     <div className="flex max-w-md flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3">
       <div className="flex flex-wrap items-center gap-1.5">
         <Badge variant="secondary">{formatSize(model.approx_mb)}</Badge>
         <Badge variant="secondary">
-          {model.multilingual ? "🌍 Многоязычная" : "Только английский"}
+          {model.multilingual ? t.multilingualBadge : t.englishOnly}
         </Badge>
         {model.quantized && <Badge variant="secondary">q5_0</Badge>}
-        <Badge variant="outline">Скорость: {SPEED_RU[model.speed]}</Badge>
-        <Badge variant="outline">Точность: {ACCURACY_RU[model.accuracy]}</Badge>
+        <Badge variant="outline">{t.speedLabel(t.speed[model.speed])}</Badge>
+        <Badge variant="outline">{t.accuracyLabel(t.accuracy[model.accuracy])}</Badge>
       </div>
       <p className="text-xs leading-relaxed text-muted-foreground">{model.note}</p>
     </div>
@@ -194,6 +339,7 @@ function ModelSpecCard({ model }: { model: ModelInfo }) {
 }
 
 function ModelStep() {
+  const t = useT(STR);
   const { data: device } = useAsrDevice();
   const { data: models, isPending } = useModels();
   const qc = useQueryClient();
@@ -214,14 +360,14 @@ function ModelStep() {
             ? 100
             : 0;
       if (p.error) {
-        toast.error(`Не удалось скачать модель: ${p.error}`);
+        toast.error(tr(STR).modelDownloadFailed(p.error));
         setDl(null);
         return;
       }
       if (p.done) {
         setDl(null);
         qc.invalidateQueries({ queryKey: asrKeys.models });
-        toast.success("Модель скачана");
+        toast.success(tr(STR).modelDownloaded);
       } else {
         setDl({ id: p.model_id, pct });
       }
@@ -245,7 +391,7 @@ function ModelStep() {
     try {
       await downloadModel(selected.id);
     } catch (e) {
-      toast.error(`Не удалось запустить скачивание. ${String(e)}`);
+      toast.error(t.downloadStartFailed(String(e)));
       setDl(null);
     }
   }
@@ -253,13 +399,11 @@ function ModelStep() {
   return (
     <div className="flex flex-col gap-3 pt-1">
       <p className="text-sm text-muted-foreground">
-        large-v3 — самая точная (лучше всего для русского). На слабых машинах или
-        CPU выберите base / medium — они быстрее и легче.
+        {t.modelHint}
       </p>
       {!device?.use_gpu && (
         <p className="text-xs text-status-importing">
-          Устройство работает на CPU — для быстрого старта рекомендуем base или
-          medium.
+          {t.cpuRecommend}
         </p>
       )}
 
@@ -270,7 +414,7 @@ function ModelStep() {
           <div className="flex flex-wrap items-center gap-2">
             <Select value={asrModelId} onValueChange={setAsrModelId}>
               <SelectTrigger className="w-full max-w-xs">
-                <SelectValue placeholder="Выберите модель" />
+                <SelectValue placeholder={t.selectModel} />
               </SelectTrigger>
               <SelectContent>
                 {models.map((m) => (
@@ -281,7 +425,7 @@ function ModelStep() {
                         {formatSize(m.approx_mb)}
                       </span>
                       <span className="text-[11px] text-muted-foreground">
-                        {m.multilingual ? "🌍 многоязычная" : "EN"}
+                        {m.multilingual ? t.multilingualShort : t.en}
                         {m.quantized ? " · q5_0" : ""}
                       </span>
                     </span>
@@ -293,7 +437,7 @@ function ModelStep() {
             {selected?.downloaded ? (
               <Badge variant="outline">
                 <CheckCircle2 className="size-3" />
-                Скачана
+                {t.downloaded}
               </Badge>
             ) : (
               <Button
@@ -307,7 +451,7 @@ function ModelStep() {
                 ) : (
                   <Download className="size-3.5" />
                 )}
-                Скачать модель
+                {t.downloadModel}
                 {selected ? (
                   <span className="font-numeric text-xs text-muted-foreground">
                     {formatSize(selected.approx_mb)}
@@ -323,7 +467,7 @@ function ModelStep() {
             <div className="flex max-w-xs flex-col gap-1">
               <Bar pct={dl.pct} />
               <span className="font-numeric text-[11px] text-muted-foreground">
-                Скачивание… {dl.pct}%
+                {t.downloading(dl.pct)}
               </span>
             </div>
           )}
@@ -334,6 +478,7 @@ function ModelStep() {
 }
 
 function DiarizationStep() {
+  const t = useT(STR);
   const qc = useQueryClient();
   const { data: present, isPending } = useQuery({
     queryKey: asrKeys.diarPresent,
@@ -345,14 +490,14 @@ function DiarizationStep() {
   useEffect(() => {
     function onDiar(p: DiarModelProgress) {
       if (p.error) {
-        toast.error(`Не удалось скачать модель диаризации: ${p.error}`);
+        toast.error(tr(STR).diarDownloadFailed(p.error));
         setDiarDl(null);
         return;
       }
       if (p.done) {
         setDiarDl(null);
         qc.invalidateQueries({ queryKey: asrKeys.diarPresent });
-        toast.success("Модели диаризации скачаны");
+        toast.success(tr(STR).diarDownloaded);
       } else {
         setDiarDl(p);
       }
@@ -371,11 +516,11 @@ function DiarizationStep() {
   }, [qc]);
 
   async function handleDownload() {
-    setDiarDl({ step: 0, total_steps: 1, label: "Запуск…", done: false, error: null });
+    setDiarDl({ step: 0, total_steps: 1, label: t.diarStartLabel, done: false, error: null });
     try {
       await downloadDiarizationModels();
     } catch (e) {
-      toast.error(`Не удалось запустить скачивание. ${String(e)}`);
+      toast.error(t.downloadStartFailed(String(e)));
       setDiarDl(null);
     }
   }
@@ -383,9 +528,7 @@ function DiarizationStep() {
   return (
     <div className="flex flex-col gap-3 pt-1">
       <p className="text-sm text-muted-foreground">
-        Диаризация размечает, кто говорил в каждом сегменте (S1, S2, …) локально.
-        Нужны отдельные файлы моделей. Этот шаг можно пропустить — включить позже
-        в «Настройках».
+        {t.diarHint}
       </p>
 
       <div className="flex flex-col gap-3">
@@ -396,12 +539,12 @@ function DiarizationStep() {
             {present ? (
               <Badge variant="outline">
                 <CheckCircle2 className="size-3" />
-                Модели установлены
+                {t.diarInstalled}
               </Badge>
             ) : (
               <Badge variant="secondary">
                 <AlertCircle className="size-3" />
-                Не скачаны
+                {t.diarNotDownloaded}
               </Badge>
             )}
             {!present && (
@@ -416,7 +559,7 @@ function DiarizationStep() {
                 ) : (
                   <Download className="size-3.5" />
                 )}
-                Скачать модели спикеров
+                {t.diarDownload}
               </Button>
             )}
           </div>
@@ -442,6 +585,7 @@ function DiarizationStep() {
 }
 
 function CliStep() {
+  const t = useT(STR);
   const { data: adapters, isPending } = useAdapters();
   const { data: activeId } = useActiveAdapter();
   const qc = useQueryClient();
@@ -459,18 +603,17 @@ function CliStep() {
     mutationFn: () => rescanPlugins(),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: adapterKeys.list });
-      toast.success("Плагины пересканированы");
+      toast.success(tr(STR).rescanned);
     },
-    onError: (e) => toast.error(`Пересканирование не удалось. ${String(e)}`),
+    onError: (e) => toast.error(tr(STR).rescanFailed(String(e))),
   });
 
   return (
     <div className="flex flex-col gap-3 pt-1">
       <p className="text-sm text-muted-foreground">
-        Локальный ИИ-CLI выполняет очистку, синтез и сравнение версий. Claude
-        Code использует вашу сессию{" "}
-        <code className="font-numeric text-[11px]">claude login</code> — ключ API
-        не нужен.
+        {t.cliHintBefore}
+        <code className="font-numeric text-[11px]">claude login</code>
+        {t.cliHintAfter}
       </p>
 
       {isPending || !adapters ? (
@@ -484,7 +627,7 @@ function CliStep() {
               disabled={okAdapters.length === 0}
             >
               <SelectTrigger className="w-full max-w-xs">
-                <SelectValue placeholder="Плагин не выбран" />
+                <SelectValue placeholder={t.pluginNotSelected} />
               </SelectTrigger>
               <SelectContent>
                 {okAdapters.map((a) => (
@@ -506,20 +649,18 @@ function CliStep() {
               ) : (
                 <RefreshCw className="size-3.5" />
               )}
-              Пересканировать
+              {t.rescan}
             </Button>
           </div>
 
           {okAdapters.length === 0 ? (
             <p className="text-xs text-status-importing">
-              Плагины не найдены. Установите локальный ИИ-CLI (например, Claude
-              Code), затем нажмите «Пересканировать». Добавить свой плагин можно
-              в «Настройках» → «AI CLI».
+              {t.noPlugins}
             </p>
           ) : (
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <TerminalSquare className="size-3.5" />
-              Активный плагин:{" "}
+              {t.activePlugin}
               <span className="text-foreground">
                 {okAdapters.find((a) => a.id === effectiveActiveId)?.name ??
                   effectiveActiveId}
@@ -533,18 +674,17 @@ function CliStep() {
 }
 
 function DoneStep() {
+  const t = useT(STR);
   return (
     <div className="flex flex-col gap-3 pt-1">
       <div className="flex size-11 items-center justify-center rounded-xl bg-primary/15 text-primary">
         <CheckCircle2 className="size-5" />
       </div>
       <p className="text-sm leading-relaxed text-foreground">
-        Готово — приложение настроено. Создайте цикл, импортируйте запись
-        интервью и запустите транскрипцию.
+        {t.doneIntro}
       </p>
       <p className="text-sm leading-relaxed text-muted-foreground">
-        Всё, что здесь настроено, всегда доступно в «Настройках» — можно поменять
-        модель, включить диаризацию или сменить ИИ-CLI в любой момент.
+        {t.doneDesc}
       </p>
     </div>
   );
@@ -552,41 +692,15 @@ function DoneStep() {
 
 // --- Shell --------------------------------------------------------------------
 
-const STEP_META: Record<Step, { title: string; description: string }> = {
-  welcome: {
-    title: "Добро пожаловать в InterviewLab",
-    description: "Настройка за минуту",
-  },
-  device: {
-    title: "Устройство",
-    description: "На чём будет работать распознавание",
-  },
-  model: {
-    title: "Модель распознавания",
-    description: "Скачайте модель Whisper",
-  },
-  diarization: {
-    title: "Диаризация (опционально)",
-    description: "Разметка спикеров",
-  },
-  cli: {
-    title: "Подключение ИИ-CLI",
-    description: "Локальный движок для задач с ИИ",
-  },
-  done: {
-    title: "Всё готово",
-    description: "Можно начинать работу",
-  },
-};
-
 export function OnboardingWizard() {
+  const t = useT(STR);
   // Gate on a single localStorage flag — show the wizard until it's marked done.
   const [open, setOpen] = useState(
     () => typeof window !== "undefined" && !localStorage.getItem(ONBOARDED_KEY),
   );
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEPS[stepIndex];
-  const meta = STEP_META[step];
+  const meta = t.meta[step];
   const isFirst = stepIndex === 0;
   const isLast = stepIndex === STEPS.length - 1;
 
@@ -641,7 +755,7 @@ export function OnboardingWizard() {
           {/* Always-available escape hatch (per spec): skip the whole wizard. */}
           {!isLast ? (
             <Button variant="ghost" size="sm" onClick={finish}>
-              Настроить позже
+              {t.setupLater}
             </Button>
           ) : (
             <span />
@@ -654,15 +768,15 @@ export function OnboardingWizard() {
                 size="sm"
                 onClick={() => setStepIndex((i) => i - 1)}
               >
-                Назад
+                {t.back}
               </Button>
             )}
             <Button size="sm" onClick={next}>
               {isLast ? (
-                "Начать работу"
+                t.finishStart
               ) : (
                 <>
-                  Далее
+                  {t.next}
                   <ArrowRight className="size-3.5" />
                 </>
               )}

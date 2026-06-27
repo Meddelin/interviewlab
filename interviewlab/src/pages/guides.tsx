@@ -30,6 +30,82 @@ import {
   type GuideTemplate,
 } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    newGuide: "Новый гайд",
+    dialogTitle: "Новый гайд интервью",
+    dialogDescription:
+      "Переиспользуемый гайд в markdown. Циклы запускаются по нему; его цели выводятся из раздела «Цели».",
+    namePlaceholder: "напр. Глубокое погружение в активацию",
+    creating: "Создаём…",
+    create: "Создать гайд",
+    createError: (e: string) => `Не удалось создать гайд. ${e}`,
+    deleteGuide: "Удалить гайд",
+    saving: "Сохраняем…",
+    save: "Сохранить",
+    saved: "Гайд сохранён",
+    saveError: (e: string) => `Не удалось сохранить гайд. ${e}`,
+    untitled: "Гайд без названия",
+    confirmDelete: (name: string) =>
+      `Удалить «${name}»? Циклы, использующие его, вернутся к встроенному гайду.`,
+    deleted: "Гайд удалён",
+    deleteError: (e: string) => `Не удалось удалить гайд. ${e}`,
+    template: "Шаблон",
+    rawMarkdown: "Сырой markdown",
+    editorPlaceholder: "Напишите гайд в markdown — начните с раздела «Цели»…",
+    derivedGoals: "Выведенные цели",
+    derivedGoalsHintStructured:
+      "Добавьте задачи под «Задачи интервью» — они станут стабильными id целей (G1, G2…).",
+    derivedGoalsHintRaw:
+      "Добавьте пункты под заголовком «Цели» — они станут стабильными id целей (G1, G2…).",
+    heading: "Гайды",
+    subtitle:
+      "Переиспользуемые дизайны интервью. Каждый цикл запускается по гайду; из него выводятся цели.",
+    emptyTitle: "Пока нет гайдов",
+    emptyBody:
+      "Создайте переиспользуемый гайд интервью — его цели управляют синтезом и сохраняют диффы стабильными между волнами.",
+    goals: (n: number) => `${n} ${n === 1 ? "цель" : n >= 2 && n <= 4 ? "цели" : "целей"}`,
+    selectToEdit: "Выберите гайд для редактирования.",
+  },
+  en: {
+    newGuide: "New guide",
+    dialogTitle: "New interview guide",
+    dialogDescription:
+      "A reusable, markdown guide. Cycles run against it; its goals are derived from the Goals section.",
+    namePlaceholder: "e.g. Activation deep-dive",
+    creating: "Creating…",
+    create: "Create guide",
+    createError: (e: string) => `Couldn't create the guide. ${e}`,
+    deleteGuide: "Delete guide",
+    saving: "Saving…",
+    save: "Save",
+    saved: "Guide saved",
+    saveError: (e: string) => `Couldn't save the guide. ${e}`,
+    untitled: "Untitled guide",
+    confirmDelete: (name: string) =>
+      `Delete "${name}"? Cycles using it will fall back to their inline guide.`,
+    deleted: "Guide deleted",
+    deleteError: (e: string) => `Couldn't delete the guide. ${e}`,
+    template: "Template",
+    rawMarkdown: "Raw markdown",
+    editorPlaceholder: "Write the guide in markdown — start with a Goals section…",
+    derivedGoals: "Derived goals",
+    derivedGoalsHintStructured:
+      "Add tasks under “Задачи интервью” — they become stable goal ids (G1, G2…).",
+    derivedGoalsHintRaw:
+      "Add bullets under a “Goals” heading — they become stable goal ids (G1, G2…).",
+    heading: "Guides",
+    subtitle:
+      "Reusable interview designs. Each cycle runs against a guide; goals are derived from it.",
+    emptyTitle: "No guides yet",
+    emptyBody:
+      "Create a reusable interview guide — its goals drive synthesis and keep diffs stable across waves.",
+    goals: (n: number) => `${n} goal${n === 1 ? "" : "s"}`,
+    selectToEdit: "Select a guide to edit.",
+  },
+};
 
 // Which editing surface is shown for a guide: the structured template (the 5 fixed blocks) or
 // the raw markdown body (free-form, for guides that don't use the template).
@@ -40,6 +116,7 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const createGuide = useCreateGuide();
+  const t = useT(STR);
 
   async function submit() {
     const trimmed = name.trim();
@@ -55,7 +132,7 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
       setOpen(false);
       onCreated(g);
     } catch (e) {
-      toast.error(`Couldn't create the guide. ${String(e)}`);
+      toast.error(t.createError(String(e)));
     }
   }
 
@@ -63,19 +140,16 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
     <Dialog open={open} onOpenChange={setOpen}>
       <Button size="sm" onClick={() => setOpen(true)}>
         <Plus className="size-3.5" />
-        New guide
+        {t.newGuide}
       </Button>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>New interview guide</DialogTitle>
-          <DialogDescription>
-            A reusable, markdown guide. Cycles run against it; its goals are derived from
-            the Goals section.
-          </DialogDescription>
+          <DialogTitle>{t.dialogTitle}</DialogTitle>
+          <DialogDescription>{t.dialogDescription}</DialogDescription>
         </DialogHeader>
         <Input
           autoFocus
-          placeholder="e.g. Activation deep-dive"
+          placeholder={t.namePlaceholder}
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
@@ -88,7 +162,7 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
             onClick={submit}
             disabled={!name.trim() || createGuide.isPending}
           >
-            {createGuide.isPending ? "Creating…" : "Create guide"}
+            {createGuide.isPending ? t.creating : t.create}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -100,6 +174,7 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
 function GuideEditor({ guide }: { guide: Guide }) {
   const updateGuide = useUpdateGuide();
   const deleteGuide = useDeleteGuide();
+  const t = useT(STR);
 
   // A guide is structured (uses the template) unless it's a legacy free-markdown guide with no
   // template but existing content — then we open on Raw so we don't hide its body.
@@ -126,18 +201,18 @@ function GuideEditor({ guide }: { guide: Guide }) {
       // backend renders content_md from it); raw → send markdown + clear the template.
       await updateGuide.mutateAsync(
         mode === "structured"
-          ? { id: guide.id, name: name.trim() || "Untitled guide", content_md: "", template }
+          ? { id: guide.id, name: name.trim() || t.untitled, content_md: "", template }
           : {
               id: guide.id,
-              name: name.trim() || "Untitled guide",
+              name: name.trim() || t.untitled,
               content_md: contentMd,
               template: EMPTY_TEMPLATE,
             },
       );
       setDirty(false);
-      toast.success("Guide saved");
+      toast.success(t.saved);
     } catch (e) {
-      toast.error(`Couldn't save the guide. ${String(e)}`);
+      toast.error(t.saveError(String(e)));
     }
   }
 
@@ -146,13 +221,12 @@ function GuideEditor({ guide }: { guide: Guide }) {
   const derivedGoals = mode === "structured" ? templateGoals(template) : guide.goals;
 
   async function remove() {
-    if (!confirm(`Delete "${guide.name}"? Cycles using it will fall back to their inline guide.`))
-      return;
+    if (!confirm(t.confirmDelete(guide.name))) return;
     try {
       await deleteGuide.mutateAsync(guide.id);
-      toast.success("Guide deleted");
+      toast.success(t.deleted);
     } catch (e) {
-      toast.error(`Couldn't delete the guide. ${String(e)}`);
+      toast.error(t.deleteError(String(e)));
     }
   }
 
@@ -184,7 +258,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="Delete guide"
+          aria-label={t.deleteGuide}
           className="text-muted-foreground hover:text-destructive"
           onClick={remove}
           disabled={deleteGuide.isPending}
@@ -192,7 +266,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
           <Trash2 className="size-4" />
         </Button>
         <Button size="sm" onClick={save} disabled={!dirty || updateGuide.isPending}>
-          {updateGuide.isPending ? "Saving…" : "Save"}
+          {updateGuide.isPending ? t.saving : t.save}
           <kbd className="ml-1 hidden font-numeric text-[10px] text-primary-foreground/70 sm:inline">
             {mod("S")}
           </kbd>
@@ -212,7 +286,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
           )}
         >
           <LayoutTemplate className="size-3.5" />
-          Template
+          {t.template}
         </button>
         <button
           type="button"
@@ -225,7 +299,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
           )}
         >
           <Code2 className="size-3.5" />
-          Raw markdown
+          {t.rawMarkdown}
         </button>
       </div>
 
@@ -248,7 +322,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
             setContentMd(md);
             setDirty(true);
           }}
-          placeholder="Write the guide in markdown — start with a Goals section…"
+          placeholder={t.editorPlaceholder}
         />
       )}
 
@@ -257,14 +331,14 @@ function GuideEditor({ guide }: { guide: Guide }) {
       <div className="flex flex-col gap-2 rounded-lg border border-border bg-card/40 p-3">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <Target className="size-3.5" />
-          Derived goals
+          {t.derivedGoals}
           <span className="font-numeric text-foreground/70">{derivedGoals.length}</span>
         </div>
         {derivedGoals.length === 0 ? (
           <p className="text-xs text-muted-foreground">
             {mode === "structured"
-              ? "Add tasks under “Задачи интервью” — they become stable goal ids (G1, G2…)."
-              : "Add bullets under a “Goals” heading — they become stable goal ids (G1, G2…)."}
+              ? t.derivedGoalsHintStructured
+              : t.derivedGoalsHintRaw}
           </p>
         ) : (
           <ul className="flex flex-col gap-1.5">
@@ -287,6 +361,7 @@ function GuideEditor({ guide }: { guide: Guide }) {
 export function GuidesPage() {
   const { data: guides, isPending } = useGuides();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const t = useT(STR);
 
   // Keep a valid selection: default to the first guide once loaded.
   useEffect(() => {
@@ -302,12 +377,9 @@ export function GuidesPage() {
       <header className="flex items-center justify-between gap-4">
         <div className="flex flex-col gap-0.5">
           <h1 className="text-lg font-semibold tracking-[-0.02em] text-foreground">
-            Guides
+            {t.heading}
           </h1>
-          <p className="text-xs text-muted-foreground">
-            Reusable interview designs. Each cycle runs against a guide; goals are derived
-            from it.
-          </p>
+          <p className="text-xs text-muted-foreground">{t.subtitle}</p>
         </div>
         <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
       </header>
@@ -323,11 +395,8 @@ export function GuidesPage() {
             <FileText className="size-5" />
           </span>
           <div className="flex max-w-sm flex-col gap-1">
-            <p className="text-sm font-medium text-foreground">No guides yet</p>
-            <p className="text-xs text-muted-foreground">
-              Create a reusable interview guide — its goals drive synthesis and keep diffs
-              stable across waves.
-            </p>
+            <p className="text-sm font-medium text-foreground">{t.emptyTitle}</p>
+            <p className="text-xs text-muted-foreground">{t.emptyBody}</p>
           </div>
           <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
         </div>
@@ -357,9 +426,7 @@ export function GuidesPage() {
                   </span>
                 </span>
                 <span className="flex items-center gap-2 pl-2.5 font-numeric text-[11px] text-muted-foreground">
-                  <span>
-                    {g.goals.length} goal{g.goals.length === 1 ? "" : "s"}
-                  </span>
+                  <span>{t.goals(g.goals.length)}</span>
                   <span className="text-muted-foreground/50">·</span>
                   <span>{relativeTime(g.updated_at)}</span>
                 </span>
@@ -372,7 +439,7 @@ export function GuidesPage() {
             <GuideEditor key={selected.id} guide={selected} />
           ) : (
             <div className="flex items-center justify-center rounded-lg border border-dashed border-border p-8 text-sm text-muted-foreground">
-              Select a guide to edit.
+              {t.selectToEdit}
             </div>
           )}
         </div>

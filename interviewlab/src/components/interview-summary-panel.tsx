@@ -30,15 +30,102 @@ import {
 } from "@/lib/tauri";
 // dev-mock: browser-only, never active under Tauri.
 import { mockOnInterviewSummaryProgress } from "@/lib/dev-mock";
+import { tr, useT, useUiLang } from "@/lib/i18n";
+import type { Lang } from "@/lib/i18n";
+
+// Localized strings for this file (ru/en). Used via useT in components and tr in helpers.
+const STR = {
+  ru: {
+    copiedToClipboard: "Скопировано в буфер обмена",
+    copyFailed: (e: string) => `Не удалось скопировать. ${e}`,
+    noPointsForGoal: "Нет ключевых пунктов по этой цели.",
+    questionAnswers: "Ответы на вопросы",
+    hypothesisSignals: "Сигналы по гипотезам",
+    notableQuotes: "Заметные цитаты",
+    interviewSummary: "Резюме интервью",
+    summaryDescription:
+      "Краткое резюме, структурированное по целям вашего гайда — ключевые пункты, подкрепляющие цитаты и неожиданные находки. Редактируется.",
+    markdown: "Markdown",
+    structure: "Структура",
+    copyMd: "Копировать .md",
+    copyAsMarkdown: "Скопировать как Markdown",
+    exportMd: "Экспорт .md",
+    downloadAsMd: "Скачать как .md",
+    save: "Сохранить",
+    saving: "Сохранение…",
+    summarizing: "Подведение итогов…",
+    regenerate: "Перегенерировать",
+    runSummary: "Создать резюме",
+    summaryFailedEvent: (e: string) => `Не удалось создать резюме: ${e}`,
+    summaryReady: "Резюме интервью готово",
+    summarizeFailed: (e: string) => `Не удалось подвести итоги. ${e}`,
+    summarySaved: "Резюме сохранено",
+    saveFailed: (e: string) => `Не удалось сохранить. ${e}`,
+    unknown: "неизвестно",
+    manualEditsCaveat:
+      "Ручные правки этого текста не попадают в синтез цикла, Diff и Чат — там используется машинная версия (см. вкладку «Структура»).",
+    markdownPlaceholder:
+      "Создайте резюме, чтобы сгенерировать его, затем редактируйте здесь…",
+    noSummaryYet: "Резюме пока нет",
+    noSummaryDesc:
+      "Создайте резюме по интервью, структурированное по целям цикла. Оно питает синтез цикла, и вы можете редактировать его здесь.",
+  },
+  en: {
+    copiedToClipboard: "Copied to clipboard",
+    copyFailed: (e: string) => `Couldn't copy. ${e}`,
+    noPointsForGoal: "No key points for this goal.",
+    questionAnswers: "Question answers",
+    hypothesisSignals: "Hypothesis signals",
+    notableQuotes: "Notable quotes",
+    interviewSummary: "Interview summary",
+    summaryDescription:
+      "A concise summary structured by your guide's goals — key points, supporting quotes, and surprises. Editable.",
+    markdown: "Markdown",
+    structure: "Structure",
+    copyMd: "Copy .md",
+    copyAsMarkdown: "Copy as Markdown",
+    exportMd: "Export .md",
+    downloadAsMd: "Download as .md",
+    save: "Save",
+    saving: "Saving…",
+    summarizing: "Summarizing…",
+    regenerate: "Regenerate",
+    runSummary: "Run summary",
+    summaryFailedEvent: (e: string) => `Summary failed: ${e}`,
+    summaryReady: "Interview summary ready",
+    summarizeFailed: (e: string) => `Couldn't summarize. ${e}`,
+    summarySaved: "Summary saved",
+    saveFailed: (e: string) => `Couldn't save. ${e}`,
+    unknown: "unknown",
+    manualEditsCaveat:
+      "Manual edits to this text don't flow into the cycle synthesis, Diff or Chat — those read the machine version (see the Structure tab).",
+    markdownPlaceholder:
+      "Run the summary to generate it, then edit here…",
+    noSummaryYet: "No summary yet",
+    noSummaryDesc:
+      "Generate a per-interview summary structured by the cycle's goals. It feeds the cycle synthesis and you can edit it here.",
+  },
+};
+
+// Stance/status signal labels (ru/en), keyed by the machine value.
+const SIGNAL_LABELS: Record<string, Record<Lang, string>> = {
+  supports: { ru: "Подтверждает", en: "Supports" },
+  contradicts: { ru: "Опровергает", en: "Contradicts" },
+  mixed: { ru: "Смешанно", en: "Mixed" },
+  neutral: { ru: "Нейтрально", en: "Neutral" },
+  direct: { ru: "Прямой ответ", en: "Direct answer" },
+  indirect: { ru: "Косвенно", en: "Indirect" },
+  not_answered: { ru: "Нет ответа", en: "Not answered" },
+};
 
 // ponytail: file-local copy/export helpers, mirroring synthesis-tab.tsx / diff-tab.tsx.
 // Factoring the three copies into a shared util is deferred to the export layer.
 async function copyMarkdown(md: string) {
   try {
     await navigator.clipboard.writeText(md);
-    toast.success("Скопировано в буфер обмена");
+    toast.success(tr(STR).copiedToClipboard);
   } catch (e) {
-    toast.error(`Не удалось скопировать. ${String(e)}`);
+    toast.error(tr(STR).copyFailed(String(e)));
   }
 }
 
@@ -78,17 +165,19 @@ function QuoteList({ quotes }: { quotes: InterviewQuote[] }) {
 
 // Stance/status → small colored label, matching synthesis-tab's status-color family.
 function SignalLabel({ kind }: { kind: string }) {
+  const lang = useUiLang();
   const k = kind.toLowerCase();
-  const meta: Record<string, { label: string; dot: string; text: string }> = {
-    supports: { label: "Подтверждает", dot: "bg-status-ready", text: "text-status-ready" },
-    contradicts: { label: "Опровергает", dot: "bg-status-error", text: "text-status-error" },
-    mixed: { label: "Смешанно", dot: "bg-status-processing", text: "text-muted-foreground" },
-    neutral: { label: "Нейтрально", dot: "bg-muted-foreground/60", text: "text-muted-foreground" },
-    direct: { label: "Прямой ответ", dot: "bg-status-ready", text: "text-status-ready" },
-    indirect: { label: "Косвенно", dot: "bg-status-processing", text: "text-muted-foreground" },
-    not_answered: { label: "Нет ответа", dot: "bg-status-error", text: "text-status-error" },
+  const styles: Record<string, { dot: string; text: string }> = {
+    supports: { dot: "bg-status-ready", text: "text-status-ready" },
+    contradicts: { dot: "bg-status-error", text: "text-status-error" },
+    mixed: { dot: "bg-status-processing", text: "text-muted-foreground" },
+    neutral: { dot: "bg-muted-foreground/60", text: "text-muted-foreground" },
+    direct: { dot: "bg-status-ready", text: "text-status-ready" },
+    indirect: { dot: "bg-status-processing", text: "text-muted-foreground" },
+    not_answered: { dot: "bg-status-error", text: "text-status-error" },
   };
-  const m = meta[k] ?? { label: kind, dot: "bg-muted-foreground/60", text: "text-muted-foreground" };
+  const style = styles[k] ?? { dot: "bg-muted-foreground/60", text: "text-muted-foreground" };
+  const m = { label: SIGNAL_LABELS[k]?.[lang] ?? kind, ...style };
   return (
     <span className={cn("inline-flex items-center gap-1.5 text-[11px]", m.text)}>
       <span className={cn("size-1.5 rounded-full", m.dot)} aria-hidden="true" />
@@ -101,6 +190,7 @@ function SignalLabel({ kind }: { kind: string }) {
 // optional question-answers and hypothesis-signals, then notable quotes. Read-only — editing
 // still happens in the markdown view.
 function StructuredSummary({ doc }: { doc: InterviewSummaryRow["doc"] }) {
+  const t = useT(STR);
   const goalText = useMemo(() => {
     const m = new Map(doc.goals.map((g) => [g.id, g.text]));
     return (id: string) => m.get(id) ?? id;
@@ -133,7 +223,7 @@ function StructuredSummary({ doc }: { doc: InterviewSummaryRow["doc"] }) {
           </div>
           {g.points.length === 0 ? (
             <p className="pl-6 text-xs text-muted-foreground">
-              Нет ключевых пунктов по этой цели.
+              {t.noPointsForGoal}
             </p>
           ) : (
             <ul className="flex flex-col gap-3 pl-6">
@@ -154,7 +244,7 @@ function StructuredSummary({ doc }: { doc: InterviewSummaryRow["doc"] }) {
       {answers.length > 0 && (
         <section className="flex flex-col gap-3">
           <h3 className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-            Ответы на вопросы
+            {t.questionAnswers}
           </h3>
           <ul className="flex flex-col gap-3">
             {answers.map((a, i) => (
@@ -184,7 +274,7 @@ function StructuredSummary({ doc }: { doc: InterviewSummaryRow["doc"] }) {
       {signals.length > 0 && (
         <section className="flex flex-col gap-3">
           <h3 className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-            Сигналы по гипотезам
+            {t.hypothesisSignals}
           </h3>
           <ul className="flex flex-col gap-3">
             {signals.map((s, i) => (
@@ -214,7 +304,7 @@ function StructuredSummary({ doc }: { doc: InterviewSummaryRow["doc"] }) {
       {doc.notable.length > 0 && (
         <section className="flex flex-col gap-3">
           <h3 className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-            Заметные цитаты
+            {t.notableQuotes}
           </h3>
           <ul className="flex flex-col gap-3">
             {doc.notable.map((n, i) => (
@@ -250,6 +340,7 @@ export function InterviewSummaryPanel({
 }: {
   interviewId: string;
 }) {
+  const t = useT(STR);
   const { data: summary, isPending } = useInterviewSummary(interviewId);
   const runSummary = useRunInterviewSummary(interviewId);
   const saveSummary = useSaveInterviewSummary(interviewId);
@@ -289,7 +380,7 @@ export function InterviewSummaryPanel({
       if (p.stage === "done" || p.stage === "error") {
         setProgress(null);
         if (p.stage === "error") {
-          toast.error(`Summary failed: ${p.error ?? "unknown"}`);
+          toast.error(t.summaryFailedEvent(p.error ?? t.unknown));
         }
       } else {
         setProgress(p);
@@ -305,7 +396,7 @@ export function InterviewSummaryPanel({
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [interviewId]);
+  }, [interviewId, t]);
 
   const running = runSummary.isPending || progress != null;
   const hasSummary = !!summary && storedMd.trim().length > 0;
@@ -319,10 +410,10 @@ export function InterviewSummaryPanel({
     });
     try {
       await runSummary.mutateAsync();
-      toast.success("Interview summary ready");
+      toast.success(t.summaryReady);
     } catch (e) {
       setProgress(null);
-      toast.error(`Couldn't summarize. ${String(e)}`);
+      toast.error(t.summarizeFailed(String(e)));
     }
   }
 
@@ -330,9 +421,9 @@ export function InterviewSummaryPanel({
     try {
       await saveSummary.mutateAsync(draft);
       setDirty(false);
-      toast.success("Summary saved");
+      toast.success(t.summarySaved);
     } catch (e) {
-      toast.error(`Couldn't save. ${String(e)}`);
+      toast.error(t.saveFailed(String(e)));
     }
   }
 
@@ -341,11 +432,10 @@ export function InterviewSummaryPanel({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-0.5">
           <h3 className="text-sm font-medium text-foreground">
-            Interview summary
+            {t.interviewSummary}
           </h3>
           <p className="text-xs text-muted-foreground">
-            A concise summary structured by your guide's goals — key points,
-            supporting quotes, and surprises. Editable.
+            {t.summaryDescription}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -363,7 +453,7 @@ export function InterviewSummaryPanel({
                   )}
                 >
                   <FileText className="size-3.5" />
-                  Markdown
+                  {t.markdown}
                 </button>
                 <button
                   type="button"
@@ -376,26 +466,26 @@ export function InterviewSummaryPanel({
                   )}
                 >
                   <LayoutList className="size-3.5" />
-                  Структура
+                  {t.structure}
                 </button>
               </div>
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() => copyMarkdown(draft || storedMd)}
-                title="Скопировать как Markdown"
+                title={t.copyAsMarkdown}
               >
                 <Copy className="size-3.5" />
-                Копировать .md
+                {t.copyMd}
               </Button>
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => exportMarkdown(draft || storedMd, "interview-summary.md")}
-                title="Скачать как .md"
+                title={t.downloadAsMd}
               >
                 <Download className="size-3.5" />
-                Экспорт .md
+                {t.exportMd}
               </Button>
               {view === "markdown" && (
                 <Button
@@ -405,7 +495,7 @@ export function InterviewSummaryPanel({
                   disabled={!dirty || saveSummary.isPending}
                 >
                   <Save className="size-3.5" />
-                  {saveSummary.isPending ? "Saving…" : "Save"}
+                  {saveSummary.isPending ? t.saving : t.save}
                 </Button>
               )}
             </>
@@ -417,10 +507,10 @@ export function InterviewSummaryPanel({
               <Sparkles className="size-4" />
             )}
             {running
-              ? "Summarizing…"
+              ? t.summarizing
               : hasSummary
-                ? "Regenerate"
-                : "Run summary"}
+                ? t.regenerate
+                : t.runSummary}
           </Button>
         </div>
       </div>
@@ -455,9 +545,7 @@ export function InterviewSummaryPanel({
                   aria-hidden="true"
                 />
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  Ручные правки этого текста не попадают в синтез цикла, Diff и
-                  Чат — там используется машинная версия (см. вкладку
-                  «Структура»).
+                  {t.manualEditsCaveat}
                 </p>
               </div>
               <MarkdownEditor
@@ -467,7 +555,7 @@ export function InterviewSummaryPanel({
                   setDraft(md);
                   setDirty(true);
                 }}
-                placeholder="Run the summary to generate it, then edit here…"
+                placeholder={t.markdownPlaceholder}
               />
             </div>
           )
@@ -475,11 +563,10 @@ export function InterviewSummaryPanel({
           <div className="flex max-w-md flex-col items-start gap-3 rounded-lg border border-dashed border-border px-6 py-8">
             <div className="flex flex-col gap-1">
               <p className="text-sm font-medium text-foreground">
-                No summary yet
+                {t.noSummaryYet}
               </p>
               <p className="text-xs text-muted-foreground">
-                Generate a per-interview summary structured by the cycle's
-                goals. It feeds the cycle synthesis and you can edit it here.
+                {t.noSummaryDesc}
               </p>
             </div>
           </div>

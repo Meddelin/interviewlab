@@ -34,15 +34,65 @@ import { useGuides } from "@/lib/guide-queries";
 import { useProducts } from "@/lib/product-queries";
 import { mod } from "@/lib/platform";
 import { useUiStore } from "@/lib/ui-store";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    searchPlaceholder: "Поиск или переход…",
+    noResults: "Ничего не найдено.",
+    actions: "Действия",
+    newCycle: "Новый цикл",
+    chatAboutCycle: "Обсудить этот цикл",
+    switchToLight: "Переключить на светлую тему",
+    switchToDark: "Переключить на тёмную тему",
+    keyboardShortcuts: "Горячие клавиши",
+    goTo: "Перейти к",
+    cycles: "Циклы",
+    guides: "Гайды",
+    products: "Продукты",
+    settings: "Настройки",
+    jumpToCycle: "Перейти к циклу",
+    jumpToGuide: "Перейти к гайду",
+    jumpToProduct: "Перейти к продукту",
+    shortcutsHintBefore: "У частых действий есть горячая клавиша. Нажмите ",
+    shortcutsHintAfter: " для полной командной палитры.",
+    scOpenPalette: "Открыть командную палитру",
+    scToggleChat: "Открыть/закрыть чат цикла (внутри цикла)",
+    scShowShortcuts: "Показать этот список горячих клавиш",
+  },
+  en: {
+    searchPlaceholder: "Search or jump to…",
+    noResults: "No results.",
+    actions: "Actions",
+    newCycle: "New cycle",
+    chatAboutCycle: "Chat about this cycle",
+    switchToLight: "Switch to light theme",
+    switchToDark: "Switch to dark theme",
+    keyboardShortcuts: "Keyboard shortcuts",
+    goTo: "Go to",
+    cycles: "Cycles",
+    guides: "Guides",
+    products: "Products",
+    settings: "Settings",
+    jumpToCycle: "Jump to cycle",
+    jumpToGuide: "Jump to guide",
+    jumpToProduct: "Jump to product",
+    shortcutsHintBefore: "Common actions have a shortcut. Press ",
+    shortcutsHintAfter: " for the full command palette.",
+    scOpenPalette: "Open command palette",
+    scToggleChat: "Toggle the cycle chat (within a cycle)",
+    scShowShortcuts: "Show this keyboard shortcuts list",
+  },
+};
 
 // Local registry of the app's keyboard shortcuts — the single source for both the
 // cheatsheet (opened with "?") and the hints shown next to palette items. Kept in this
 // file deliberately: the set is tiny and there's no second consumer yet, so a shared
 // module would be premature (// ponytail: a const beats a new module for ~4 keys).
-const SHORTCUTS: { keys: string; label: string }[] = [
-  { keys: mod("K"), label: "Open command palette" },
-  { keys: mod("J"), label: "Toggle the cycle chat (within a cycle)" },
-  { keys: "?", label: "Show this keyboard shortcuts list" },
+const SHORTCUTS: { keys: string; labelKey: "scOpenPalette" | "scToggleChat" | "scShowShortcuts" }[] = [
+  { keys: mod("K"), labelKey: "scOpenPalette" },
+  { keys: mod("J"), labelKey: "scToggleChat" },
+  { keys: "?", labelKey: "scShowShortcuts" },
 ];
 
 // The signature interaction: Cmd/Ctrl+K opens a fuzzy palette that is the app's
@@ -65,6 +115,7 @@ export function CommandPalette() {
   const onCycleDetail = useMatch("/cycles/:id");
   const onTranscriptEditor = useMatch("/cycles/:cycleId/interviews/:interviewId");
   const inCycle = Boolean(onCycleDetail || onTranscriptEditor);
+  const t = useT(STR);
 
   // Global keys: Cmd/Ctrl+K toggles the palette; bare "?" opens the cheatsheet (but only
   // when the user isn't typing into a field, so it doesn't swallow real "?" input).
@@ -102,17 +153,17 @@ export function CommandPalette() {
   return (
     <>
       <CommandDialog open={open} onOpenChange={setOpen}>
-        <CommandInput placeholder="Search or jump to…" />
+        <CommandInput placeholder={t.searchPlaceholder} />
         <CommandList>
-          <CommandEmpty>No results.</CommandEmpty>
+          <CommandEmpty>{t.noResults}</CommandEmpty>
 
-          <CommandGroup heading="Actions">
+          <CommandGroup heading={t.actions}>
             <CommandItem
               onSelect={() => run(() => requestNewCycle())}
               keywords={["create", "add", "wave"]}
             >
               <Plus />
-              <span>New cycle</span>
+              <span>{t.newCycle}</span>
             </CommandItem>
             {inCycle && (
               <CommandItem
@@ -120,7 +171,7 @@ export function CommandPalette() {
                 keywords={["chat", "ask", "assistant", "question"]}
               >
                 <MessageSquare />
-                <span>Chat about this cycle</span>
+                <span>{t.chatAboutCycle}</span>
                 <CommandShortcut>{mod("J")}</CommandShortcut>
               </CommandItem>
             )}
@@ -129,55 +180,55 @@ export function CommandPalette() {
               keywords={["dark", "light", "appearance"]}
             >
               {isDark ? <Sun /> : <Moon />}
-              <span>{isDark ? "Switch to light theme" : "Switch to dark theme"}</span>
+              <span>{isDark ? t.switchToLight : t.switchToDark}</span>
             </CommandItem>
             <CommandItem
               onSelect={() => run(() => setShortcutsOpen(true))}
               keywords={["help", "keys", "hotkeys", "cheatsheet"]}
             >
               <Keyboard />
-              <span>Keyboard shortcuts</span>
+              <span>{t.keyboardShortcuts}</span>
               <CommandShortcut>?</CommandShortcut>
             </CommandItem>
           </CommandGroup>
 
           <CommandSeparator />
 
-          <CommandGroup heading="Go to">
+          <CommandGroup heading={t.goTo}>
             <CommandItem
               onSelect={() => run(() => navigate("/cycles"))}
               keywords={["waves", "research"]}
             >
               <FolderKanban />
-              <span>Cycles</span>
+              <span>{t.cycles}</span>
             </CommandItem>
             <CommandItem
               onSelect={() => run(() => navigate("/guides"))}
               keywords={["interview", "script", "questions"]}
             >
               <BookText />
-              <span>Guides</span>
+              <span>{t.guides}</span>
             </CommandItem>
             <CommandItem
               onSelect={() => run(() => navigate("/products"))}
               keywords={["library", "context"]}
             >
               <Package />
-              <span>Products</span>
+              <span>{t.products}</span>
             </CommandItem>
             <CommandItem
               onSelect={() => run(() => navigate("/settings"))}
               keywords={["preferences", "config", "models", "cli"]}
             >
               <SettingsIcon />
-              <span>Settings</span>
+              <span>{t.settings}</span>
             </CommandItem>
           </CommandGroup>
 
           {cycles && cycles.length > 0 && (
             <>
               <CommandSeparator />
-              <CommandGroup heading="Jump to cycle">
+              <CommandGroup heading={t.jumpToCycle}>
                 {cycles.map((cycle) => (
                   <CommandItem
                     key={cycle.id}
@@ -195,7 +246,7 @@ export function CommandPalette() {
           {guides && guides.length > 0 && (
             <>
               <CommandSeparator />
-              <CommandGroup heading="Jump to guide">
+              <CommandGroup heading={t.jumpToGuide}>
                 {guides.map((guide) => (
                   <CommandItem
                     key={guide.id}
@@ -215,7 +266,7 @@ export function CommandPalette() {
           {products && products.length > 0 && (
             <>
               <CommandSeparator />
-              <CommandGroup heading="Jump to product">
+              <CommandGroup heading={t.jumpToProduct}>
                 {products.map((product) => (
                   <CommandItem
                     key={product.id}
@@ -236,10 +287,11 @@ export function CommandPalette() {
       <Dialog open={shortcutsOpen} onOpenChange={setShortcutsOpen}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>Keyboard shortcuts</DialogTitle>
+            <DialogTitle>{t.keyboardShortcuts}</DialogTitle>
             <DialogDescription>
-              Common actions have a shortcut. Press{" "}
-              <kbd className="font-numeric">{mod("K")}</kbd> for the full command palette.
+              {t.shortcutsHintBefore}
+              <kbd className="font-numeric">{mod("K")}</kbd>
+              {t.shortcutsHintAfter}
             </DialogDescription>
           </DialogHeader>
           <dl className="flex flex-col gap-2 text-sm">
@@ -248,7 +300,7 @@ export function CommandPalette() {
                 key={s.keys}
                 className="flex items-center justify-between gap-4"
               >
-                <dt className="text-muted-foreground">{s.label}</dt>
+                <dt className="text-muted-foreground">{t[s.labelKey]}</dt>
                 <dd>
                   <kbd className="rounded border border-border bg-secondary/40 px-1.5 py-0.5 font-numeric text-xs text-foreground">
                     {s.keys}

@@ -52,15 +52,132 @@ import {
 import { mockOnSynthesisProgress } from "@/lib/dev-mock";
 import { absoluteDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { tr, useT, useUiLang } from "@/lib/i18n";
+
+// Localized strings for this file (ru/en). Used via useT in components and tr in helpers.
+const STR = {
+  ru: {
+    copiedToClipboard: "Скопировано в буфер обмена",
+    copyFailed: (e: string) => `Не удалось скопировать. ${e}`,
+    quoteUnavailable: "(цитата недоступна)",
+    segment: (n: number) => `сегмент ${n}`,
+    confidence: (label: string) => `Уверенность: ${label}`,
+    interviews: (n: number) => `${n} ${n === 1 ? "интервью" : "интервью"}`,
+    byRole: "По ролям",
+    noFindingsForGoal: "По этой цели в этой волне выводов не найдено.",
+    hypotheses: "Гипотезы",
+    confidenceShort: (label: string) => `Уверенность: ${label}`,
+    questions: "Вопросы",
+    stageReading: "Чтение интервью",
+    stageSynthesizing: "Формирование выводов",
+    stageDone: "Готово",
+    stageWorking: "Обработка",
+    cycleSynthesis: "Синтез цикла",
+    lastSynthesized: (when: string) => `Последний синтез: ${when}.`,
+    editableReport: (n: number, goalsLabel: string) =>
+      `Редактируемый отчёт по интервью этой волны, привязанный к ${n || ""} ${goalsLabel} вашего гайда.`,
+    goalWord: (n: number) => (n === 1 ? "цели" : "целям"),
+    artifact: "Артефакт",
+    findings: "Выводы",
+    copyMd: "Копировать .md",
+    copyAsMarkdown: "Скопировать как Markdown",
+    export: "Экспорт",
+    downloadAsMd: "Скачать как .md",
+    reRunSynthesis: "Перезапустить синтез",
+    runSynthesis: "Запустить синтез",
+    synthesisComplete: (f: number, g: number) =>
+      `Синтез завершён — ${f} ${f === 1 ? "вывод" : "выводов"} по ${g} целям.`,
+    synthesisFailedRun: (e: string) => `Не удалось выполнить синтез. ${e}`,
+    synthesisFailedEvent: (e: string) => `Синтез не удался: ${e}`,
+    synthesisSaved: "Синтез сохранён",
+    saveFailed: (e: string) => `Не удалось сохранить. ${e}`,
+    editableReportNote:
+      "Редактируемый отчёт. Перезапуск создаёт его заново; ваши правки сохраняются.",
+    save: "Сохранить",
+    saving: "Сохранение…",
+    manualEditsCaveat:
+      "Ручные правки этого текста не попадают в Diff и Чат — там используется машинная версия findings.",
+    artifactPlaceholder:
+      "Запустите синтез, чтобы сгенерировать отчёт, затем редактируйте его здесь…",
+    openQuestions: "Открытые вопросы",
+    synthesizingEmpty: "Формирование выводов по интервью этой волны…",
+    noSynthesisYet: "Синтеза пока нет",
+    noSynthesisDesc:
+      "Запустите синтез, чтобы собрать редактируемый отчёт по интервью этой волны — привязанный к целям вашего гайда, с трассируемыми цитатами и разбивкой по ролям.",
+    groundedOn: (n: number, goalsLabel: string) => `Опирается на ${n} ${goalsLabel}`,
+    goalCountWord: (n: number) => (n === 1 ? "цель" : "целей"),
+    addGoalsPrefix: "Сначала добавьте раздел ",
+    addGoalsGoals: "Цели",
+    addGoalsSuffix: " в гайд интервью на вкладке «Обзор».",
+    unknown: "неизвестно",
+    interviewFallback: (id: string) => `Интервью ${id}`,
+  },
+  en: {
+    copiedToClipboard: "Copied to clipboard",
+    copyFailed: (e: string) => `Couldn't copy. ${e}`,
+    quoteUnavailable: "(quote unavailable)",
+    segment: (n: number) => `segment ${n}`,
+    confidence: (label: string) => `${label} confidence`,
+    interviews: (n: number) => `${n} interview${n === 1 ? "" : "s"}`,
+    byRole: "By role",
+    noFindingsForGoal: "No findings surfaced for this goal in this wave.",
+    hypotheses: "Hypotheses",
+    confidenceShort: (label: string) => `${label} confidence`,
+    questions: "Questions",
+    stageReading: "Reading interviews",
+    stageSynthesizing: "Synthesizing findings",
+    stageDone: "Done",
+    stageWorking: "Working",
+    cycleSynthesis: "Cycle synthesis",
+    lastSynthesized: (when: string) => `Last synthesized ${when}.`,
+    editableReport: (n: number, goalsLabel: string) =>
+      `An editable report across this wave's interviews, tied to your ${n || ""} guide ${goalsLabel}.`,
+    goalWord: (n: number) => (n === 1 ? "goal" : "goals"),
+    artifact: "Artifact",
+    findings: "Findings",
+    copyMd: "Copy .md",
+    copyAsMarkdown: "Copy as Markdown",
+    export: "Export",
+    downloadAsMd: "Download as .md",
+    reRunSynthesis: "Re-run synthesis",
+    runSynthesis: "Run synthesis",
+    synthesisComplete: (f: number, g: number) =>
+      `Synthesis complete — ${f} finding${f === 1 ? "" : "s"} across ${g} goals.`,
+    synthesisFailedRun: (e: string) => `Couldn't synthesize. ${e}`,
+    synthesisFailedEvent: (e: string) => `Synthesis failed: ${e}`,
+    synthesisSaved: "Synthesis saved",
+    saveFailed: (e: string) => `Couldn't save. ${e}`,
+    editableReportNote:
+      "The editable report. Re-running regenerates it; your edits are saved.",
+    save: "Save",
+    saving: "Saving…",
+    manualEditsCaveat:
+      "Manual edits to this text don't flow into Diff or Chat — those read the machine version of the findings.",
+    artifactPlaceholder:
+      "Run synthesis to generate the report, then edit it here…",
+    openQuestions: "Open questions",
+    synthesizingEmpty: "Synthesizing findings across this wave's interviews…",
+    noSynthesisYet: "No synthesis yet",
+    noSynthesisDesc:
+      "Run synthesis to assemble an editable report across this wave's interviews — tied to your guide's goals, with evidence quotes you can trace and a by-role breakdown.",
+    groundedOn: (n: number, goalsLabel: string) => `Grounded on ${n} ${goalsLabel}`,
+    goalCountWord: (n: number) => (n === 1 ? "goal" : "goals"),
+    addGoalsPrefix: "Add a ",
+    addGoalsGoals: "Goals",
+    addGoalsSuffix: " section to the interview guide on the Overview tab first.",
+    unknown: "unknown",
+    interviewFallback: (id: string) => `Interview ${id}`,
+  },
+};
 
 // ponytail: file-local copy/export helpers (no shared util module — same two helpers are
 // duplicated in diff-tab.tsx; factoring out a common module is deferred to the export layer).
 async function copyMarkdown(md: string) {
   try {
     await navigator.clipboard.writeText(md);
-    toast.success("Скопировано в буфер обмена");
+    toast.success(tr(STR).copiedToClipboard);
   } catch (e) {
-    toast.error(`Не удалось скопировать. ${String(e)}`);
+    toast.error(tr(STR).copyFailed(String(e)));
   }
 }
 
@@ -77,9 +194,18 @@ function exportMarkdown(md: string, filename: string) {
 
 // Confidence → badge styling. Muted palette to fit the Linear bar: high reads in the
 // accent, medium neutral, low quiet.
+const CONFIDENCE_LABELS: Record<string, { ru: string; en: string }> = {
+  high: { ru: "высокая", en: "High" },
+  medium: { ru: "средняя", en: "Medium" },
+  low: { ru: "низкая", en: "Low" },
+};
+
 function ConfidenceBadge({ confidence }: { confidence: string }) {
+  const t = useT(STR);
+  const lang = useUiLang();
   const c = confidence.toLowerCase();
-  const label = c.charAt(0).toUpperCase() + c.slice(1);
+  const label =
+    CONFIDENCE_LABELS[c]?.[lang] ?? c.charAt(0).toUpperCase() + c.slice(1);
   return (
     <Badge
       variant="outline"
@@ -98,7 +224,7 @@ function ConfidenceBadge({ confidence }: { confidence: string }) {
         )}
         aria-hidden="true"
       />
-      {label} confidence
+      {t.confidence(label)}
     </Badge>
   );
 }
@@ -114,6 +240,7 @@ function EvidenceQuote({
   interviewTitle: string;
   onOpen: () => void;
 }) {
+  const t = useT(STR);
   return (
     <li className="flex gap-2.5">
       <Quote
@@ -122,7 +249,7 @@ function EvidenceQuote({
       />
       <div className="flex flex-col gap-1">
         <p className="text-sm leading-relaxed text-foreground/90">
-          {evidence.quote ? `“${evidence.quote}”` : "(quote unavailable)"}
+          {evidence.quote ? `“${evidence.quote}”` : t.quoteUnavailable}
         </p>
         <button
           type="button"
@@ -132,7 +259,7 @@ function EvidenceQuote({
           {interviewTitle}
           <span className="text-muted-foreground/50">
             {" "}
-            · segment {evidence.segment_id + 1}
+            · {t.segment(evidence.segment_id + 1)}
           </span>
         </button>
       </div>
@@ -150,6 +277,7 @@ function FindingCard({
   titleFor: (interviewId: string) => string;
   onOpenInterview: (interviewId: string) => void;
 }) {
+  const t = useT(STR);
   return (
     // id anchor so a chat citation [[finding:Fn]] can route here (#finding-Fn) — M11.
     <Card id={`finding-${finding.id}`} size="sm" className="scroll-mt-20 gap-3">
@@ -167,8 +295,7 @@ function FindingCard({
         <div className="flex flex-wrap items-center gap-2">
           <ConfidenceBadge confidence={finding.confidence} />
           <Badge variant="ghost" className="text-muted-foreground">
-            {finding.support_count} interview
-            {finding.support_count === 1 ? "" : "s"}
+            {t.interviews(finding.support_count)}
           </Badge>
         </div>
 
@@ -216,6 +343,7 @@ function GoalSection({
   titleFor: (interviewId: string) => string;
   onOpenInterview: (interviewId: string) => void;
 }) {
+  const t = useT(STR);
   return (
     <section className="flex flex-col gap-3">
       <div className="flex items-baseline gap-2.5">
@@ -227,7 +355,7 @@ function GoalSection({
       </div>
       {findings.length === 0 ? (
         <p className="pl-6 text-xs text-muted-foreground">
-          No findings surfaced for this goal in this wave.
+          {t.noFindingsForGoal}
         </p>
       ) : (
         // Wide: lay findings out as a multi-column card grid (one column on narrow).
@@ -247,7 +375,7 @@ function GoalSection({
         <div className="ml-6 flex flex-col gap-1.5 rounded-md border border-border bg-secondary/30 px-3 py-2">
           <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
             <Users className="size-3" aria-hidden="true" />
-            By role
+            {t.byRole}
           </div>
           <ul className="flex flex-col gap-1">
             {roleNotes.notes.map((n, i) => (
@@ -266,12 +394,19 @@ function GoalSection({
 // Verdict → badge styling. confirmed reads green, refuted red, partial amber, inconclusive
 // neutral — the same status-color family the rest of the app uses.
 function VerdictBadge({ verdict }: { verdict: string }) {
+  const lang = useUiLang();
   const v = verdict.toLowerCase();
+  const labels: Record<string, { ru: string; en: string }> = {
+    confirmed: { ru: "Подтверждена", en: "Confirmed" },
+    partially: { ru: "Частично подтверждена", en: "Partially confirmed" },
+    refuted: { ru: "Опровергнута", en: "Refuted" },
+    inconclusive: { ru: "Неубедительно", en: "Inconclusive" },
+  };
   const meta: Record<string, { label: string; dot: string; text: string; border: string }> = {
-    confirmed: { label: "Confirmed", dot: "bg-status-ready", text: "text-status-ready", border: "border-status-ready/40" },
-    partially: { label: "Partially confirmed", dot: "bg-status-processing", text: "", border: "" },
-    refuted: { label: "Refuted", dot: "bg-status-error", text: "text-status-error", border: "border-status-error/40" },
-    inconclusive: { label: "Inconclusive", dot: "bg-muted-foreground/60", text: "text-muted-foreground", border: "" },
+    confirmed: { label: labels.confirmed[lang], dot: "bg-status-ready", text: "text-status-ready", border: "border-status-ready/40" },
+    partially: { label: labels.partially[lang], dot: "bg-status-processing", text: "", border: "" },
+    refuted: { label: labels.refuted[lang], dot: "bg-status-error", text: "text-status-error", border: "border-status-error/40" },
+    inconclusive: { label: labels.inconclusive[lang], dot: "bg-muted-foreground/60", text: "text-muted-foreground", border: "" },
   };
   const m = meta[v] ?? meta.inconclusive;
   return (
@@ -284,11 +419,17 @@ function VerdictBadge({ verdict }: { verdict: string }) {
 
 // Question-answer status → small label. answered=green, partially=amber, not_answered=red.
 function QuestionStatusBadge({ status }: { status: string }) {
+  const lang = useUiLang();
   const s = status.toLowerCase();
+  const labels: Record<string, { ru: string; en: string }> = {
+    answered: { ru: "Отвечено", en: "Answered" },
+    partially: { ru: "Частично", en: "Partial" },
+    not_answered: { ru: "Нет ответа", en: "Not answered" },
+  };
   const meta: Record<string, { label: string; dot: string; text: string }> = {
-    answered: { label: "Answered", dot: "bg-status-ready", text: "text-status-ready" },
-    partially: { label: "Partial", dot: "bg-status-processing", text: "text-muted-foreground" },
-    not_answered: { label: "Not answered", dot: "bg-status-error", text: "text-status-error" },
+    answered: { label: labels.answered[lang], dot: "bg-status-ready", text: "text-status-ready" },
+    partially: { label: labels.partially[lang], dot: "bg-status-processing", text: "text-muted-foreground" },
+    not_answered: { label: labels.not_answered[lang], dot: "bg-status-error", text: "text-status-error" },
   };
   const m = meta[s] ?? meta.not_answered;
   return (
@@ -310,12 +451,14 @@ function HypothesesSection({
   titleFor: (id: string) => string;
   onOpenInterview: (id: string) => void;
 }) {
+  const t = useT(STR);
+  const lang = useUiLang();
   return (
     <section className="flex flex-col gap-4">
       <div className="flex items-baseline gap-2.5">
         <span className="flex items-center gap-1.5 font-numeric text-xs font-medium text-primary">
           <Lightbulb className="size-3.5" aria-hidden="true" />
-          Hypotheses
+          {t.hypotheses}
         </span>
       </div>
       <div className="flex flex-col gap-4">
@@ -331,7 +474,10 @@ function HypothesesSection({
               <div className="flex flex-wrap items-center gap-2">
                 <VerdictBadge verdict={h.verdict} />
                 <Badge variant="ghost" className="text-muted-foreground">
-                  {h.confidence} confidence
+                  {t.confidenceShort(
+                    CONFIDENCE_LABELS[h.confidence.toLowerCase()]?.[lang] ??
+                      h.confidence,
+                  )}
                 </Badge>
               </div>
               {h.rationale && (
@@ -367,12 +513,13 @@ function QuestionsSection({
   titleFor: (id: string) => string;
   onOpenInterview: (id: string) => void;
 }) {
+  const t = useT(STR);
   return (
     <section className="flex flex-col gap-3">
       <div className="flex items-baseline gap-2.5">
         <span className="flex items-center gap-1.5 font-numeric text-xs font-medium text-primary">
           <FileText className="size-3.5" aria-hidden="true" />
-          Questions
+          {t.questions}
         </span>
       </div>
       <div className="flex flex-col gap-3">
@@ -413,10 +560,11 @@ function QuestionsSection({
 
 // Human-readable stage label for the live progress line.
 function stageLabel(stage: string): string {
-  if (stage === "extract") return "Reading interviews";
-  if (stage === "reduce") return "Synthesizing findings";
-  if (stage === "done") return "Done";
-  return "Working";
+  const s = tr(STR);
+  if (stage === "extract") return s.stageReading;
+  if (stage === "reduce") return s.stageSynthesizing;
+  if (stage === "done") return s.stageDone;
+  return s.stageWorking;
 }
 
 // Which view of the cycle synthesis is shown: the editable markdown artifact (default) or
@@ -424,6 +572,7 @@ function stageLabel(stage: string): string {
 type View = "artifact" | "structured";
 
 export function SynthesisTab({ cycleId }: { cycleId: string }) {
+  const t = useT(STR);
   const navigate = useNavigate();
   const location = useLocation();
   const qc = useQueryClient();
@@ -465,8 +614,8 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
   // Interview id → title for evidence refs (fallback to a short id when not loaded).
   const titleFor = useMemo(() => {
     const map = new Map((interviews ?? []).map((i) => [i.id, i.title]));
-    return (id: string) => map.get(id) ?? `Interview ${id.slice(0, 8)}`;
-  }, [interviews]);
+    return (id: string) => map.get(id) ?? t.interviewFallback(id.slice(0, 8));
+  }, [interviews, t]);
 
   // Seed the markdown draft from the stored artifact whenever it (re)loads.
   const storedMd = synthesis?.content_md ?? "";
@@ -496,7 +645,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
         setProgress(null);
         qc.invalidateQueries({ queryKey: synthesisKeys.detail(cycleId) });
         if (p.stage === "error") {
-          toast.error(`Synthesis failed: ${p.error ?? "unknown"}`);
+          toast.error(t.synthesisFailedEvent(p.error ?? t.unknown));
         }
       } else {
         setProgress(p);
@@ -513,7 +662,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [cycleId, qc]);
+  }, [cycleId, qc, t]);
 
   const running = runSynthesis.isPending || progress != null;
 
@@ -529,13 +678,11 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     try {
       const row: SynthesisRow = await runSynthesis.mutateAsync();
       toast.success(
-        `Synthesis complete — ${row.doc.findings.length} finding${
-          row.doc.findings.length === 1 ? "" : "s"
-        } across ${row.doc.goals.length} goals.`,
+        t.synthesisComplete(row.doc.findings.length, row.doc.goals.length),
       );
     } catch (e) {
       setProgress(null);
-      toast.error(`Couldn't synthesize. ${String(e)}`);
+      toast.error(t.synthesisFailedRun(String(e)));
     }
   }
 
@@ -543,9 +690,9 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     try {
       await saveArtifact.mutateAsync(draft);
       setDirty(false);
-      toast.success("Synthesis saved");
+      toast.success(t.synthesisSaved);
     } catch (e) {
-      toast.error(`Couldn't save. ${String(e)}`);
+      toast.error(t.saveFailed(String(e)));
     }
   }
 
@@ -590,14 +737,15 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-0.5">
           <h2 className="text-sm font-medium text-foreground">
-            Cycle synthesis
+            {t.cycleSynthesis}
           </h2>
           <p className="text-xs text-muted-foreground">
             {hasSynthesis
-              ? `Last synthesized ${absoluteDate(synthesis!.created_at)}.`
-              : `An editable report across this wave's interviews, tied to your ${
-                  groupGoals.length || ""
-                } guide goal${groupGoals.length === 1 ? "" : "s"}.`}
+              ? t.lastSynthesized(absoluteDate(synthesis!.created_at))
+              : t.editableReport(
+                  groupGoals.length,
+                  t.goalWord(groupGoals.length),
+                )}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -614,7 +762,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
                 )}
               >
                 <FileText className="size-3.5" />
-                Artifact
+                {t.artifact}
               </button>
               <button
                 type="button"
@@ -627,7 +775,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
                 )}
               >
                 <LayoutList className="size-3.5" />
-                Findings
+                {t.findings}
               </button>
             </div>
           )}
@@ -637,10 +785,10 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
                 size="sm"
                 variant="ghost"
                 onClick={() => copyMarkdown(draft || storedMd)}
-                title="Скопировать как Markdown"
+                title={t.copyAsMarkdown}
               >
                 <Copy className="size-3.5" />
-                Копировать .md
+                {t.copyMd}
               </Button>
               <Button
                 size="sm"
@@ -648,10 +796,10 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
                 onClick={() =>
                   exportMarkdown(draft || storedMd, "synthesis.md")
                 }
-                title="Скачать как .md"
+                title={t.downloadAsMd}
               >
                 <Download className="size-3.5" />
-                Экспорт
+                {t.export}
               </Button>
             </>
           )}
@@ -667,7 +815,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
             ) : (
               <>
                 <Sparkles className="size-4" />
-                {hasSynthesis ? "Re-run synthesis" : "Run synthesis"}
+                {hasSynthesis ? t.reRunSynthesis : t.runSynthesis}
               </>
             )}
           </Button>
@@ -692,7 +840,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">
-              The editable report. Re-running regenerates it; your edits are saved.
+              {t.editableReportNote}
             </p>
             <Button
               size="sm"
@@ -701,7 +849,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
               disabled={!dirty || saveArtifact.isPending}
             >
               <Save className="size-3.5" />
-              {saveArtifact.isPending ? "Saving…" : "Save"}
+              {saveArtifact.isPending ? t.saving : t.save}
             </Button>
           </div>
           {/* MIN caveat (theme C): manual markdown edits never flow back into findings_json,
@@ -713,8 +861,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
               aria-hidden="true"
             />
             <p className="text-xs leading-relaxed text-muted-foreground">
-              Ручные правки этого текста не попадают в Diff и Чат — там
-              используется машинная версия findings.
+              {t.manualEditsCaveat}
             </p>
           </div>
           <MarkdownEditor
@@ -724,7 +871,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
               setDraft(md);
               setDirty(true);
             }}
-            placeholder="Run synthesis to generate the report, then edit it here…"
+            placeholder={t.artifactPlaceholder}
           />
         </div>
       ) : (
@@ -761,7 +908,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
           {(doc!.open_questions?.length ?? 0) > 0 && (
             <section className="flex flex-col gap-2 border-t border-border pt-5">
               <h3 className="text-sm font-medium text-foreground">
-                Open questions
+                {t.openQuestions}
               </h3>
               <ul className="flex flex-col gap-1.5">
                 {doc!.open_questions.map((q, i) => (
@@ -785,12 +932,13 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
 // Empty state before the first run: shows what synthesis will be grounded on (the goals)
 // so the action feels concrete.
 function EmptyState({ goals, running }: { goals: Goal[]; running: boolean }) {
+  const t = useT(STR);
   if (running) {
     return (
       <div className="flex max-w-md flex-col items-start gap-2 rounded-lg border border-dashed border-border px-6 py-10">
         <Loader2 className="size-4 animate-spin text-muted-foreground" />
         <p className="text-sm text-muted-foreground">
-          Synthesizing findings across this wave's interviews…
+          {t.synthesizingEmpty}
         </p>
       </div>
     );
@@ -798,17 +946,15 @@ function EmptyState({ goals, running }: { goals: Goal[]; running: boolean }) {
   return (
     <div className="flex max-w-md flex-col items-start gap-4 rounded-lg border border-dashed border-border px-6 py-8">
       <div className="flex flex-col gap-1">
-        <p className="text-sm font-medium text-foreground">No synthesis yet</p>
+        <p className="text-sm font-medium text-foreground">{t.noSynthesisYet}</p>
         <p className="text-xs text-muted-foreground">
-          Run synthesis to assemble an editable report across this wave's
-          interviews — tied to your guide's goals, with evidence quotes you can
-          trace and a by-role breakdown.
+          {t.noSynthesisDesc}
         </p>
       </div>
       {goals.length > 0 ? (
         <div className="flex w-full flex-col gap-2">
           <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-            Grounded on {goals.length} goal{goals.length === 1 ? "" : "s"}
+            {t.groundedOn(goals.length, t.goalCountWord(goals.length))}
           </span>
           <ul className="flex flex-col gap-1.5">
             {goals.map((g) => (
@@ -821,8 +967,9 @@ function EmptyState({ goals, running }: { goals: Goal[]; running: boolean }) {
         </div>
       ) : (
         <p className="text-xs text-muted-foreground">
-          Add a <span className="text-foreground">Goals</span> section to the
-          interview guide on the Overview tab first.
+          {t.addGoalsPrefix}
+          <span className="text-foreground">{t.addGoalsGoals}</span>
+          {t.addGoalsSuffix}
         </p>
       )}
     </div>

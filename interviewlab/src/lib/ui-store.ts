@@ -19,6 +19,11 @@ type UiState = {
   setAsrModelId: (id: string) => void;
   setAsrLanguage: (lang: string) => void;
 
+  // UI language for the whole interface (ru/en). DISTINCT from asrLanguage (the language of
+  // the audio being transcribed). Persisted; default "ru" (the primary research audience).
+  uiLang: "ru" | "en";
+  setUiLang: (lang: "ru" | "en") => void;
+
   // Diarization preference: the expected speaker count the Transcribe / Re-diarize
   // actions force ("auto" = let diarization detect it, else "2" | "3" | "4"). Stored as a
   // string in localStorage (same rationale as the ASR prefs); callers map "auto"→null when
@@ -45,6 +50,7 @@ type UiState = {
 const LS_MODEL = "ilab.asr.model";
 const LS_LANG = "ilab.asr.lang";
 const LS_SPEAKERS = "ilab.asr.speakers";
+const LS_UILANG = "ilab.ui.lang";
 function lsGet(key: string, fallback: string): string {
   try {
     return localStorage.getItem(key) ?? fallback;
@@ -97,6 +103,12 @@ export const useUiStore = create<UiState>((set, get) => ({
   setAsrLanguage: (lang) => {
     lsSet(LS_LANG, lang);
     set({ asrLanguage: lang });
+  },
+
+  uiLang: (lsGet(LS_UILANG, "ru") === "en" ? "en" : "ru"),
+  setUiLang: (lang) => {
+    lsSet(LS_UILANG, lang);
+    set({ uiLang: lang });
   },
 
   asrExpectedSpeakers: lsGet(LS_SPEAKERS, "auto"),

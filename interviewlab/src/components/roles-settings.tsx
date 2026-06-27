@@ -15,7 +15,39 @@ import {
   useRoles,
   useUpdateRole,
 } from "@/lib/role-queries";
+import { useT } from "@/lib/i18n";
 import type { Role } from "@/lib/tauri";
+
+const STR = {
+  ru: {
+    roleColor: "Цвет роли",
+    pick: (c: string) => `Выбрать ${c}`,
+    moveUp: "Переместить вверх",
+    moveDown: "Переместить вниз",
+    deleteRole: "Удалить роль",
+    roleDeleted: "Роль удалена",
+    rolesTitle: "Роли",
+    rolesDesc:
+      "Переиспользуемая библиотека ролей спикеров для редактора транскрипта. Первая роль — это интервьюер по умолчанию: при синтезе её реплики трактуются как вопросы/контекст.",
+    addPlaceholder: "Добавить роль (например, Дизайнер)…",
+    addRole: "Добавить роль",
+    addFailed: (e: string) => `Не удалось добавить роль. ${e}`,
+  },
+  en: {
+    roleColor: "Role color",
+    pick: (c: string) => `Pick ${c}`,
+    moveUp: "Move up",
+    moveDown: "Move down",
+    deleteRole: "Delete role",
+    roleDeleted: "Role deleted",
+    rolesTitle: "Roles",
+    rolesDesc:
+      "A reusable library of speaker roles for the transcript editor. The first role is the conventional interviewer — synthesis treats its turns as questions/context.",
+    addPlaceholder: "Add a role (e.g. Designer)…",
+    addRole: "Add role",
+    addFailed: (e: string) => `Couldn't add the role. ${e}`,
+  },
+} as const;
 
 // A small palette of muted, Linear-ish hues to seed new roles + offer in the color picker.
 // Mirrors the --role-* / status token family (index.css) so chips stay coherent.
@@ -38,13 +70,14 @@ function ColorPicker({
   color: string;
   onPick: (c: string) => void;
 }) {
+  const t = useT(STR);
   const [open, setOpen] = useState(false);
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label="Role color"
+          aria-label={t.roleColor}
           className="size-5 shrink-0 rounded-full border border-border-strong transition-transform hover:scale-110 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
           style={{ backgroundColor: color }}
         />
@@ -55,7 +88,7 @@ function ColorPicker({
             <button
               key={c}
               type="button"
-              aria-label={`Pick ${c}`}
+              aria-label={t.pick(c)}
               onClick={() => {
                 onPick(c);
                 setOpen(false);
@@ -82,6 +115,7 @@ function RoleRow({
   total: number;
   onMove: (dir: -1 | 1) => void;
 }) {
+  const t = useT(STR);
   const updateRole = useUpdateRole();
   const deleteRole = useDeleteRole();
   const [name, setName] = useState(role.name);
@@ -104,7 +138,7 @@ function RoleRow({
   function remove() {
     deleteRole.mutate(role.id, {
       onError: (e) => toast.error(String(e)),
-      onSuccess: () => toast.success("Role deleted"),
+      onSuccess: () => toast.success(t.roleDeleted),
     });
   }
 
@@ -126,7 +160,7 @@ function RoleRow({
         <Button
           variant="ghost"
           size="icon-xs"
-          aria-label="Move up"
+          aria-label={t.moveUp}
           className="text-muted-foreground"
           disabled={index === 0}
           onClick={() => onMove(-1)}
@@ -136,7 +170,7 @@ function RoleRow({
         <Button
           variant="ghost"
           size="icon-xs"
-          aria-label="Move down"
+          aria-label={t.moveDown}
           className="text-muted-foreground"
           disabled={index === total - 1}
           onClick={() => onMove(1)}
@@ -147,7 +181,7 @@ function RoleRow({
       <Button
         variant="ghost"
         size="icon-xs"
-        aria-label="Delete role"
+        aria-label={t.deleteRole}
         className="text-muted-foreground opacity-0 transition-opacity group-hover/role:opacity-100 hover:text-destructive focus-visible:opacity-100"
         onClick={remove}
         disabled={deleteRole.isPending}
@@ -159,6 +193,7 @@ function RoleRow({
 }
 
 export function RolesSettings() {
+  const t = useT(STR);
   const { data: roles, isPending } = useRoles();
   const createRole = useCreateRole();
   const updateRole = useUpdateRole();
@@ -173,7 +208,7 @@ export function RolesSettings() {
       await createRole.mutateAsync({ name: trimmed, color });
       setNewName("");
     } catch (e) {
-      toast.error(`Couldn't add the role. ${String(e)}`);
+      toast.error(t.addFailed(String(e)));
     }
   }
 
@@ -191,10 +226,9 @@ export function RolesSettings() {
   return (
     <div className="flex w-full flex-col gap-4 pt-2">
       <div className="flex flex-col gap-0.5">
-        <span className="text-sm font-medium text-foreground">Roles</span>
+        <span className="text-sm font-medium text-foreground">{t.rolesTitle}</span>
         <span className="text-xs text-muted-foreground">
-          A reusable library of speaker roles for the transcript editor. The first role is
-          the conventional interviewer — synthesis treats its turns as questions/context.
+          {t.rolesDesc}
         </span>
       </div>
 
@@ -217,7 +251,7 @@ export function RolesSettings() {
       {/* Add a role */}
       <div className="flex items-center gap-2">
         <Input
-          placeholder="Add a role (e.g. Дизайнер)…"
+          placeholder={t.addPlaceholder}
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
           onKeyDown={(e) => {
@@ -232,7 +266,7 @@ export function RolesSettings() {
           disabled={!newName.trim() || createRole.isPending}
         >
           <Plus className="size-3.5" />
-          Add role
+          {t.addRole}
         </Button>
       </div>
     </div>

@@ -5,6 +5,34 @@ import { NewCycleDialog } from "@/components/new-cycle-dialog";
 import { useCycles } from "@/lib/cycle-queries";
 import { relativeTime, absoluteDate } from "@/lib/format";
 import type { Cycle } from "@/lib/tauri";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    wave: (n: number) => `волна ${n}`,
+    updatedTitle: (d: string) => `Обновлён ${d}`,
+    heading: "Циклы",
+    subtitle: "Каждый цикл — это волна интервью: загрузка, расшифровка, синтез.",
+    loadError: "Не удалось загрузить циклы",
+    loadErrorDetail: (e: string) => `Бэкенд не ответил. ${e}`,
+    tryAgain: "Повторить",
+    emptyTitle: "Пока нет циклов",
+    emptyBody:
+      "Создайте первый, чтобы начать волну исследования — загрузите записи, расшифруйте и синтезируйте выводы.",
+  },
+  en: {
+    wave: (n: number) => `wave ${n}`,
+    updatedTitle: (d: string) => `Updated ${d}`,
+    heading: "Cycles",
+    subtitle: "Each cycle is a wave of interviews — ingest, transcribe, synthesize.",
+    loadError: "Couldn't load cycles",
+    loadErrorDetail: (e: string) => `The backend didn't respond. ${e}`,
+    tryAgain: "Try again",
+    emptyTitle: "No cycles yet",
+    emptyBody:
+      "Create your first to start a research wave — ingest recordings, transcribe, and synthesize findings.",
+  },
+};
 
 // ponytail: the old status dot derived processing/idle from record age (updated_at < 7d),
 // which is a lie — it told nothing about real work. The honest interview-count metadata
@@ -13,6 +41,7 @@ import type { Cycle } from "@/lib/tauri";
 function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
   const navigate = useNavigate();
   const open = () => navigate(`/cycles/${cycle.id}`);
+  const t = useT(STR);
 
   return (
     <div
@@ -33,12 +62,12 @@ function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
 
       {/* Wave index — a quiet nod to "research waves", right-aligned metadata. */}
       <span className="hidden font-numeric text-xs text-muted-foreground/70 sm:inline">
-        wave {index + 1}
+        {t.wave(index + 1)}
       </span>
 
       <span
         className="w-28 shrink-0 text-right font-numeric text-xs text-muted-foreground"
-        title={`Updated ${absoluteDate(cycle.updated_at)}`}
+        title={t.updatedTitle(absoluteDate(cycle.updated_at))}
       >
         {relativeTime(cycle.updated_at)}
       </span>
@@ -48,6 +77,7 @@ function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
 
 export function CyclesPage() {
   const { data: cycles, isPending, isError, error, refetch } = useCycles();
+  const t = useT(STR);
 
   return (
     // Wide: cap the list so rows don't stretch into a dead gap between the name (left) and
@@ -56,11 +86,9 @@ export function CyclesPage() {
       <header className="flex items-center justify-between gap-4">
         <div className="flex flex-col gap-0.5">
           <h1 className="text-lg font-semibold tracking-[-0.02em] text-foreground">
-            Cycles
+            {t.heading}
           </h1>
-          <p className="text-xs text-muted-foreground">
-            Each cycle is a wave of interviews — ingest, transcribe, synthesize.
-          </p>
+          <p className="text-xs text-muted-foreground">{t.subtitle}</p>
         </div>
         <NewCycleDialog />
       </header>
@@ -82,10 +110,10 @@ export function CyclesPage() {
         <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-card p-8">
           <div className="flex flex-col gap-1">
             <p className="text-sm font-medium text-foreground">
-              Couldn't load cycles
+              {t.loadError}
             </p>
             <p className="text-xs text-muted-foreground">
-              The backend didn't respond. {String(error)}
+              {t.loadErrorDetail(String(error))}
             </p>
           </div>
           <button
@@ -93,7 +121,7 @@ export function CyclesPage() {
             onClick={() => refetch()}
             className="rounded-md border border-border px-2.5 py-1 text-xs font-medium transition-colors hover:bg-secondary/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
           >
-            Try again
+            {t.tryAgain}
           </button>
         </div>
       ) : cycles.length === 0 ? (
@@ -103,11 +131,8 @@ export function CyclesPage() {
             <Waves className="size-5" />
           </span>
           <div className="flex max-w-sm flex-col gap-1">
-            <p className="text-sm font-medium text-foreground">No cycles yet</p>
-            <p className="text-xs text-muted-foreground">
-              Create your first to start a research wave — ingest recordings,
-              transcribe, and synthesize findings.
-            </p>
+            <p className="text-sm font-medium text-foreground">{t.emptyTitle}</p>
+            <p className="text-xs text-muted-foreground">{t.emptyBody}</p>
           </div>
           <NewCycleDialog />
         </div>

@@ -12,7 +12,25 @@ import { useWavesurfer } from "@wavesurfer/react";
 import { Pause, Play, SkipBack } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { formatTimecode } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const STR = {
+  ru: {
+    position: "Позиция воспроизведения",
+    valueText: (cur: string, total: string) => `${cur} из ${total}`,
+    pause: "Пауза",
+    play: "Воспроизвести",
+    restart: "В начало",
+  },
+  en: {
+    position: "Playback position",
+    valueText: (cur: string, total: string) => `${cur} of ${total}`,
+    pause: "Pause",
+    play: "Play",
+    restart: "Restart",
+  },
+} as const;
 
 // Imperative handle so the segment list can drive the player (seek on segment click).
 export type WaveformHandle = {
@@ -45,6 +63,7 @@ export const WaveformPlayer = forwardRef<
     onPlayingChange?: (playing: boolean) => void;
   }
 >(function WaveformPlayer({ url, durationMs, onTime, onPlayingChange }, ref) {
+  const t = useT(STR);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentMs, setCurrentMs] = useState(0);
 
@@ -186,11 +205,11 @@ export const WaveformPlayer = forwardRef<
           ref={containerRef}
           role="slider"
           tabIndex={isReady ? 0 : -1}
-          aria-label="Playback position"
+          aria-label={t.position}
           aria-valuemin={0}
           aria-valuemax={Math.round(totalMs / 1000)}
           aria-valuenow={Math.round(currentMs / 1000)}
-          aria-valuetext={`${formatTimecode(currentMs)} of ${formatTimecode(totalMs)}`}
+          aria-valuetext={t.valueText(formatTimecode(currentMs), formatTimecode(totalMs))}
           onKeyDown={handleKeyDown}
           className="w-full rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
         />
@@ -214,7 +233,7 @@ export const WaveformPlayer = forwardRef<
         <Button
           variant="secondary"
           size="icon-sm"
-          aria-label={isPlaying ? "Pause" : "Play"}
+          aria-label={isPlaying ? t.pause : t.play}
           disabled={!isReady}
           onClick={() => wavesurfer?.playPause()}
         >
@@ -223,7 +242,7 @@ export const WaveformPlayer = forwardRef<
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="Restart"
+          aria-label={t.restart}
           disabled={!isReady}
           className="text-muted-foreground"
           onClick={() => {
