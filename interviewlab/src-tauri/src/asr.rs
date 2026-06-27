@@ -139,27 +139,66 @@ pub struct ModelInfo {
     pub label: String,
     pub file: String,
     pub approx_mb: u64,
-    pub default: bool,   // the app default (large-v3, spec §6.4)
+    pub default: bool,    // the app default (large-v3, spec §6.4)
     pub downloaded: bool, // resolved at list time from models/ on disk
+    // --- characteristics shown in the model picker so the user can choose with eyes open ---
+    pub multilingual: bool, // false = English-only (".en" weights)
+    pub quantized: bool,    // q5_0 — ~⅓ the size, near-identical quality, a touch slower on CPU
+    pub speed: String,      // "fastest" | "fast" | "medium" | "slow" | "slowest"
+    pub accuracy: String,   // "lowest" | "basic" | "good" | "high" | "highest"
+    pub note: String,       // short human description of the tradeoffs (RU)
 }
 
-// The catalog. Default = large-v3 (best Russian accuracy, spec §6.4); turbo + medium
-// are the speed/VRAM knobs the spec calls out. tiny/base are small models for dev
-// verification (kept selectable so the M4 verify can avoid a 3 GB download).
+// The full whisper.cpp ggml catalog (https://github.com/ggml-org/whisper.cpp/blob/master/models).
+// Any of these can be downloaded. Default = large-v3 (best Russian accuracy). `.en` = English-only;
+// `-q5_0` = quantized (smaller, ~same quality); `-turbo` = faster large-v3; `-tdrz` = tinydiarize
+// speaker tokens (English only). approx_mb is rough on-disk size for the UI.
 struct CatalogEntry {
     id: &'static str,
     label: &'static str,
     file: &'static str,
     approx_mb: u64,
     default: bool,
+    multilingual: bool,
+    quantized: bool,
+    speed: &'static str,
+    accuracy: &'static str,
+    note: &'static str,
 }
 
 const CATALOG: &[CatalogEntry] = &[
-    CatalogEntry { id: "large-v3", label: "Large v3 (best, Russian default)", file: "ggml-large-v3.bin", approx_mb: 3094, default: true },
-    CatalogEntry { id: "large-v3-turbo", label: "Large v3 Turbo (faster)", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false },
-    CatalogEntry { id: "medium", label: "Medium (lighter)", file: "ggml-medium.bin", approx_mb: 1533, default: false },
-    CatalogEntry { id: "base", label: "Base (small, for testing)", file: "ggml-base.bin", approx_mb: 148, default: false },
-    CatalogEntry { id: "tiny", label: "Tiny (smallest, for testing)", file: "ggml-tiny.bin", approx_mb: 78, default: false },
+    CatalogEntry { id: "large-v3", label: "Large v3", file: "ggml-large-v3.bin", approx_mb: 3094, default: true, multilingual: true, quantized: false, speed: "slowest", accuracy: "highest",
+        note: "Лучшее качество, рекомендуется для русского. Тяжёлая — комфортно на GPU." },
+    CatalogEntry { id: "large-v3-turbo", label: "Large v3 Turbo", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false, multilingual: true, quantized: false, speed: "fast", accuracy: "high",
+        note: "Ускоренная large-v3: заметно быстрее, качество чуть ниже флагмана. Хороший баланс." },
+    CatalogEntry { id: "large-v3-turbo-q5_0", label: "Large v3 Turbo (q5_0)", file: "ggml-large-v3-turbo-q5_0.bin", approx_mb: 574, default: false, multilingual: true, quantized: true, speed: "fast", accuracy: "high",
+        note: "Квантованный turbo: самый компактный из топовых (~0.5 ГБ), быстрый, качество близко к turbo." },
+    CatalogEntry { id: "large-v3-q5_0", label: "Large v3 (q5_0)", file: "ggml-large-v3-q5_0.bin", approx_mb: 1100, default: false, multilingual: true, quantized: true, speed: "slow", accuracy: "highest",
+        note: "Квантованная large-v3: ~⅓ размера при почти том же качестве, чуть медленнее на CPU." },
+    CatalogEntry { id: "large-v2", label: "Large v2", file: "ggml-large-v2.bin", approx_mb: 3094, default: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high",
+        note: "Прошлое поколение large. Обычно лучше брать v3, но иногда стабильнее на отдельных языках." },
+    CatalogEntry { id: "large-v2-q5_0", label: "Large v2 (q5_0)", file: "ggml-large-v2-q5_0.bin", approx_mb: 1100, default: false, multilingual: true, quantized: true, speed: "slow", accuracy: "high",
+        note: "Квантованная large-v2: компактная версия предыдущего поколения." },
+    CatalogEntry { id: "large-v1", label: "Large v1", file: "ggml-large-v1.bin", approx_mb: 3094, default: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high",
+        note: "Самая старая large. Как правило уступает v3 — берите только для совместимости." },
+    CatalogEntry { id: "medium", label: "Medium", file: "ggml-medium.bin", approx_mb: 1533, default: false, multilingual: true, quantized: false, speed: "medium", accuracy: "good",
+        note: "Компромисс качество/скорость для скромного железа без сильного GPU." },
+    CatalogEntry { id: "small", label: "Small", file: "ggml-small.bin", approx_mb: 488, default: false, multilingual: true, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Лёгкая модель: ок для черновика или слабой машины, заметно теряет на сложной речи." },
+    CatalogEntry { id: "base", label: "Base", file: "ggml-base.bin", approx_mb: 148, default: false, multilingual: true, quantized: false, speed: "fastest", accuracy: "basic",
+        note: "Маленькая, для быстрых черновиков и тестов. Низкая точность на русском." },
+    CatalogEntry { id: "tiny", label: "Tiny", file: "ggml-tiny.bin", approx_mb: 78, default: false, multilingual: true, quantized: false, speed: "fastest", accuracy: "lowest",
+        note: "Самая маленькая. Только для проверки пайплайна или очень слабых машин." },
+    CatalogEntry { id: "medium.en", label: "Medium (English-only)", file: "ggml-medium.en.bin", approx_mb: 1533, default: false, multilingual: false, quantized: false, speed: "medium", accuracy: "good",
+        note: "Только английский: точнее на англ. речи, но НЕ подходит для русского." },
+    CatalogEntry { id: "small.en", label: "Small (English-only)", file: "ggml-small.en.bin", approx_mb: 488, default: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Только английский, лёгкая." },
+    CatalogEntry { id: "small.en-tdrz", label: "Small (English, tinydiarize)", file: "ggml-small.en-tdrz.bin", approx_mb: 488, default: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Только англ., со встроенными токенами смены говорящего (tinydiarize). Узкоспециальная." },
+    CatalogEntry { id: "base.en", label: "Base (English-only)", file: "ggml-base.en.bin", approx_mb: 148, default: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "basic",
+        note: "Только английский, маленькая." },
+    CatalogEntry { id: "tiny.en", label: "Tiny (English-only)", file: "ggml-tiny.en.bin", approx_mb: 78, default: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "lowest",
+        note: "Только английский, самая маленькая." },
 ];
 
 fn catalog_entry(id: &str) -> Option<&'static CatalogEntry> {
@@ -1079,6 +1118,11 @@ pub async fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, String
             approx_mb: e.approx_mb,
             default: e.default,
             downloaded,
+            multilingual: e.multilingual,
+            quantized: e.quantized,
+            speed: e.speed.to_string(),
+            accuracy: e.accuracy.to_string(),
+            note: e.note.to_string(),
         });
     }
     Ok(out)

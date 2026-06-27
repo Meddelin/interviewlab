@@ -2,7 +2,6 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
-  Copy,
   Cpu,
   Download,
   Loader2,
@@ -14,8 +13,6 @@ import {
   Zap,
 } from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { isMac } from "@/lib/platform";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -70,6 +67,7 @@ import {
   type AdapterSummary,
   type Capability,
   type DiarModelProgress,
+  type ModelInfo,
   type ModelOption,
   type ModelProgress,
   type ProbeResult,
@@ -115,68 +113,42 @@ function Bar({ pct }: { pct: number }) {
   );
 }
 
-// "Get the GPU build" call-to-action: shown when a supported GPU is present but this
-// build runs on CPU. openUrl is the Tauri opener plugin; the browser preview has no
-// plugin, so we fall back to window.open. winget (CUDA Toolkit) is Windows-only.
-const GPU_RELEASES_URL = "https://github.com/Meddelin/interviewlab/releases";
-const CUDA_WINGET_CMD = "winget install -e --id Nvidia.CUDA";
+// Human-readable model characteristics, shared by the picker list + the selected-model
+// card. Settings follows the surrounding English copy.
+const SPEED_LABEL: Record<ModelInfo["speed"], string> = {
+  fastest: "fastest",
+  fast: "fast",
+  medium: "medium",
+  slow: "slow",
+  slowest: "slowest",
+};
+const ACCURACY_LABEL: Record<ModelInfo["accuracy"], string> = {
+  lowest: "lowest",
+  basic: "basic",
+  good: "good",
+  high: "high",
+  highest: "highest",
+};
 
-async function openReleases() {
-  try {
-    await openUrl(GPU_RELEASES_URL);
-  } catch {
-    // ponytail: browser preview has no opener plugin — plain window.open is enough.
-    window.open(GPU_RELEASES_URL, "_blank");
-  }
+function formatSize(approxMb: number): string {
+  return approxMb >= 1000 ? `${(approxMb / 1000).toFixed(1)} GB` : `${approxMb} MB`;
 }
 
-function DeviceGpuCallout({
-  gpuName,
-  cudaBuild,
-}: {
-  gpuName: string | null;
-  cudaBuild: boolean;
-}) {
-  const [copied, setCopied] = useState(false);
-  const showWinget = !isMac && !cudaBuild;
+// Characteristics card for the selected model: size, language, quantization, speed,
+// accuracy + the human note. Compact, shadcn Badge styling.
+function ModelSpecCard({ model }: { model: ModelInfo }) {
   return (
-    <div className="mt-1 flex flex-col gap-2 rounded-md border border-primary/30 bg-primary/5 p-2.5">
-      <p className="text-xs leading-relaxed text-foreground">
-        {gpuName ?? "GPU"} detected, but this build runs on CPU. Install the GPU
-        version to accelerate recognition.
-      </p>
-      <Button size="sm" className="self-start" onClick={openReleases}>
-        <Download className="size-3.5" />
-        Download GPU version
-      </Button>
-      {showWinget && (
-        <div className="flex flex-col gap-1.5 pt-0.5">
-          <span className="text-xs text-muted-foreground">
-            Or install the CUDA Toolkit:
-          </span>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
-              {CUDA_WINGET_CMD}
-            </code>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={async () => {
-                await navigator.clipboard.writeText(CUDA_WINGET_CMD);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              }}
-            >
-              {copied ? (
-                <CheckCircle2 className="size-3.5" />
-              ) : (
-                <Copy className="size-3.5" />
-              )}
-              Copy
-            </Button>
-          </div>
-        </div>
-      )}
+    <div className="flex max-w-md flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge variant="secondary">{formatSize(model.approx_mb)}</Badge>
+        <Badge variant="secondary">
+          {model.multilingual ? "🌍 Multilingual" : "English-only"}
+        </Badge>
+        {model.quantized && <Badge variant="secondary">q5_0</Badge>}
+        <Badge variant="outline">Speed: {SPEED_LABEL[model.speed]}</Badge>
+        <Badge variant="outline">Accuracy: {ACCURACY_LABEL[model.accuracy]}</Badge>
+      </div>
+      <p className="text-xs leading-relaxed text-muted-foreground">{model.note}</p>
     </div>
   );
 }
@@ -334,12 +306,6 @@ function TranscriptionTab() {
                 GPU active ({device.device === "metal" ? "Apple Metal" : "CUDA"})
               </span>
             )}
-            {device.recommendation === "get_gpu_build" && (
-              <DeviceGpuCallout
-                gpuName={device.gpu_name}
-                cudaBuild={device.cuda_build}
-              />
-            )}
           </div>
         )}
       </div>
@@ -366,7 +332,16 @@ function TranscriptionTab() {
                 <SelectContent>
                   {models.map((m) => (
                     <SelectItem key={m.id} value={m.id}>
-                      {m.label}
+                      <span className="flex items-center gap-2">
+                        {m.label}
+                        <span className="font-numeric text-[11px] text-muted-foreground">
+                          {formatSize(m.approx_mb)}
+                        </span>
+                        <span className="text-[11px] text-muted-foreground">
+                          {m.multilingual ? "🌍 multilingual" : "EN"}
+                          {m.quantized ? " · q5_0" : ""}
+                        </span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -389,14 +364,14 @@ function TranscriptionTab() {
                   Download model
                   {selected ? (
                     <span className="font-numeric text-xs text-muted-foreground">
-                      {selected.approx_mb >= 1000
-                        ? `${(selected.approx_mb / 1000).toFixed(1)} GB`
-                        : `${selected.approx_mb} MB`}
+                      {formatSize(selected.approx_mb)}
                     </span>
                   ) : null}
                 </Button>
               )}
             </div>
+
+            {selected && <ModelSpecCard model={selected} />}
 
             {dl && selected && dl.id === selected.id && (
               <div className="flex max-w-xs flex-col gap-1">

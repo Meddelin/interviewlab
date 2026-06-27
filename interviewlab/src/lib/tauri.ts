@@ -145,6 +145,12 @@ export type ModelInfo = {
   approx_mb: number;
   default: boolean;
   downloaded: boolean;
+  // Characteristics for the picker. multilingual=false → English-only (.en).
+  multilingual: boolean;
+  quantized: boolean;
+  speed: "fastest" | "fast" | "medium" | "slow" | "slowest";
+  accuracy: "lowest" | "basic" | "good" | "high" | "highest";
+  note: string;
 };
 
 // A stored transcript row (Rust `TranscriptRow`). segments_json is JSON of Segment[].
