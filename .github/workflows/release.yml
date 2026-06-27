@@ -33,7 +33,9 @@ jobs:
           # ---- Windows: GPU (CUDA) build. nvcc compiles the whisper.cpp CUDA kernels in CI WITHOUT
           #      a physical GPU (a GPU is only needed at runtime). Target hardware is Windows+Nvidia,
           #      so we ship ONLY the CUDA build (no CPU variant). sherpa libs come via cargo build-script. ----
-          - platform: windows-latest
+          # windows-2022 = VS 2022 / MSVC 14.4x. NOT windows-latest: that now ships VS 2026 / MSVC
+          # 14.51, whose host_config.h check CUDA 12.6 rejects ("unsupported Visual Studio version").
+          - platform: windows-2022
             args: "--features cuda"
             rust_target: x86_64-pc-windows-msvc
             cuda: true
@@ -79,6 +81,19 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
+      # Set CUDA/CMake build env ONLY on the cuda job (writing to $GITHUB_ENV). Doing this here
+      # instead of step-level env keeps these vars ABSENT on macOS — an empty CMAKE_GENERATOR there
+      # breaks the sherpa/whisper cmake builds. Ninja generator (the VS+CUDA generator can't resolve
+      # CudaToolkitDir); 12.6 has no native Blackwell SASS, so real SASS for Ampere/Ada + sm_90 PTX
+      # the Blackwell driver JIT-compiles at runtime (covers RTX 30/40/50).
+      - name: Configure CUDA build env
+        if: matrix.cuda
+        shell: bash
+        run: |
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          echo "CMAKE_GENERATOR_INSTANCE=" >> "$GITHUB_ENV"
+          echo "CMAKE_CUDA_ARCHITECTURES=86-real;89-real;90-virtual" >> "$GITHUB_ENV"
+
       - name: Install frontend dependencies
         working-directory: interviewlab
         run: npm ci
@@ -91,13 +106,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # NO APPLE_* / APPLE_CERTIFICATE / WINDOWS_CERTIFICATE secrets — builds stay UNSIGNED on purpose.
-          # CUDA build knobs (empty on macOS → ignored). Ninja generator (the VS+CUDA generator can't
-          # resolve CudaToolkitDir reliably). The 12.6 toolkit has no native Blackwell (sm_120) SASS, so we
-          # ship real SASS for Ampere/Ada + a sm_90 VIRTUAL (PTX) arch the Blackwell driver JIT-compiles at
-          # runtime — so the one installer runs on RTX 30/40/50-series.
-          CMAKE_GENERATOR: ${{ matrix.cuda && 'Ninja' || '' }}
-          CMAKE_GENERATOR_INSTANCE: ""
-          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda && '86-real;89-real;90-virtual' || '' }}
+          # CUDA/CMake env is set per-job via the "Configure CUDA build env" step (cuda only) so macOS
+          # never inherits an empty CMAKE_GENERATOR.
         with:
           projectPath: interviewlab
           args: ${{ matrix.args }}
