@@ -1954,7 +1954,9 @@ async fn gather_interview(
 // cycle's stored synthesis (get_synthesis_db) → prev_wave_block. Best-effort: any DB error / a
 // missing prev synthesis just yields Null so synthesis runs exactly as a first wave.
 async fn prev_wave_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Value {
-    let prev_id: Option<String> = sqlx::query_scalar("SELECT prev_cycle_id FROM cycle WHERE id = ?")
+    let prev_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT prev_cycle_id FROM cycle WHERE id = ?",
+    )
         .bind(cycle_id)
         .fetch_optional(pool)
         .await
