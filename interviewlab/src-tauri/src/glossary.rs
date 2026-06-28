@@ -333,6 +333,27 @@ pub(crate) async fn glossary_for_interview_db(
     }
 }
 
+// The glossary terms for a CYCLE (cycle → product → terms). The synthesis-level stages (diff)
+// work per-cycle, not per-interview, but the glossary is one-per-product on the cycle, so this is
+// the cycle-level twin of glossary_for_interview_db. Empty when the cycle has no linked product.
+// pub(crate) so diff.rs shares this one resolution path (roadmap §4: glossary as the spelling
+// authority in the diff too).
+pub(crate) async fn glossary_for_cycle_db(
+    pool: &SqlitePool,
+    cycle_id: &str,
+) -> Result<Vec<GlossaryTerm>, String> {
+    let product_id: Option<String> = sqlx::query_scalar("SELECT product_id FROM cycle WHERE id = ?")
+        .bind(cycle_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+    match product_id.filter(|s| !s.is_empty()) {
+        Some(pid) => list_for_product_db(pool, &pid).await.map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
 // --- B/C: term extraction via the CLI -----------------------------------------
 
 // The output schema we hand the CLI for the extract task: { "terms": [ {canonical, aliases,
@@ -513,7 +534,20 @@ fn diff_pairs(raw: &[Segment], fixed: &[Segment]) -> Vec<(String, String)> {
         .collect()
 }
 
-// Shared extract instructions: what a glossary term IS and the never-hallucinate guardrails.
+// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / glossary.rs / diff.rs so it
+// can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
+// константой во все стадии"). Do NOT diverge the wording per file.
+const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
+    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
+    better than guessing.\n\
+    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
+    numbers, and NO markdown headings inside string fields of the JSON.";
+
+// Shared extract instructions: what a glossary term IS and the never-hallucinate guardrails. The
+// language / anti-hallucination policy comes from UNIFIED_LLM_RULES (one source of truth); this
+// string covers only the extract-task SPECIFICS so it can't drift from the other stages.
 const EXTRACT_GUIDELINES: &str = "Build a focused GLOSSARY for fixing speech-to-text of \
     Russian product/tech interviews. A glossary term = a brand / product / tool name, an \
     acronym/initialism, a technical term, or an anglicism that the ASR mis-renders. For each \
@@ -521,9 +555,8 @@ const EXTRACT_GUIDELINES: &str = "Build a focused GLOSSARY for fixing speech-to-
     products/tools → canonical like Figma/Jira/GitHub; assimilated anglicisms → standard \
     Cyrillic like дедлайн/фича/баг — do NOT Latinize those) plus `aliases`: the garbled / \
     phonetic / mis-spelled forms to map to it (e.g. canonical \"API\" with aliases \
-    [\"эй-пи-ай\",\"апишка\"]). Only include terms ACTUALLY present in the provided text — never \
-    invent terms, and never translate a term the speaker chose. Skip ordinary words. Prefer \
-    fewer, high-value entries over an exhaustive dump.";
+    [\"эй-пи-ай\",\"апишка\"]). Only include terms ACTUALLY present in the provided text. Skip \
+    ordinary words. Prefer fewer, high-value entries over an exhaustive dump.";
 
 // Build the extract input for the transcript-mining path (B).
 fn build_extract_input(
@@ -535,6 +568,7 @@ fn build_extract_input(
     let mut input = json!({
         "task": "glossary-extract",
         "language": language.unwrap_or("auto"),
+        "rules": UNIFIED_LLM_RULES,
         "guidelines": EXTRACT_GUIDELINES,
         "instructions": "Read `transcript_text` (and `product_desc` for product/brand spellings) \
             and propose NEW glossary terms per `guidelines`. Do NOT propose any term already in \
@@ -564,6 +598,7 @@ fn build_extract_from_edits_input(
     let mut input = json!({
         "task": "glossary-extract",
         "language": language.unwrap_or("auto"),
+        "rules": UNIFIED_LLM_RULES,
         "guidelines": EXTRACT_GUIDELINES,
         "instructions": "`corrections` are (before → after) edits a human made to the transcript. \
             Find TERM-LEVEL normalizations among them (a brand/acronym/anglicism spelled one way in \

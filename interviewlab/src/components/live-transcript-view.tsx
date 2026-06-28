@@ -3,7 +3,37 @@ import { Loader2, Square, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Segment } from "@/lib/tauri";
 import { formatTimecode } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const STR = {
+  ru: {
+    diarizing: "Диаризация — определяем спикеров",
+    transcribing: "Расшифровка",
+    segments: (n: number) => `${n} сегм.`,
+    stop: "Остановить",
+    stopAria: "Остановить расшифровку",
+    diarNote:
+      "Транскрипт готов — теперь распределяем спикеров. Это выполняется на CPU и может занять время на длинных записях.",
+    speakersDetected: (n: number) =>
+      `Обнаружено спикеров: ${n}.`,
+    wrappingUp: "Завершаем…",
+    waiting: "Ждём первые слова…",
+  },
+  en: {
+    diarizing: "Diarizing — identifying speakers",
+    transcribing: "Transcribing",
+    segments: (n: number) => `${n} segment${n === 1 ? "" : "s"}`,
+    stop: "Stop",
+    stopAria: "Stop transcription",
+    diarNote:
+      "Transcript is complete — assigning speakers now. This runs on the CPU and can take a while on long recordings.",
+    speakersDetected: (n: number) =>
+      `${n} speaker${n === 1 ? "" : "s"} detected.`,
+    wrappingUp: "Wrapping up…",
+    waiting: "Waiting for the first words…",
+  },
+} as const;
 
 // Read-only live view shown in the editor's right pane WHILE a transcription is running, so a
 // slow (e.g. Mac CPU) run can be watched filling in instead of being a black box. Two phases:
@@ -48,6 +78,7 @@ export function LiveTranscriptView({
   durationMs: number | null;
   onStop: () => void;
 }) {
+  const t = useT(STR);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // Auto-follow the tail as new segments stream in, but only when the user is already near the
   // bottom — so scrolling up to re-read an earlier line isn't yanked back down.
@@ -86,7 +117,7 @@ export function LiveTranscriptView({
             <Loader2 className="size-3.5 shrink-0 animate-spin text-status-processing" />
           )}
           <span className="text-xs font-medium text-foreground">
-            {diarActive ? "Diarizing — identifying speakers" : "Transcribing"}
+            {diarActive ? t.diarizing : t.transcribing}
           </span>
           <span className="font-numeric text-xs tabular-nums text-muted-foreground">
             {diarActive
@@ -94,21 +125,18 @@ export function LiveTranscriptView({
               : `${Math.max(0, Math.min(100, progress))}%`}
           </span>
           <span className="ml-auto flex items-center gap-3">
-            <span className="text-xs text-muted-foreground">
-              <span className="font-numeric tabular-nums text-foreground/70">
-                {segments.length}
-              </span>{" "}
-              segment{segments.length === 1 ? "" : "s"}
+            <span className="font-numeric text-xs tabular-nums text-muted-foreground">
+              {t.segments(segments.length)}
             </span>
             <Button
               variant="ghost"
               size="xs"
               className="text-status-error"
               onClick={onStop}
-              aria-label="Stop transcription"
+              aria-label={t.stopAria}
             >
               <Square className="size-3 fill-current" />
-              Stop
+              {t.stop}
             </Button>
           </span>
         </div>
@@ -126,13 +154,12 @@ export function LiveTranscriptView({
         </div>
         {diarActive && (
           <p className="text-[11px] text-muted-foreground">
-            Transcript is complete — assigning speakers now. This runs on the CPU and can take a
-            while on long recordings.
+            {t.diarNote}
           </p>
         )}
         {speakers != null && !diarActive && (
           <p className="text-[11px] text-muted-foreground">
-            {speakers} speaker{speakers === 1 ? "" : "s"} detected.
+            {t.speakersDetected(speakers)}
           </p>
         )}
       </div>
@@ -148,9 +175,7 @@ export function LiveTranscriptView({
         {segments.length === 0 ? (
           <div className="flex h-full items-center justify-center">
             <p className="text-sm text-muted-foreground">
-              {diarActive
-                ? "Wrapping up…"
-                : "Waiting for the first words…"}
+              {diarActive ? t.wrappingUp : t.waiting}
             </p>
           </div>
         ) : (

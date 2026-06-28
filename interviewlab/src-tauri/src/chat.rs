@@ -230,9 +230,21 @@ const CITATION_PREAMBLE: &str = r#"You are InterviewLab's cycle assistant. Answe
 
 Cite every claim inline using these exact tokens (the app turns them into clickable chips):
 - [[finding:F1]] — when a claim comes from a synthesis finding (use its id, e.g. F1, F2).
+- [[hypothesis:H1]] — when answering about a guide hypothesis (use its id, e.g. H1, H2).
+- [[question:Q1]] — when answering about a guide question (use its id, e.g. Q1, Q2).
 - [[interview:<interview_id>]] — when referring to a whole interview.
 - [[iv:<interview_id> seg:<n>]] — when quoting/paraphrasing a transcript segment.
-Put the token right after the sentence it supports. Prefer finding citations; they are the most reliable. Do not output the tokens in a code block.
+Put the token right after the sentence it supports. Prefer finding/hypothesis/question citations; they are the most reliable. Do not output the tokens in a code block.
+
+"#;
+
+// ЕДИНЫЕ ПРАВИЛА LLM-СТАДИЙ — kept verbatim so it can later be hoisted into one Rust const
+// shared by every LLM stage (roadmap §4 "общий мини-блок правил одной константой").
+const LLM_STAGE_RULES: &str = r#"## Shared LLM-stage rules
+- Язык вывода = язык интервью; термины НЕ переводить.
+- Анти-галлюцинации: не выдумывать имена/числа/цитаты; «не установлено / нет ответа» лучше, чем додумывание.
+- Терминология: использовать каноничные написания из глоссария в прозе и в цитатах.
+- Стиль артефактов: нейтральный аналитический тон, без воды, единый формат цитат и чисел, без markdown-заголовков внутри строковых полей JSON.
 
 --- CYCLE DATA ---
 "#;
@@ -245,6 +257,7 @@ Put the token right after the sentence it supports. Prefer finding citations; th
 pub(crate) async fn build_context(pool: &SqlitePool, cycle_id: &str) -> Result<String, String> {
     let mut out = String::with_capacity(8 * 1024);
     out.push_str(CITATION_PREAMBLE);
+    out.push_str(LLM_STAGE_RULES);
 
     // Cycle name + product description.
     let cycle: Option<(String, String)> =
@@ -260,6 +273,17 @@ pub(crate) async fn build_context(pool: &SqlitePool, cycle_id: &str) -> Result<S
     out.push_str(&format!("\n## Analysis principles\n{}\n", crate::synthesis::analysis_system_prompt()));
     if !product_desc.trim().is_empty() {
         out.push_str(&format!("\n## Product\n{}\n", product_desc.trim()));
+    }
+
+    // Glossary (canonical spellings) — the SAME render_for_prompt the ASR/cleanup/synthesis
+    // stages use, so the chat answers with the cycle's canonical terms in prose AND in quotes.
+    let glossary = crate::glossary::glossary_for_cycle_db(pool, cycle_id).await?;
+    let gloss_json = crate::glossary::render_for_prompt(&glossary);
+    if gloss_json.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        out.push_str(&format!(
+            "\n## Glossary (canonical spellings — use these exact forms)\n{}\n",
+            serde_json::to_string(&gloss_json).unwrap_or_else(|_| "[]".into())
+        ));
     }
 
     // Guide + derived goals (reuse synthesis.rs as the single source of truth for both).
@@ -291,6 +315,8 @@ pub(crate) async fn build_context(pool: &SqlitePool, cycle_id: &str) -> Result<S
             out.push_str(&format!("\n## Synthesis report\n{}\n", content_md.trim()));
         }
         out.push_str(&render_findings(&findings_json));
+        out.push_str(&render_hypotheses(&findings_json));
+        out.push_str(&render_question_answers(&findings_json));
     } else {
         out.push_str("\n## Synthesis\n_No synthesis has been run for this cycle yet._\n");
     }
@@ -379,6 +405,62 @@ fn render_findings(findings_json: &str) -> String {
     s
 }
 
+// Render the cross-interview hypothesis verdicts from findings_json into compact, citable
+// markdown (stable ids H1, H2… match the guide template) so the chat can answer "what about
+// hypothesis X?" and cite [[hypothesis:H1]]. Tolerant: missing fields are skipped.
+fn render_hypotheses(findings_json: &str) -> String {
+    let Ok(doc): Result<Value, _> = serde_json::from_str(findings_json) else {
+        return String::new();
+    };
+    let Some(items) = doc.get("hypothesis_verdicts").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n## Hypotheses (cite [[hypothesis:H1]])\n");
+    for h in items {
+        let id = h.get("id").and_then(Value::as_str).unwrap_or("?");
+        let verdict = h.get("verdict").and_then(Value::as_str).unwrap_or("");
+        let conf = h.get("confidence").and_then(Value::as_str).unwrap_or("");
+        let text = h.get("text").and_then(Value::as_str).unwrap_or("");
+        s.push_str(&format!("\n- **{id}** ({verdict}, {conf} confidence): {text}\n"));
+        if let Some(r) = h.get("rationale").and_then(Value::as_str) {
+            if !r.trim().is_empty() {
+                s.push_str(&format!("  - rationale: {}\n", r.trim()));
+            }
+        }
+    }
+    s
+}
+
+// Render the consolidated per-question answers from findings_json (stable ids Q1, Q2… match the
+// guide template) so the chat can answer "did we answer question Y?" and cite [[question:Q1]].
+fn render_question_answers(findings_json: &str) -> String {
+    let Ok(doc): Result<Value, _> = serde_json::from_str(findings_json) else {
+        return String::new();
+    };
+    let Some(items) = doc.get("question_answers").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n## Question answers (cite [[question:Q1]])\n");
+    for q in items {
+        let id = q.get("id").and_then(Value::as_str).unwrap_or("?");
+        let status = q.get("status").and_then(Value::as_str).unwrap_or("");
+        let text = q.get("text").and_then(Value::as_str).unwrap_or("");
+        s.push_str(&format!("\n- **{id}** ({status}): {text}\n"));
+        if let Some(a) = q.get("answer").and_then(Value::as_str) {
+            if !a.trim().is_empty() {
+                s.push_str(&format!("  - answer: {}\n", a.trim()));
+            }
+        }
+    }
+    s
+}
+
 // Render the diff doc's summary + per-goal change list into compact markdown.
 fn render_diff(diff_json: &str) -> String {
     let Ok(doc): Result<Value, _> = serde_json::from_str(diff_json) else {
@@ -415,6 +497,8 @@ fn parse_citations(content: &str) -> String {
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum Citation {
         Finding { finding_id: String },
+        Hypothesis { hypothesis_id: String },
+        Question { question_id: String },
         Interview { interview_id: String },
         Segment { interview_id: String, segment_id: u64 },
     }
@@ -428,6 +512,10 @@ fn parse_citations(content: &str) -> String {
                 let inner = content[i + 2..i + 2 + end].trim();
                 if let Some(rest) = inner.strip_prefix("finding:") {
                     cites.push(Citation::Finding { finding_id: rest.trim().to_string() });
+                } else if let Some(rest) = inner.strip_prefix("hypothesis:") {
+                    cites.push(Citation::Hypothesis { hypothesis_id: rest.trim().to_string() });
+                } else if let Some(rest) = inner.strip_prefix("question:") {
+                    cites.push(Citation::Question { question_id: rest.trim().to_string() });
                 } else if let Some(rest) = inner.strip_prefix("interview:") {
                     cites.push(Citation::Interview { interview_id: rest.trim().to_string() });
                 } else if let Some(rest) = inner.strip_prefix("iv:") {
@@ -573,6 +661,14 @@ fn neutral_cwd() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
+// Idle-timeout (watchdog) for the chat stream: the longest we wait for the NEXT line from the
+// CLI before we assume it hung and kill it. The chat path is the one long-running CLI loop with
+// no watchdog (ASR has run_guarded_whisper, the batch runner has spawn_once's timeout); a hung
+// plugin that stops emitting lines without closing stdout would otherwise pin the thread's
+// in-flight slot forever. The budget is generous — first-token latency on a cold model + a long
+// answer between two deltas can be slow — but bounded.
+const CHAT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 // The core streaming turn: spawn the plugin's chat command, line-stream stdout, emit
 // token/done/error on chat://<thread_id>, persist the assistant message + thread session_id.
 // Runs on a spawned task so cycle_chat_send returns immediately and the UI streams live.
@@ -618,7 +714,10 @@ async fn run_turn(
         .current_dir(neutral_cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Kill the child if this handle is dropped (panic / early return) so a stuck CLI
+        // can't outlive the turn as an orphan (roadmap §H: kill_on_drop on both Commands).
+        .kill_on_drop(true);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -645,12 +744,21 @@ async fn run_turn(
     let mut session_id: Option<String> = None;
     let mut cost_usd: Option<f64> = None;
     let mut got_partial = false;
+    // Set when the idle watchdog fires (no line within CHAT_STREAM_IDLE_TIMEOUT): we kill the
+    // child below and surface a clear timeout error instead of hanging the thread's slot.
+    let mut idle_timed_out = false;
 
     if let Some(stdout) = stdout {
         let mut lines = BufReader::new(stdout).lines();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
+            // Idle watchdog: bound the wait for the NEXT line. A done `result` event can still be
+            // followed by more lines (or EOF); we keep reading until EOF, but never wait forever.
+            match tokio::time::timeout(CHAT_STREAM_IDLE_TIMEOUT, lines.next_line()).await {
+                Err(_elapsed) => {
+                    idle_timed_out = true;
+                    break;
+                }
+                Ok(Ok(Some(line))) => {
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -672,10 +780,35 @@ async fn run_turn(
                         let _ = app.emit(&evt, ChatEvent::Token { thread_id: thread_id.clone(), text: t });
                     }
                 }
-                Ok(None) => break, // EOF
-                Err(_) => break,
+                Ok(Ok(None)) => break, // EOF
+                Ok(Err(_)) => break,   // read error
             }
         }
+    }
+
+    // Idle watchdog fired: kill the child, surface a timeout, drop the partial turn. Done before
+    // the normal reap so the killed child is removed from INFLIGHT and the thread slot frees.
+    if idle_timed_out {
+        if let Some(mut c) = with_inflight(|m| m.remove(&thread_id)) {
+            let _ = c.start_kill();
+        }
+        let _ = tokio::fs::remove_file(&pack_path).await;
+        log::error!(
+            target: "interviewlab::chat",
+            "[E-CHAT-TIMEOUT] chat turn (thread='{thread_id}'): no output from CLI '{}' for {}s — killed",
+            adapter.command,
+            CHAT_STREAM_IDLE_TIMEOUT.as_secs()
+        );
+        emit_error(
+            &app,
+            &evt,
+            &thread_id,
+            format!(
+                "the assistant stopped responding (no output for {}s) and was stopped",
+                CHAT_STREAM_IDLE_TIMEOUT.as_secs()
+            ),
+        );
+        return;
     }
 
     // Reap the child + capture stderr. If cancel already removed+killed it, take() returns None.
@@ -1042,18 +1175,22 @@ mod tests {
         assert!(pack.len() < 64 * 1024, "pack under 64KB: {}", pack.len());
     }
 
-    // Citation parser: extracts the three token shapes, ignores malformed ones.
+    // Citation parser: extracts every token shape, ignores malformed ones.
     #[test]
     fn parse_citations_extracts_tokens() {
-        let content = "Stalls at connect [[finding:F1]] per [[interview:iv9]] and [[iv:iv9 seg:3]]. Junk [[bogus:x]].";
+        let content = "Stalls at connect [[finding:F1]] supports [[hypothesis:H2]] answers [[question:Q3]] per [[interview:iv9]] and [[iv:iv9 seg:3]]. Junk [[bogus:x]].";
         let json: Value = serde_json::from_str(&parse_citations(content)).unwrap();
         let arr = json.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.len(), 5);
         assert_eq!(arr[0]["kind"], "finding");
         assert_eq!(arr[0]["finding_id"], "F1");
-        assert_eq!(arr[1]["kind"], "interview");
-        assert_eq!(arr[2]["kind"], "segment");
-        assert_eq!(arr[2]["segment_id"], 3);
+        assert_eq!(arr[1]["kind"], "hypothesis");
+        assert_eq!(arr[1]["hypothesis_id"], "H2");
+        assert_eq!(arr[2]["kind"], "question");
+        assert_eq!(arr[2]["question_id"], "Q3");
+        assert_eq!(arr[3]["kind"], "interview");
+        assert_eq!(arr[4]["kind"], "segment");
+        assert_eq!(arr[4]["segment_id"], 3);
     }
 
     // The claude-stream-json parser: a content_block_delta yields a text token; the result

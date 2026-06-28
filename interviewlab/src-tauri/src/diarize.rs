@@ -2,7 +2,7 @@
 //
 // In-process, Python-free, CPU-only diarization via the OFFICIAL k2-fsa `sherpa-onnx`
 // Rust crate (NOT the archived thewh1teagle/sherpa-rs). The pipeline is:
-//   pyannote-segmentation-3.0 (ONNX)  →  3D-Speaker ERes2Net embedding (ONNX)  →  FastClustering
+//   pyannote-segmentation-3.0 (ONNX)  →  WeSpeaker ResNet34 / VoxCeleb embedding (ONNX)  →  FastClustering
 // all running on the 16 kHz mono WAV whisper.cpp already produces, so ASR + diarization
 // share the same audio. Output is a list of speaker TURNS {start_ms,end_ms,speaker} that
 // the pipeline then assigns to whisper ASR segments by max time-overlap (see assign.rs).
@@ -31,31 +31,34 @@ use crate::asr::Segment;
 
 // --- diarization model files (feature-diarization.md §3.3) --------------------
 //
-// Two ONNX files under <app_data>/models/diarization/. Tiny (~6 MB + ~38 MB), MIT /
+// Two ONNX files under <app_data>/models/diarization/. Tiny (~6 MB + ~25 MB), MIT /
 // Apache-2.0, gating-free — so first-run downloads them with no token/license-accept
 // (mirrors the ASR model UX). The segmentation file is pyannote-segmentation-3.0's
-// model.onnx; the embedding is 3D-Speaker ERes2Net base.
+// model.onnx; the embedding is WeSpeaker ResNet34 trained on VoxCeleb — language-agnostic
+// (7k+ speakers, many nationalities), so it generalizes to Russian far better than the old
+// Chinese-trained 3D-Speaker zh-cn embedding. The embedding file is versioned in its name so
+// upgrading auto-fetches the new weights instead of reusing a stale `embedding.onnx`.
 pub const SEGMENTATION_FILE: &str = "segmentation.onnx";
-pub const EMBEDDING_FILE: &str = "embedding.onnx";
+pub const EMBEDDING_FILE: &str = "embedding-wespeaker-resnet34-lm.onnx";
 
 // Release asset URLs (k2-fsa sherpa-onnx model releases, verified 2026-06). The
 // segmentation model ships inside a .tar.bz2 (we extract model.onnx); the embedding is a
 // bare .onnx. Kept here so the download command + the first-run UX share one source.
 pub const SEGMENTATION_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
 pub const SEGMENTATION_ARCHIVE_MEMBER: &str = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx";
-pub const EMBEDDING_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+pub const EMBEDDING_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx";
 
 // Auto-detect default threshold (feature-diarization.md §3.2): with num_clusters=-1, a
 // smaller threshold → more speakers, larger → fewer.
 //
-// Calibrated on a real Russian 2-speaker podcast clip (w1_a) — speaker count vs threshold:
-//   0.5→11   0.6→6   0.7→5   0.8→5   0.9→3   1.0→2   (the doc's 0.5 starting point badly
-// over-counts on this audio with the zh-cn-trained ERes2Net embedder; the count falls
-// monotonically as the threshold rises). 1.0 auto-detects exactly 2 speakers here — the
-// same clean result as forcing the hint — so we default to 1.0. The "Expected speakers"
-// hint (forces num_clusters=N) remains the reliable escape hatch + the "Re-diarize" retry
-// when auto over/under-counts on harder audio (feature-diarization.md risk #2).
-pub const DEFAULT_THRESHOLD: f32 = 1.0;
+// ponytail: PROVISIONAL after the embedder swap (zh-cn ERes2Net → WeSpeaker ResNet34/VoxCeleb).
+// The old 1.0 was hand-calibrated FOR ERes2Net (0.5→11 … 1.0→2 speakers on the w1_a clip);
+// WeSpeaker embeddings have a different cosine scale, so 1.0 no longer maps to "2 speakers".
+// sherpa-onnx's own diarization examples use ~0.5 with WeSpeaker, so we start there and MUST
+// re-calibrate on a real clip after a build (count vs threshold sweep, like the ERes2Net table).
+// Until then the "Expected speakers" hint (forces num_clusters=N, threshold ignored) is the
+// reliable path, plus the "Re-diarize" retry. Upgrade path: expose this as a Settings slider.
+pub const DEFAULT_THRESHOLD: f32 = 0.5;
 
 // models/diarization/ dir under the app-data dir (weights live OUTSIDE cycle dirs, like ASR).
 pub fn diarization_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {

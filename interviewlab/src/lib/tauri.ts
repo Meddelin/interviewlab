@@ -128,11 +128,13 @@ export function deleteInterview(id: string): Promise<void> {
 
 // Detected ASR device for the Transcription settings Badge (Rust `DeviceInfo`).
 export type DeviceInfo = {
-  device: string; // "cuda" | "cpu"
+  device: string; // "cuda" | "metal" | "cpu"
   use_gpu: boolean;
   gpu_name: string | null;
   cuda_build: boolean;
   detail: string;
+  // "gpu_active" | "get_gpu_build" | "cpu_only_no_gpu" — what the Device UI should offer.
+  recommendation: string;
 };
 
 // One selectable Whisper model in the catalog (Rust `ModelInfo`).
@@ -143,6 +145,12 @@ export type ModelInfo = {
   approx_mb: number;
   default: boolean;
   downloaded: boolean;
+  // Characteristics for the picker. multilingual=false → English-only (.en).
+  multilingual: boolean;
+  quantized: boolean;
+  speed: "fastest" | "fast" | "medium" | "slow" | "slowest";
+  accuracy: "lowest" | "basic" | "good" | "high" | "highest";
+  note: string;
 };
 
 // A stored transcript row (Rust `TranscriptRow`). segments_json is JSON of Segment[].
@@ -508,6 +516,21 @@ export function rescanPlugins(): Promise<AdapterSummary[]> {
 // The manifest JSON Schema (feature-cli-plugins.md §3.3) for the Add-plugin dialog.
 export function pluginManifestSchema(): Promise<string> {
   return invoke<string>("plugin_manifest_schema");
+}
+
+// Save (create or overwrite) a USER plugin manifest from the Settings UI. The backend
+// validates `manifestJson` through the loader's own path (rejecting anything that would
+// load as "(invalid plugin)") and writes plugins/<id>/manifest.json. Rejects builtin ids.
+export function savePluginManifest(
+  id: string,
+  manifestJson: string,
+): Promise<void> {
+  return invoke<void>("save_plugin_manifest", { id, manifestJson });
+}
+
+// Delete a USER plugin folder (plugins/<id>). Builtin (bundled) ids are refused server-side.
+export function deletePlugin(id: string): Promise<void> {
+  return invoke<void>("delete_plugin", { id });
 }
 
 // Read the active adapter id (default 'claude-code').

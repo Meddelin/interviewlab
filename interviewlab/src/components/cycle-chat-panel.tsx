@@ -66,14 +66,74 @@ import {
 import { useInterviews } from "@/lib/interview-queries";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUiStore } from "@/lib/ui-store";
+import { mod } from "@/lib/platform";
+import { useT, tr } from "@/lib/i18n";
 
-// Suggested starter questions for the empty state (mirrors the synthesis-tab empty state).
-const STARTERS = [
-  "Summarize the top objections in this cycle",
-  "What did designers say about onboarding?",
-  "What changed vs the previous wave?",
-  "Which interviews mention pricing?",
-];
+const STR = {
+  ru: {
+    // Suggested starter questions for the empty state (mirrors the synthesis-tab empty state).
+    starters: [
+      "Сформулируй главные возражения в этом цикле",
+      "Что дизайнеры говорили про онбординг?",
+      "Что изменилось по сравнению с предыдущей волной?",
+      "В каких интервью упоминается цена?",
+    ],
+    closeChat: "Закрыть панель чата",
+    close: (key: string) => `Закрыть (${key})`,
+    chatsInCycle: "Чаты в этом цикле",
+    noChatsYet: "Чатов пока нет. Начните ниже.",
+    newChat: "Новый чат",
+    untitledChat: "Чат без названия",
+    selectChat: "Выберите чат",
+    chatAboutCycle: "Чат об этом цикле",
+    switchChatThread: "Переключить тред чата",
+    renameLabel: (title: string) => `Переименовать ${title || "чат"}`,
+    deleteLabel: (title: string) => `Удалить ${title || "чат"}`,
+    saveName: "Сохранить название",
+    cancelRename: "Отменить переименование",
+    chatName: "Название чата",
+    deleteConfirm: (label: string) => `Удалить «${label}»? Это действие нельзя отменить.`,
+    thisChat: "этот чат",
+    emptyHint:
+      "Спросите что угодно об этом цикле — ответы опираются на синтез цикла, краткие итоги интервью и diff, со ссылками на источник.",
+    interview: "Интервью",
+    composerPlaceholder: "Спросите об этом цикле…  (Enter — отправить, Shift+Enter — новая строка)",
+    stop: "Остановить",
+    send: "Отправить",
+    seg: (n: number) => `сегм. ${n}`,
+  },
+  en: {
+    starters: [
+      "Summarize the top objections in this cycle",
+      "What did designers say about onboarding?",
+      "What changed vs the previous wave?",
+      "Which interviews mention pricing?",
+    ],
+    closeChat: "Close chat panel",
+    close: (key: string) => `Close (${key})`,
+    chatsInCycle: "Chats in this cycle",
+    noChatsYet: "No chats yet. Start one below.",
+    newChat: "New chat",
+    untitledChat: "Untitled chat",
+    selectChat: "Select a chat",
+    chatAboutCycle: "Chat about this cycle",
+    switchChatThread: "Switch chat thread",
+    renameLabel: (title: string) => `Rename ${title || "chat"}`,
+    deleteLabel: (title: string) => `Delete ${title || "chat"}`,
+    saveName: "Save name",
+    cancelRename: "Cancel rename",
+    chatName: "Chat name",
+    deleteConfirm: (label: string) => `Delete "${label}"? This can't be undone.`,
+    thisChat: "this chat",
+    emptyHint:
+      "Ask anything about this cycle — answers are grounded in its synthesis, per-interview summaries, and diff, with citations back to the source.",
+    interview: "Interview",
+    composerPlaceholder: "Ask about this cycle…  (Enter to send, Shift+Enter for a newline)",
+    stop: "Stop",
+    send: "Send",
+    seg: (n: number) => `seg ${n}`,
+  },
+} as const;
 
 // A live message: persisted rows + the in-flight streaming assistant buffer.
 type LiveMessage = {
@@ -105,6 +165,7 @@ function toLive(m: ChatMessage): LiveMessage {
 }
 
 export function CycleChatPanel({ cycleId }: { cycleId: string }) {
+  const t = useT(STR);
   const qc = useQueryClient();
   const navigate = useNavigate();
   const setChatOpen = useUiStore((s) => s.setChatOpen);
@@ -272,7 +333,7 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
 
   // Title lookup for interview citations.
   const interviewTitle = (id: string) =>
-    interviews?.find((i) => i.id === id)?.title ?? "Interview";
+    interviews?.find((i) => i.id === id)?.title ?? t.interview;
 
   function openCitation(c: ChatCitation) {
     if (c.kind === "finding") {
@@ -304,9 +365,9 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
             onDelete={(id) => {
               // ponytail: reuse the codebase's existing window.confirm guard (same
               // pattern as guides.tsx) instead of pulling in an AlertDialog.
-              const t = threads?.find((x) => x.id === id);
-              const label = t?.title?.trim() || "this chat";
-              if (!confirm(`Delete "${label}"? This can't be undone.`)) return;
+              const thread = threads?.find((x) => x.id === id);
+              const label = thread?.title?.trim() || t.thisChat;
+              if (!confirm(t.deleteConfirm(label))) return;
               deleteThread.mutate(id);
               // Switch to the next remaining thread (newest), else empty state.
               if (id === threadId) {
@@ -322,12 +383,12 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
                 size="icon"
                 className="size-7 shrink-0 text-muted-foreground"
                 onClick={() => setChatOpen(cycleId, false)}
-                aria-label="Close chat panel"
+                aria-label={t.closeChat}
               >
                 <PanelRightClose className="size-4" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="left">Close (⌘J)</TooltipContent>
+            <TooltipContent side="left">{t.close(mod("J"))}</TooltipContent>
           </Tooltip>
         </div>
 
@@ -397,6 +458,7 @@ function ThreadSwitcher({
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
 }) {
+  const t = useT(STR);
   const [open, setOpen] = useState(false);
   // The thread row currently being renamed inline (id), if any.
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -407,10 +469,10 @@ function ThreadSwitcher({
 
   const hasThreads = !!threads && threads.length > 0;
   const triggerLabel = threadId
-    ? activeTitle.trim() || "Untitled chat"
+    ? activeTitle.trim() || t.untitledChat
     : hasThreads
-      ? "Select a chat"
-      : "Chat about this cycle";
+      ? t.selectChat
+      : t.chatAboutCycle;
 
   return (
     <Popover
@@ -424,7 +486,7 @@ function ThreadSwitcher({
         <Button
           variant="ghost"
           className="h-7 min-w-0 flex-1 justify-start gap-1.5 px-2 text-xs font-medium text-foreground hover:bg-secondary/60"
-          aria-label="Switch chat thread"
+          aria-label={t.switchChatThread}
         >
           <span className="truncate">{triggerLabel}</span>
           <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
@@ -432,42 +494,42 @@ function ThreadSwitcher({
       </PopoverTrigger>
       <PopoverContent align="start" className="w-72 p-1.5">
         <div className="mb-1 px-2 pt-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-          Chats in this cycle
+          {t.chatsInCycle}
         </div>
         {hasThreads ? (
           <ul className="max-h-72 overflow-y-auto">
-            {threads!.map((t) =>
-              renamingId === t.id ? (
-                <li key={t.id} className="px-0.5 py-0.5">
+            {threads!.map((thread) =>
+              renamingId === thread.id ? (
+                <li key={thread.id} className="px-0.5 py-0.5">
                   <RenameRow
-                    initial={t.title}
+                    initial={thread.title}
                     onCancel={() => setRenamingId(null)}
                     onSave={(title) => {
-                      onRename(t.id, title);
+                      onRename(thread.id, title);
                       setRenamingId(null);
                     }}
                   />
                 </li>
               ) : (
-                <li key={t.id} className="group/row flex items-center gap-1">
+                <li key={thread.id} className="group/row flex items-center gap-1">
                   <button
                     type="button"
                     onClick={() => {
-                      onSelect(t.id);
+                      onSelect(thread.id);
                       setOpen(false);
                     }}
                     className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs text-foreground transition-colors hover:bg-secondary/70 aria-[current=true]:bg-secondary/50"
-                    aria-current={t.id === threadId}
+                    aria-current={thread.id === threadId}
                   >
                     <Check
                       className={`size-3.5 shrink-0 ${
-                        t.id === threadId
+                        thread.id === threadId
                           ? "text-primary"
                           : "text-transparent"
                       }`}
                     />
                     <span className="truncate">
-                      {t.title.trim() || "Untitled chat"}
+                      {thread.title.trim() || t.untitledChat}
                     </span>
                   </button>
                   <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
@@ -475,8 +537,8 @@ function ThreadSwitcher({
                       variant="ghost"
                       size="icon"
                       className="size-6 text-muted-foreground hover:text-foreground"
-                      onClick={() => setRenamingId(t.id)}
-                      aria-label={`Rename ${t.title || "chat"}`}
+                      onClick={() => setRenamingId(thread.id)}
+                      aria-label={t.renameLabel(thread.title)}
                     >
                       <Pencil className="size-3" />
                     </Button>
@@ -484,8 +546,8 @@ function ThreadSwitcher({
                       variant="ghost"
                       size="icon"
                       className="size-6 text-muted-foreground hover:text-status-error"
-                      onClick={() => onDelete(t.id)}
-                      aria-label={`Delete ${t.title || "chat"}`}
+                      onClick={() => onDelete(thread.id)}
+                      aria-label={t.deleteLabel(thread.title)}
                     >
                       <Trash2 className="size-3" />
                     </Button>
@@ -496,7 +558,7 @@ function ThreadSwitcher({
           </ul>
         ) : (
           <p className="px-2 py-2 text-xs text-muted-foreground">
-            No chats yet. Start one below.
+            {t.noChatsYet}
           </p>
         )}
         <div className="mt-1 border-t border-border/60 pt-1">
@@ -509,7 +571,7 @@ function ThreadSwitcher({
             className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs font-medium text-foreground transition-colors hover:bg-secondary/70"
           >
             <MessageSquarePlus className="size-3.5 shrink-0 text-muted-foreground" />
-            New chat
+            {t.newChat}
           </button>
         </div>
       </PopoverContent>
@@ -527,6 +589,7 @@ function RenameRow({
   onSave: (title: string) => void;
   onCancel: () => void;
 }) {
+  const t = useT(STR);
   const [draft, setDraft] = useState(initial);
   return (
     <form
@@ -549,9 +612,9 @@ function RenameRow({
           }
         }}
         className="h-7 text-xs"
-        placeholder="Chat name"
+        placeholder={t.chatName}
       />
-      <Button type="submit" variant="ghost" size="icon" className="size-7 shrink-0" aria-label="Save name">
+      <Button type="submit" variant="ghost" size="icon" className="size-7 shrink-0" aria-label={t.saveName}>
         <Check className="size-3.5" />
       </Button>
       <Button
@@ -560,7 +623,7 @@ function RenameRow({
         size="icon"
         className="size-7 shrink-0"
         onClick={onCancel}
-        aria-label="Cancel rename"
+        aria-label={t.cancelRename}
       >
         <X className="size-3.5" />
       </Button>
@@ -571,14 +634,14 @@ function RenameRow({
 // --- empty state --------------------------------------------------------------
 
 function EmptyState({ onPick }: { onPick: (q: string) => void }) {
+  const t = useT(STR);
   return (
     <div className="flex flex-col gap-4 pt-6">
       <p className="text-sm text-muted-foreground">
-        Ask anything about this cycle — answers are grounded in its synthesis,
-        per-interview summaries, and diff, with citations back to the source.
+        {t.emptyHint}
       </p>
       <div className="flex flex-col gap-2">
-        {STARTERS.map((q) => (
+        {t.starters.map((q) => (
           <button
             key={q}
             type="button"
@@ -678,7 +741,7 @@ function CitationFooter({
 function chipLabel(c: ChatCitation, interviewTitle: (id: string) => string): string {
   if (c.kind === "finding") return c.finding_id;
   if (c.kind === "interview") return interviewTitle(c.interview_id);
-  return `${interviewTitle(c.interview_id)} · seg ${c.segment_id + 1}`;
+  return `${interviewTitle(c.interview_id)} · ${tr(STR).seg(c.segment_id + 1)}`;
 }
 
 // Hide [[…]] tokens (and a dangling half-token mid-stream) from the rendered markdown.
@@ -701,6 +764,7 @@ function Composer({
   onSend: (text: string) => void;
   onStop: () => void;
 }) {
+  const t = useT(STR);
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -724,7 +788,7 @@ function Composer({
             }
           }}
           rows={1}
-          placeholder="Ask about this cycle…  (Enter to send, Shift+Enter for a newline)"
+          placeholder={t.composerPlaceholder}
           className="max-h-40 min-h-0 flex-1 resize-none border-0 bg-transparent p-0 text-sm shadow-none focus-visible:ring-0"
         />
         {isRunning ? (
@@ -733,7 +797,7 @@ function Composer({
             variant="secondary"
             className="size-7 shrink-0"
             onClick={onStop}
-            aria-label="Stop"
+            aria-label={t.stop}
           >
             <Square className="size-3.5 fill-current" />
           </Button>
@@ -743,7 +807,7 @@ function Composer({
             className="size-7 shrink-0"
             onClick={submit}
             disabled={!text.trim()}
-            aria-label="Send"
+            aria-label={t.send}
           >
             <ArrowUp className="size-4" />
           </Button>

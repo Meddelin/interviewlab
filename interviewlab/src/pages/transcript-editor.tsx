@@ -64,6 +64,7 @@ import {
   type WaveformHandle,
 } from "@/components/waveform-player";
 import { useInterviews } from "@/lib/interview-queries";
+import { useCycle } from "@/lib/cycle-queries";
 import {
   useParticipants,
   useSaveEditedTranscript,
@@ -90,8 +91,10 @@ import { EMPTY_LIVE_ASR, useLiveAsrStore } from "@/lib/live-asr-store";
 import { LiveTranscriptView } from "@/components/live-transcript-view";
 import { mockAudioSrc } from "@/lib/dev-mock";
 import { formatTimecode } from "@/lib/format";
+import { mod } from "@/lib/platform";
 import { wordDiff, textChanged } from "@/lib/word-diff";
 import { cn } from "@/lib/utils";
+import { useT, tr, currentLang } from "@/lib/i18n";
 
 // A local, editable participant (id may be a client temp id until saved). `role` is now a
 // role-library id (M10a) rather than the old fixed enum; seeded ids equal the old enum
@@ -118,6 +121,18 @@ function toDraft(p: Participant): DraftParticipant {
 function lookupRole(roles: Role[], id: string | undefined): Role | undefined {
   if (!id) return undefined;
   return roles.find((r) => r.id === id);
+}
+
+// ponytail: tiny inline plural for "segment" — RU has three forms
+// (1 сегмент / 2 сегмента / 5 сегментов), EN two (segment / segments).
+// Reads the current UI language straight from the store (non-hook callers below).
+function pluralSegments(n: number): string {
+  if (currentLang() === "en") return n === 1 ? "segment" : "segments";
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "сегмент";
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return "сегмента";
+  return "сегментов";
 }
 
 // ─── Coalesce micro-segments into readable paragraphs ──────────────────────────
@@ -152,6 +167,20 @@ function coalesceSegments(segs: Segment[]): Segment[] {
 // Per-segment speaker reassignment via Popover + Command (spec §4.3). Lists the
 // interview's participants (by their bound speaker_label) plus a quick "set role"
 // fallback for segments whose label has no participant yet.
+const SPEAKER_PICKER_STR = {
+  ru: {
+    assignPlaceholder: "Назначить спикера…",
+    noParticipants: "Пока нет участников.",
+    participants: "Участники",
+    assignRoleDirectly: "Назначить роль напрямую",
+  },
+  en: {
+    assignPlaceholder: "Assign speaker…",
+    noParticipants: "No participants yet.",
+    participants: "Participants",
+    assignRoleDirectly: "Assign role directly",
+  },
+};
 function SpeakerPicker({
   current,
   participants,
@@ -165,6 +194,7 @@ function SpeakerPicker({
   onPick: (speakerLabel: string) => void;
   children: React.ReactNode;
 }) {
+  const t = useT(SPEAKER_PICKER_STR);
   const [open, setOpen] = useState(false);
   // Participants with a bound speaker label are the primary choices.
   const bound = participants.filter((p) => p.speaker_label);
@@ -173,11 +203,11 @@ function SpeakerPicker({
       <PopoverTrigger asChild>{children}</PopoverTrigger>
       <PopoverContent align="start" className="w-64 p-0">
         <Command>
-          <CommandInput placeholder="Assign speaker…" className="h-9" />
+          <CommandInput placeholder={t.assignPlaceholder} className="h-9" />
           <CommandList>
-            <CommandEmpty>No participants yet.</CommandEmpty>
+            <CommandEmpty>{t.noParticipants}</CommandEmpty>
             {bound.length > 0 && (
-              <CommandGroup heading="Participants">
+              <CommandGroup heading={t.participants}>
                 {bound.map((p) => {
                   const role = lookupRole(roles, p.role);
                   return (
@@ -198,7 +228,7 @@ function SpeakerPicker({
                 })}
               </CommandGroup>
             )}
-            <CommandGroup heading="Set role directly">
+            <CommandGroup heading={t.assignRoleDirectly}>
               {roles.map((role) => (
                 <CommandItem
                   key={role.id}
@@ -225,6 +255,28 @@ function SpeakerPicker({
 // ─── Participants panel (left pane) ────────────────────────────────────────────
 // Define participants (name + role) and bind each to a transcript speaker label
 // (manual diarization, spec §4.5). The whole list is owned here and saved on Save.
+const PARTICIPANTS_PANEL_STR = {
+  ru: {
+    title: "Участники и спикеры",
+    add: "Добавить",
+    emptyState:
+      "Пока нет участников. Добавьте интервьюера и респондента, затем привяжите каждого к спикеру.",
+    name: "Имя",
+    removeParticipant: "Удалить участника",
+    speaker: "Спикер",
+    noSpeaker: "Без спикера",
+  },
+  en: {
+    title: "Participants & speakers",
+    add: "Add",
+    emptyState:
+      "No participants yet. Add an interviewer and a respondent, then bind each to a speaker.",
+    name: "Name",
+    removeParticipant: "Remove participant",
+    speaker: "Speaker",
+    noSpeaker: "No speaker",
+  },
+};
 function ParticipantsPanel({
   participants,
   speakerLabels,
@@ -236,6 +288,7 @@ function ParticipantsPanel({
   roles: Role[];
   onChange: (next: DraftParticipant[]) => void;
 }) {
+  const t = useT(PARTICIPANTS_PANEL_STR);
   function update(id: string, patch: Partial<DraftParticipant>) {
     onChange(participants.map((p) => (p.id === id ? { ...p, ...patch } : p)));
   }
@@ -264,18 +317,17 @@ function ParticipantsPanel({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <Users className="size-3.5" />
-          <span>Participants &amp; speakers</span>
+          <span>{t.title}</span>
         </div>
         <Button variant="ghost" size="xs" onClick={add} className="text-muted-foreground">
           <Plus className="size-3" />
-          Add
+          {t.add}
         </Button>
       </div>
 
       {participants.length === 0 ? (
         <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-          No participants yet. Add the interviewer and respondent, then bind each to a
-          speaker.
+          {t.emptyState}
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
@@ -295,14 +347,14 @@ function ParticipantsPanel({
                 />
                 <Input
                   value={p.display_name}
-                  placeholder="Name"
+                  placeholder={t.name}
                   onChange={(e) => update(p.id, { display_name: e.target.value })}
                   className="h-7 flex-1 border-transparent bg-transparent px-1.5 text-sm shadow-none focus-visible:border-input"
                 />
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label="Remove participant"
+                  aria-label={t.removeParticipant}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/p:opacity-100 focus-visible:opacity-100"
                   onClick={() => remove(p.id)}
                 >
@@ -334,11 +386,11 @@ function ParticipantsPanel({
                   }
                 >
                   <SelectTrigger size="sm" className="h-7 flex-1">
-                    <SelectValue placeholder="Speaker" />
+                    <SelectValue placeholder={t.speaker} />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value={NONE}>
-                      <span className="text-muted-foreground">No speaker</span>
+                      <span className="text-muted-foreground">{t.noSpeaker}</span>
                     </SelectItem>
                     {speakerLabels.map((label) => (
                       <SelectItem key={label} value={label}>
@@ -361,12 +413,51 @@ function ParticipantsPanel({
 // checkbox + its own auto-growing textarea. The speaker chip now lives at the TURN level
 // (see TurnBlock), so a micro-segment no longer repeats it — the row just carries text +
 // timing + per-segment controls. Multi-select (checkbox + bulk-assign bar) stays available.
+const SEGMENT_LINE_STR = {
+  ru: {
+    deselectSegment: (n: number) => `Снять выделение сегмента ${n}`,
+    selectSegment: (n: number) => `Выделить сегмент ${n}`,
+    pause: "Пауза",
+    playFromHere: "Воспроизвести с этого момента",
+    playFrom: (tc: string) => `Воспроизвести с ${tc}`,
+    editSegmentText: (n: number) => `Редактировать текст сегмента ${n}`,
+    rewriteSegmentTitle: "Переписать этот сегмент через модель",
+    rewriteSegmentAria: (n: number) => `Переписать сегмент ${n}`,
+    rewriting: "Переписываю…",
+    rewriteSegment: "Переписать сегмент",
+    showChangesTitle: "Показать, что изменилось относительно оригинала",
+    changed: "Изменено",
+    revertTitle: "Вернуть исходный текст сегмента",
+    revertAria: (n: number) => `Вернуть исходный текст сегмента ${n}`,
+    revert: "Вернуть",
+    changesVsOriginal: "Изменения относительно оригинала",
+  },
+  en: {
+    deselectSegment: (n: number) => `Deselect segment ${n}`,
+    selectSegment: (n: number) => `Select segment ${n}`,
+    pause: "Pause",
+    playFromHere: "Play from here",
+    playFrom: (tc: string) => `Play from ${tc}`,
+    editSegmentText: (n: number) => `Edit segment ${n} text`,
+    rewriteSegmentTitle: "Rewrite this segment with the model",
+    rewriteSegmentAria: (n: number) => `Rewrite segment ${n}`,
+    rewriting: "Rewriting…",
+    rewriteSegment: "Rewrite segment",
+    showChangesTitle: "Show what changed from the original",
+    changed: "Changed",
+    revertTitle: "Restore the segment's original text",
+    revertAria: (n: number) => `Restore segment ${n} original text`,
+    revert: "Revert",
+    changesVsOriginal: "Changes from the original",
+  },
+};
 function SegmentLine({
   segment,
   index,
   active,
   playing,
   selected,
+  focused,
   canRewrite,
   rewriting,
   baseline,
@@ -376,12 +467,16 @@ function SegmentLine({
   onToggleSelect,
   onRewrite,
   onRevert,
+  onKeyDown,
+  onFocus,
 }: {
   segment: Segment;
   index: number;
   active: boolean;
   playing: boolean;
   selected: boolean;
+  // Whether THIS row owns the roving tabindex (tabIndex=0); all others are -1.
+  focused: boolean;
   // Whether the per-segment rewrite button is available (an editable version is shown).
   canRewrite: boolean;
   // This row's rewrite is in flight (the CLI is cleaning just this segment).
@@ -396,7 +491,11 @@ function SegmentLine({
   onRewrite: () => void;
   // Restore this segment's text to its baseline (original).
   onRevert: () => void;
+  // Keyboard navigation/selection on the row wrapper (Up/Down/Shift/Space/Home/End).
+  onKeyDown: (e: React.KeyboardEvent) => void;
+  onFocus: () => void;
 }) {
+  const t = useT(SEGMENT_LINE_STR);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   // Has this segment's text diverged from the original? Drives the "Changed" chip + diff.
   const changed = baseline != null && textChanged(baseline, segment.text);
@@ -437,11 +536,18 @@ function SegmentLine({
   return (
     <div
       data-segment-index={index}
+      // Roving tabindex: the focused row is the single tab stop; arrows move focus between
+      // rows (handled by onKeyDown). role=option + aria-selected expose the selection to AT.
+      role="option"
+      aria-selected={selected}
+      tabIndex={focused ? 0 : -1}
+      onKeyDown={onKeyDown}
+      onFocus={onFocus}
       className={cn(
         // ponytail: every row state must be unmistakable (founder bar: "the user must
         // always clearly see the interface react"). Selected = clear accent wash + ring;
         // playing/active = accent wash; plain hover = an obvious surface lift, not a whisper.
-        "group/seg relative grid grid-cols-[auto_auto_1fr] gap-x-3 gap-y-1 rounded-lg px-2.5 py-1.5 transition-colors",
+        "group/seg relative grid grid-cols-[auto_auto_1fr] gap-x-3 gap-y-1 rounded-lg px-2.5 py-1.5 transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
         selected
           ? "bg-primary/15 ring-1 ring-inset ring-primary/30"
           : active
@@ -470,7 +576,7 @@ function SegmentLine({
         type="button"
         role="checkbox"
         aria-checked={selected}
-        aria-label={selected ? `Deselect segment ${index + 1}` : `Select segment ${index + 1}`}
+        aria-label={selected ? t.deselectSegment(index + 1) : t.selectSegment(index + 1)}
         onClick={onToggleSelect}
         className={cn(
           "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-[5px] border-2 transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
@@ -490,8 +596,8 @@ function SegmentLine({
           type="button"
           onClick={onPlay}
           className="group/play flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 -ml-1 font-numeric text-xs text-muted-foreground tabular-nums transition-colors hover:bg-secondary/60 hover:text-primary focus-visible:text-primary focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-          title={playing ? "Pause" : "Play from this timestamp"}
-          aria-label={playing ? "Pause" : `Play from ${formatTimecode(segment.start_ms)}`}
+          title={playing ? t.pause : t.playFromHere}
+          aria-label={playing ? t.pause : t.playFrom(formatTimecode(segment.start_ms))}
         >
           {playing ? (
             <Pause className="size-3 shrink-0 text-primary" />
@@ -525,7 +631,7 @@ function SegmentLine({
           }}
           rows={1}
           spellCheck={false}
-          aria-label={`Edit segment ${index + 1} text`}
+          aria-label={t.editSegmentText(index + 1)}
           className={cn(
             "block w-full cursor-text resize-none overflow-hidden rounded-md border bg-transparent px-2 py-1 -mx-2 -my-1 text-[13.5px] leading-relaxed text-foreground/90 outline-none transition-colors placeholder:text-muted-foreground",
             "border-transparent group-hover/seg:border-border group-hover/seg:bg-background/60",
@@ -537,18 +643,18 @@ function SegmentLine({
             original), and Revert. The chip toggles this row's inline diff; the global "Changes"
             header toggle forces every changed row's diff open. */}
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
-          {/* Per-segment rewrite — the "Хуйня, переписывай" button. Re-cleans JUST this segment
-              via the CLI (plain text in, plain text out) and swaps the result into the field. This
-              is the per-segment replacement for whole-transcript cleanup: one segment in isolation,
-              so the model has nothing to drift across and hallucinates far less. A spinner while
-              its own request runs. */}
+          {/* Per-segment rewrite — re-cleans JUST this segment via the CLI (plain text in,
+              plain text out) and swaps the result into the field. This is the per-segment
+              replacement for whole-transcript cleanup: one segment in isolation, so the model
+              has nothing to drift across and hallucinates far less. A spinner while its own
+              request runs. */}
           {canRewrite && (
             <button
               type="button"
               onClick={onRewrite}
               disabled={rewriting}
-              title="Переписать этот сегмент через модель"
-              aria-label={`Хуйня, переписывай — переписать сегмент ${index + 1}`}
+              title={t.rewriteSegmentTitle}
+              aria-label={t.rewriteSegmentAria(index + 1)}
               className={cn(
                 "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-100",
                 rewriting
@@ -561,7 +667,7 @@ function SegmentLine({
               ) : (
                 <Wand2 className="size-3 shrink-0" />
               )}
-              {rewriting ? "Переписываю…" : "Хуйня, переписывай"}
+              {rewriting ? t.rewriting : t.rewriteSegment}
             </button>
           )}
 
@@ -570,7 +676,7 @@ function SegmentLine({
               type="button"
               onClick={() => setDiffOpen((o) => !o)}
               aria-expanded={diffShown}
-              title="Показать, что изменилось относительно оригинала"
+              title={t.showChangesTitle}
               className={cn(
                 "flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                 diffShown
@@ -579,7 +685,7 @@ function SegmentLine({
               )}
             >
               <GitCompareArrows className="size-3 shrink-0" />
-              Изменено
+              {t.changed}
             </button>
           )}
 
@@ -587,12 +693,12 @@ function SegmentLine({
             <button
               type="button"
               onClick={onRevert}
-              title="Вернуть исходный текст сегмента"
-              aria-label={`Вернуть исходный текст сегмента ${index + 1}`}
+              title={t.revertTitle}
+              aria-label={t.revertAria(index + 1)}
               className="flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/70 transition-colors hover:border-border hover:bg-secondary/60 hover:text-foreground focus-visible:border-border focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
             >
               <Undo2 className="size-3 shrink-0" />
-              Вернуть
+              {t.revert}
             </button>
           )}
         </div>
@@ -604,7 +710,7 @@ function SegmentLine({
           <div className="mt-1.5 rounded-md border border-border bg-secondary/30 px-2.5 py-1.5">
             <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
               <GitCompareArrows className="size-3 shrink-0" />
-              Изменения относительно оригинала
+              {t.changesVsOriginal}
             </div>
             <p className="text-[13px] leading-relaxed break-words whitespace-pre-wrap">
               {diffParts.map((p, i) =>
@@ -642,6 +748,10 @@ function SegmentLine({
 // segments via the SpeakerPicker → onAssignTurn), with the turn's segments listed under it
 // (each its own SegmentLine). This is what makes the transcript read as an alternating
 // dialogue instead of a wall of tiny rows. Timing + segment count are untouched.
+const TURN_BLOCK_STR = {
+  ru: { assignSpeaker: "Назначить спикера для этой реплики" },
+  en: { assignSpeaker: "Assign a speaker for this turn" },
+};
 function TurnBlock({
   turn,
   segments,
@@ -653,6 +763,7 @@ function TurnBlock({
   activeIndex,
   isPlaying,
   selected,
+  focusedIndex,
   canRewrite,
   rewritingIndex,
   baselines,
@@ -663,6 +774,8 @@ function TurnBlock({
   onToggleSelect,
   onRewrite,
   onRevert,
+  onSegmentKeyDown,
+  onSegmentFocus,
 }: {
   turn: { speakerLabel: string; startMs: number; segmentIndices: number[] };
   segments: Segment[];
@@ -674,6 +787,8 @@ function TurnBlock({
   activeIndex: number;
   isPlaying: boolean;
   selected: Set<number>;
+  // Which segment index currently owns the roving tabindex (null until a row is focused).
+  focusedIndex: number | null;
   // Whether per-segment rewrite is available, and which segment index is currently rewriting.
   canRewrite: boolean;
   rewritingIndex: number | null;
@@ -686,7 +801,10 @@ function TurnBlock({
   onToggleSelect: (index: number, e: React.MouseEvent) => void;
   onRewrite: (index: number) => void;
   onRevert: (index: number) => void;
+  onSegmentKeyDown: (index: number, e: React.KeyboardEvent) => void;
+  onSegmentFocus: (index: number) => void;
 }) {
+  const t = useT(TURN_BLOCK_STR);
   return (
     <div className="flex flex-col gap-0.5 py-1.5">
       {/* Turn header: the single speaker chip for the whole run. Picking a new speaker
@@ -701,7 +819,7 @@ function TurnBlock({
           <button
             type="button"
             className="w-fit rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-            title="Assign speaker for this turn"
+            title={t.assignSpeaker}
           >
             <RoleChip
               color={roleColor}
@@ -726,6 +844,9 @@ function TurnBlock({
             active={i === activeIndex}
             playing={isPlaying && i === activeIndex}
             selected={selected.has(i)}
+            // The roving tab stop: the focused row, or segment 0 when nothing's focused yet
+            // (so the list is reachable with a single Tab).
+            focused={focusedIndex === null ? i === 0 : focusedIndex === i}
             canRewrite={canRewrite}
             rewriting={rewritingIndex === i}
             baseline={baselines[i] ?? null}
@@ -735,6 +856,8 @@ function TurnBlock({
             onToggleSelect={(e) => onToggleSelect(i, e)}
             onRewrite={() => onRewrite(i)}
             onRevert={() => onRevert(i)}
+            onKeyDown={(e) => onSegmentKeyDown(i, e)}
+            onFocus={() => onSegmentFocus(i)}
           />
         ))}
       </div>
@@ -743,12 +866,92 @@ function TurnBlock({
 }
 
 // ─── The editor page ───────────────────────────────────────────────────────────
+const PAGE_STR = {
+  ru: {
+    // toasts / confirm (used in callbacks via tr)
+    segmentRewritten: "Сегмент переписан",
+    noChanges: "Без изменений",
+    rewriteFailed: (e: string) => `Не удалось переписать. ${e}`,
+    modelNotDownloaded: "Модель не скачана — Настройки → Транскрипция.",
+    retranscribeFailed: (e: string) => `Не удалось перетранскрибировать фрагмент. ${e}`,
+    resumeFailed: (e: string) => `Не удалось продолжить. ${e}`,
+    saveSuccess: "Правки транскрипта сохранены",
+    saveFailed: (e: string) => `Не удалось сохранить. ${e}`,
+    leaveConfirm: "Уйти без сохранения? Изменения потеряются.",
+    // toolbar / body (used in JSX via t)
+    backToCycle: "Назад к циклу",
+    transcriptFallbackTitle: "Транскрипт",
+    unsavedChanges: "Несохранённые изменения",
+    transcript: "Транскрипт",
+    summary: "Саммари",
+    diarizing: "Диаризация…",
+    transcribing: "Транскрибирование…",
+    showAllDiffsTitle: "Показать изменения относительно оригинала по всем сегментам",
+    hideChanges: "Скрыть изменения",
+    changes: "Изменения",
+    saving: "Сохранение…",
+    save: "Сохранить",
+    transcriptionStoppedAt: (tc: string) => `Транскрипция прервалась на ${tc}`,
+    partialSavedHint: " — сохранён частичный результат. Можно продолжить с этого места.",
+    resume: "Продолжить",
+    recording: "Запись",
+    noAudio: "Для этого интервью нет подготовленного аудио.",
+    unassignedSuffix: "без назначенной роли",
+    noSegmentsInVersion: "В этой версии нет сегментов.",
+    transcriptSegments: "Сегменты транскрипта",
+    selectedLabel: "Выделено",
+    assignSpeaker: "Назначить спикера",
+    retranscribeSelectionTitle: "Перетранскрибировать выделенный фрагмент аудио заново",
+    retranscribe: "Перетранскрибировать",
+    clear: "Сбросить",
+  },
+  en: {
+    segmentRewritten: "Segment rewritten",
+    noChanges: "No changes",
+    rewriteFailed: (e: string) => `Couldn't rewrite. ${e}`,
+    modelNotDownloaded: "Model not downloaded — Settings → Transcription.",
+    retranscribeFailed: (e: string) => `Couldn't re-transcribe the fragment. ${e}`,
+    resumeFailed: (e: string) => `Couldn't resume. ${e}`,
+    saveSuccess: "Transcript edits saved",
+    saveFailed: (e: string) => `Couldn't save. ${e}`,
+    leaveConfirm: "Leave without saving? Your changes will be lost.",
+    backToCycle: "Back to cycle",
+    transcriptFallbackTitle: "Transcript",
+    unsavedChanges: "Unsaved changes",
+    transcript: "Transcript",
+    summary: "Summary",
+    diarizing: "Diarizing…",
+    transcribing: "Transcribing…",
+    showAllDiffsTitle: "Show changes from the original across all segments",
+    hideChanges: "Hide changes",
+    changes: "Changes",
+    saving: "Saving…",
+    save: "Save",
+    transcriptionStoppedAt: (tc: string) => `Transcription stopped at ${tc}`,
+    partialSavedHint: " — a partial result was saved. You can continue from here.",
+    resume: "Resume",
+    recording: "Recording",
+    noAudio: "No prepared audio for this interview.",
+    unassignedSuffix: "with no assigned role",
+    noSegmentsInVersion: "This version has no segments.",
+    transcriptSegments: "Transcript segments",
+    selectedLabel: "Selected",
+    assignSpeaker: "Assign speaker",
+    retranscribeSelectionTitle: "Re-transcribe the selected audio fragment from scratch",
+    retranscribe: "Re-transcribe",
+    clear: "Clear",
+  },
+};
 export function TranscriptEditorPage() {
   const { cycleId, interviewId } = useParams<{
     cycleId: string;
     interviewId: string;
   }>();
   const navigate = useNavigate();
+  const t = useT(PAGE_STR);
+
+  // Cycle (for the breadcrumb context above the title — quiet wayfinding).
+  const { data: cycle } = useCycle(cycleId);
 
   // Interview row (for title/audio/duration) — reuse the cycle's interview list.
   const { data: interviews } = useInterviews(cycleId);
@@ -836,7 +1039,10 @@ export function TranscriptEditorPage() {
   // is the last row clicked, so Shift-click can extend a contiguous range from it. ──
   const [selected, setSelected] = useState<Set<number>>(() => new Set());
   const [anchor, setAnchor] = useState<number | null>(null);
-  // Which segment index is currently being rewritten via the per-segment "хуйня, переписывай"
+  // Roving-tabindex focus: which segment row currently owns Tab focus (so the whole list is
+  // ONE tab stop and Up/Down arrows move between rows). null = nothing focused yet.
+  const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
+  // Which segment index is currently being rewritten via the per-segment "Переписать сегмент"
   // button (null = none in flight). One at a time keeps it obvious + cheap on the CLI.
   const [rewritingIndex, setRewritingIndex] = useState<number | null>(null);
   // Which right-pane view is shown: the transcript segments or the per-interview Summary
@@ -845,6 +1051,9 @@ export function TranscriptEditorPage() {
   // Global "show changes" toggle: expand every changed segment's diff vs the original at once.
   const [showDiff, setShowDiff] = useState(false);
   const waveRef = useRef<WaveformHandle | null>(null);
+  // The scroll region holding the turn/segment list — used to move DOM focus between rows
+  // for keyboard navigation (query the row by its data-segment-index).
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   // Seed segments from the loaded version whenever the version changes. We coalesce the raw
   // whisper segmentation into readable paragraphs HERE, before turn-grouping/playback consume
@@ -856,6 +1065,7 @@ export function TranscriptEditorPage() {
       // ponytail: drop any selection when the underlying segments change out from under it.
       setSelected(new Set());
       setAnchor(null);
+      setFocusedIndex(null);
     }
   }, [version]);
 
@@ -1033,7 +1243,7 @@ export function TranscriptEditorPage() {
     setDirty(true);
   }
 
-  // Per-segment rewrite ("хуйня, переписывай"): re-clean JUST this one segment via the CLI and
+  // Per-segment rewrite ("Переписать сегмент"): re-clean JUST this one segment via the CLI and
   // swap in the plain-text result. This is the per-segment alternative to whole-transcript
   // cleanup — it sends only this segment's text, so the model has nothing to drift across and
   // hallucinates far less. One at a time; the result lands in the local buffer (Save persists it).
@@ -1048,12 +1258,12 @@ export function TranscriptEditorPage() {
         const next = cleaned.trim();
         if (next && next !== original.trim()) {
           setText(index, next);
-          toast.success("Сегмент переписан");
+          toast.success(tr(PAGE_STR).segmentRewritten);
         } else {
-          toast("Без изменений");
+          toast(tr(PAGE_STR).noChanges);
         }
       } catch (e) {
-        toast.error(`Не удалось переписать. ${String(e)}`);
+        toast.error(tr(PAGE_STR).rewriteFailed(String(e)));
       } finally {
         setRewritingIndex(null);
       }
@@ -1098,6 +1308,67 @@ export function TranscriptEditorPage() {
     setAnchor(null);
   }
 
+  // Move keyboard focus to a segment row by index (roving tabindex). Focusing the row also
+  // updates focusedIndex so the row's tabIndex flips to 0 and it scrolls into view.
+  const focusSegment = useCallback((index: number) => {
+    const el = listRef.current?.querySelector<HTMLElement>(
+      `[data-segment-index="${index}"]`,
+    );
+    if (el) {
+      el.focus();
+      el.scrollIntoView({ block: "nearest" });
+    }
+  }, []);
+
+  // Keyboard navigation between segment rows (roving tabindex):
+  //   • ↑ / ↓            → move focus to the previous/next row,
+  //   • Shift+↑ / Shift+↓ → extend the contiguous selection while moving (keyboard range),
+  //   • Space / Enter     → toggle this row in/out of the selection,
+  //   • Home / End        → jump to the first/last row.
+  // Editing keys are untouched: the handler is bound on the row wrapper but React events
+  // bubble, so we IGNORE keys when the event originates inside an editable field (the
+  // textarea / inputs) — typing and caret movement stay with the field. The existing mouse
+  // multi-select is unaffected.
+  function onSegmentKeyDown(index: number, e: React.KeyboardEvent) {
+    // Only act when the row wrapper itself is focused, not a control inside it (textarea,
+    // play button, picker). That keeps text editing and inner controls fully usable.
+    if (e.target !== e.currentTarget) return;
+    const last = segments.length - 1;
+    let target: number | null = null;
+    if (e.key === "ArrowDown") target = Math.min(index + 1, last);
+    else if (e.key === "ArrowUp") target = Math.max(index - 1, 0);
+    else if (e.key === "Home") target = 0;
+    else if (e.key === "End") target = last;
+    else if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(index)) next.delete(index);
+        else next.add(index);
+        return next;
+      });
+      setAnchor(index);
+      return;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    if (target === index && (e.key === "ArrowUp" || e.key === "ArrowDown")) return;
+    // Shift+arrow extends a contiguous range from the anchor (set it on first shifted move).
+    if (e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      const from = anchor ?? index;
+      setAnchor(from);
+      setSelected(() => {
+        const [a, b] = [Math.min(from, target!), Math.max(from, target!)];
+        const next = new Set<number>();
+        for (let i = a; i <= b; i++) next.add(i);
+        return next;
+      });
+    }
+    setFocusedIndex(target);
+    focusSegment(target);
+  }
+
   // Bulk-assign a speaker/role to every selected segment at once, then clear the selection.
   function assignSelected(label: string) {
     if (selected.size === 0) return;
@@ -1131,7 +1402,7 @@ export function TranscriptEditorPage() {
     const endMs = Math.max(...idxs.map((i) => segments[i]?.end_ms ?? 0));
     if (endMs <= startMs) return;
     if (!models?.find((m) => m.id === asrModelId)?.downloaded) {
-      toast.error("Модель не скачана — Settings → Transcription.");
+      toast.error(tr(PAGE_STR).modelNotDownloaded);
       return;
     }
     clearSelection();
@@ -1145,7 +1416,7 @@ export function TranscriptEditorPage() {
         expectedSpeakers,
       );
     } catch (e) {
-      toast.error(`Не удалось перетранскрибировать фрагмент. ${String(e)}`);
+      toast.error(tr(PAGE_STR).retranscribeFailed(String(e)));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interviewId, selected, segments, models, asrModelId, asrLanguage, expectedSpeakers]);
@@ -1156,7 +1427,7 @@ export function TranscriptEditorPage() {
     try {
       await resumeTranscription(interviewId, asrLanguage, expectedSpeakers);
     } catch (e) {
-      toast.error(`Не удалось продолжить. ${String(e)}`);
+      toast.error(tr(PAGE_STR).resumeFailed(String(e)));
     }
   }, [interviewId, asrLanguage, expectedSpeakers]);
 
@@ -1203,9 +1474,9 @@ export function TranscriptEditorPage() {
       });
       setDirty(false);
       setActiveKind("edited");
-      toast.success("Saved edited transcript");
+      toast.success(tr(PAGE_STR).saveSuccess);
     } catch (e) {
-      toast.error(`Couldn't save. ${String(e)}`);
+      toast.error(tr(PAGE_STR).saveFailed(String(e)));
     }
   }, [interviewId, participants, segments, version?.language, saveMutation, roles]);
 
@@ -1224,9 +1495,25 @@ export function TranscriptEditorPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [dirty, doSave, saveMutation.isPending, selected.size]);
 
+  // Warn before leaving with unsaved edits. The dirty dot already exists in the toolbar;
+  // this makes the dirty state actually BLOCK an accidental exit instead of silently
+  // dropping the work. Native confirm() matches the existing pattern (guides.tsx:148).
   function goBack() {
+    if (dirty && !confirm(tr(PAGE_STR).leaveConfirm)) return;
     navigate(`/cycles/${cycleId}`);
   }
+
+  // Guard the window/tab close (and Tauri window close) while there are unsaved edits.
+  // The browser shows its own generic prompt; we only need to set returnValue to trigger it.
+  useEffect(() => {
+    if (!dirty) return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
 
   return (
     // Lives INSIDE the shell now (under the global header), so this fills its pane rather
@@ -1238,20 +1525,31 @@ export function TranscriptEditorPage() {
           variant="ghost"
           size="icon-sm"
           onClick={goBack}
-          aria-label="Back to cycle"
+          aria-label={t.backToCycle}
           className="text-muted-foreground"
         >
           <ArrowLeft className="size-4" />
         </Button>
         <div className="flex min-w-0 items-center gap-2">
+          {/* Quiet breadcrumb: cycle name → interview title, so the editor always shows which
+              cycle/interview you're in (wayfinding). Cycle name is muted + non-interactive;
+              hidden until the cycle query resolves so it never flashes a placeholder. */}
+          {cycle?.name && (
+            <span className="hidden min-w-0 shrink items-center gap-1.5 text-sm text-muted-foreground sm:flex">
+              <span className="truncate">{cycle.name}</span>
+              <span className="text-muted-foreground/50" aria-hidden>
+                /
+              </span>
+            </span>
+          )}
           <span className="truncate text-sm font-medium text-foreground">
-            {interview?.title ?? "Transcript"}
+            {interview?.title ?? t.transcriptFallbackTitle}
           </span>
           {dirty && (
             <span
               className="size-1.5 shrink-0 rounded-full bg-status-importing"
-              title="Unsaved changes"
-              aria-label="Unsaved changes"
+              title={t.unsavedChanges}
+              aria-label={t.unsavedChanges}
             />
           )}
         </div>
@@ -1270,7 +1568,7 @@ export function TranscriptEditorPage() {
               )}
             >
               <ListTree className="size-3.5" />
-              Transcript
+              {t.transcript}
             </button>
             <button
               type="button"
@@ -1283,13 +1581,13 @@ export function TranscriptEditorPage() {
               )}
             >
               <FileText className="size-3.5" />
-              Summary
+              {t.summary}
             </button>
           </div>
 
           {/* Whole-transcript cleanup was removed: cleaning the entire interview in one
               JSON-echo pass is exactly where the hallucinations crept in. The fix now lives
-              per-segment — each row's "Хуйня, переписывай" button re-cleans just that segment
+              per-segment — each row's "Переписать сегмент" button re-cleans just that segment
               as plain text. The `cleaned` version + clean_transcript command still exist in the
               backend; they're simply no longer driven from the editor. */}
 
@@ -1298,7 +1596,7 @@ export function TranscriptEditorPage() {
           {pane === "transcript" && isLive && (
             <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
               <Loader2 className="size-3.5 animate-spin" />
-              <span>{live.diarActive ? "Diarizing…" : "Transcribing…"}</span>
+              <span>{live.diarActive ? t.diarizing : t.transcribing}</span>
             </span>
           )}
 
@@ -1315,7 +1613,7 @@ export function TranscriptEditorPage() {
                   type="button"
                   onClick={() => setShowDiff((s) => !s)}
                   aria-pressed={showDiff}
-                  title="Показать изменения относительно оригинала по всем сегментам"
+                  title={t.showAllDiffsTitle}
                   className={cn(
                     "flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                     showDiff
@@ -1324,7 +1622,7 @@ export function TranscriptEditorPage() {
                   )}
                 >
                   <GitCompareArrows className="size-3.5" />
-                  {showDiff ? "Скрыть изменения" : "Изменения"}
+                  {showDiff ? t.hideChanges : t.changes}
                   <span className="font-numeric tabular-nums rounded bg-status-importing/20 px-1 text-[10px] text-status-importing">
                     {changedCount}
                   </span>
@@ -1337,9 +1635,9 @@ export function TranscriptEditorPage() {
                 disabled={!dirty || saveMutation.isPending || !editable}
               >
                 <Save className="size-3.5" />
-                {saveMutation.isPending ? "Saving…" : "Save"}
+                {saveMutation.isPending ? t.saving : t.save}
                 <kbd className="ml-1 hidden font-numeric text-[10px] text-primary-foreground/70 sm:inline">
-                  ⌘S
+                  {mod("S")}
                 </kbd>
               </Button>
             </>
@@ -1355,16 +1653,13 @@ export function TranscriptEditorPage() {
           <RotateCcw className="size-4 shrink-0 text-status-importing" />
           <div className="min-w-0 flex-1 text-xs">
             <span className="font-medium text-foreground">
-              Транскрипция прервалась на {formatTimecode(checkpoint.processed_ms)}
+              {t.transcriptionStoppedAt(formatTimecode(checkpoint.processed_ms))}
             </span>
-            <span className="text-muted-foreground">
-              {" "}
-              — сохранён частичный результат. Можно продолжить с этого места.
-            </span>
+            <span className="text-muted-foreground">{t.partialSavedHint}</span>
           </div>
           <Button size="sm" onClick={doResume}>
             <RotateCcw className="size-3.5" />
-            Продолжить
+            {t.resume}
           </Button>
         </div>
       )}
@@ -1377,7 +1672,7 @@ export function TranscriptEditorPage() {
             <section className="flex flex-col gap-3">
               <div className="flex items-baseline justify-between">
                 <span className="text-xs font-medium text-muted-foreground">
-                  Recording
+                  {t.recording}
                 </span>
                 {interview?.format && (
                   <span className="font-numeric text-[11px] text-muted-foreground/70 uppercase">
@@ -1394,9 +1689,7 @@ export function TranscriptEditorPage() {
                   onPlayingChange={setIsPlaying}
                 />
               ) : (
-                <p className="text-xs text-muted-foreground">
-                  No prepared audio for this interview.
-                </p>
+                <p className="text-xs text-muted-foreground">{t.noAudio}</p>
               )}
             </section>
 
@@ -1415,8 +1708,7 @@ export function TranscriptEditorPage() {
             {unassignedCount > 0 && (
               <p className="flex items-center gap-1.5 rounded-md bg-status-importing/10 px-2.5 py-1.5 text-xs text-status-importing">
                 <span className="size-1.5 rounded-full bg-status-importing" />
-                {unassignedCount} segment{unassignedCount > 1 ? "s" : ""} without an
-                assigned role
+                {unassignedCount} {pluralSegments(unassignedCount)} {t.unassignedSuffix}
               </p>
             )}
           </div>
@@ -1449,7 +1741,7 @@ export function TranscriptEditorPage() {
                 <span className="font-numeric tabular-nums text-foreground/70">
                   {segments.length}
                 </span>{" "}
-                segments
+                {pluralSegments(segments.length)}
               </span>
             </div>
 
@@ -1457,7 +1749,7 @@ export function TranscriptEditorPage() {
                 scrollbar tucked inside the pane with breathing room so it never renders under
                 / collides with the chat split-panel handle on the right. The textareas no
                 longer scroll (overflow-hidden + autosize), so this is the only scrollbar here. */}
-            <div className="min-h-0 flex-1 overflow-y-auto pl-2 pr-3 py-3">
+            <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto pl-2 pr-3 py-3">
               {versionPending && segments.length === 0 ? (
                 <div className="flex flex-col gap-3 px-2">
                   {Array.from({ length: 8 }).map((_, i) => (
@@ -1470,7 +1762,7 @@ export function TranscriptEditorPage() {
               ) : segments.length === 0 ? (
                 <div className="flex h-full items-center justify-center">
                   <p className="text-sm text-muted-foreground">
-                    No segments in this version.
+                    {t.noSegmentsInVersion}
                   </p>
                 </div>
               ) : (
@@ -1479,7 +1771,12 @@ export function TranscriptEditorPage() {
                 // line length on ultrawide so text doesn't run edge-to-edge.
                 // Render TURNS (grouped same-speaker runs), not raw rows — the transcript
                 // reads as an alternating dialogue while each segment stays editable.
-                <div className="flex max-w-5xl flex-col gap-1">
+                <div
+                  role="listbox"
+                  aria-multiselectable="true"
+                  aria-label={t.transcriptSegments}
+                  className="flex max-w-5xl flex-col gap-1"
+                >
                   {turns.map((turn) => {
                     const resolved = resolveRole(turn.speakerLabel);
                     return (
@@ -1495,6 +1792,7 @@ export function TranscriptEditorPage() {
                         activeIndex={activeIndex}
                         isPlaying={isPlaying}
                         selected={selected}
+                        focusedIndex={focusedIndex}
                         canRewrite={editable}
                         rewritingIndex={rewritingIndex}
                         baselines={baselines}
@@ -1507,6 +1805,8 @@ export function TranscriptEditorPage() {
                         onToggleSelect={(i, e) => toggleSelect(i, e)}
                         onRewrite={(i) => rewriteSegmentAt(i)}
                         onRevert={(i) => revertSegment(i)}
+                        onSegmentKeyDown={onSegmentKeyDown}
+                        onSegmentFocus={setFocusedIndex}
                       />
                     );
                   })}
@@ -1522,10 +1822,10 @@ export function TranscriptEditorPage() {
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-4">
                 <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-border bg-popover/95 px-2 py-1.5 shadow-lg shadow-black/20 backdrop-blur supports-[backdrop-filter]:bg-popover/80">
                   <span className="pl-1.5 text-xs text-foreground">
+                    {t.selectedLabel}{" "}
                     <span className="font-numeric tabular-nums font-medium">
                       {selected.size}
-                    </span>{" "}
-                    selected
+                    </span>
                   </span>
                   <span className="h-4 w-px bg-border" aria-hidden />
                   <SpeakerPicker
@@ -1536,7 +1836,7 @@ export function TranscriptEditorPage() {
                   >
                     <Button size="xs" variant="secondary" disabled={!editable}>
                       <Users className="size-3" />
-                      Assign speaker
+                      {t.assignSpeaker}
                       <ChevronDown className="size-3 opacity-70" />
                     </Button>
                   </SpeakerPicker>
@@ -1546,10 +1846,10 @@ export function TranscriptEditorPage() {
                     size="xs"
                     variant="secondary"
                     onClick={retranscribeSelection}
-                    title="Перетранскрибировать выделенный фрагмент аудио заново"
+                    title={t.retranscribeSelectionTitle}
                   >
                     <RotateCcw className="size-3" />
-                    Перетранскрибировать
+                    {t.retranscribe}
                   </Button>
                   <Button
                     size="xs"
@@ -1558,7 +1858,7 @@ export function TranscriptEditorPage() {
                     className="text-muted-foreground"
                   >
                     <X className="size-3" />
-                    Clear
+                    {t.clear}
                   </Button>
                 </div>
               </div>

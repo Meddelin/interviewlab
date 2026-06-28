@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  type KeyboardEvent,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -11,7 +12,25 @@ import { useWavesurfer } from "@wavesurfer/react";
 import { Pause, Play, SkipBack } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { formatTimecode } from "@/lib/format";
+import { useT } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const STR = {
+  ru: {
+    position: "Позиция воспроизведения",
+    valueText: (cur: string, total: string) => `${cur} из ${total}`,
+    pause: "Пауза",
+    play: "Воспроизвести",
+    restart: "В начало",
+  },
+  en: {
+    position: "Playback position",
+    valueText: (cur: string, total: string) => `${cur} of ${total}`,
+    pause: "Pause",
+    play: "Play",
+    restart: "Restart",
+  },
+} as const;
 
 // Imperative handle so the segment list can drive the player (seek on segment click).
 export type WaveformHandle = {
@@ -44,13 +63,14 @@ export const WaveformPlayer = forwardRef<
     onPlayingChange?: (playing: boolean) => void;
   }
 >(function WaveformPlayer({ url, durationMs, onTime, onPlayingChange }, ref) {
+  const t = useT(STR);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [currentMs, setCurrentMs] = useState(0);
 
   // Colors resolved once per mount from the active theme.
   const colors = useMemo(
     () => ({
-      wave: themeColor("--text-muted", "#6b6e76"),
+      wave: themeColor("--muted-foreground", "#6b6e76"),
       progress: themeColor("--accent", "#5e6ad2"),
       cursor: themeColor("--foreground", "#e6e7ea"),
     }),
@@ -60,7 +80,7 @@ export const WaveformPlayer = forwardRef<
   const { wavesurfer, isPlaying, isReady } = useWavesurfer({
     container: containerRef,
     url,
-    height: 56,
+    height: 72,
     waveColor: colors.wave,
     progressColor: colors.progress,
     cursorColor: colors.cursor,
@@ -122,14 +142,81 @@ export const WaveformPlayer = forwardRef<
   const totalMs =
     isReady && wavesurfer ? Math.round(wavesurfer.getDuration() * 1000) : durationMs ?? 0;
 
+  // Seek to an absolute ms position (clamped), keeping the label in sync. Used by the
+  // keyboard slider handler below.
+  const seekToMs = useCallback(
+    (ms: number) => {
+      if (!wavesurfer) return;
+      const dur = wavesurfer.getDuration();
+      if (dur <= 0) return;
+      const clamped = Math.min(dur * 1000, Math.max(0, ms));
+      wavesurfer.seekTo(clamped / 1000 / dur);
+      setCurrentMs(Math.round(clamped));
+    },
+    [wavesurfer],
+  );
+
+  // Keyboard control for the waveform as an ARIA slider over playback position.
+  // ←/→ nudge by 5s, ↑/↓ by 1s, PageUp/Down by 30s, Home/End to ends, Space toggles play.
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLDivElement>) => {
+      if (!isReady || !wavesurfer) return;
+      switch (e.key) {
+        case "ArrowRight":
+          seekToMs(currentMs + 5000);
+          break;
+        case "ArrowLeft":
+          seekToMs(currentMs - 5000);
+          break;
+        case "ArrowUp":
+          seekToMs(currentMs + 1000);
+          break;
+        case "ArrowDown":
+          seekToMs(currentMs - 1000);
+          break;
+        case "PageUp":
+          seekToMs(currentMs + 30000);
+          break;
+        case "PageDown":
+          seekToMs(currentMs - 30000);
+          break;
+        case "Home":
+          seekToMs(0);
+          break;
+        case "End":
+          seekToMs(totalMs);
+          break;
+        case " ":
+        case "Enter":
+          wavesurfer.playPause();
+          break;
+        default:
+          return; // let other keys (Tab etc.) through
+      }
+      e.preventDefault();
+    },
+    [isReady, wavesurfer, currentMs, totalMs, seekToMs],
+  );
+
   return (
     <div className="flex flex-col gap-3">
       <div className="relative">
-        <div ref={containerRef} className="w-full" />
+        <div
+          ref={containerRef}
+          role="slider"
+          tabIndex={isReady ? 0 : -1}
+          aria-label={t.position}
+          aria-valuemin={0}
+          aria-valuemax={Math.round(totalMs / 1000)}
+          aria-valuenow={Math.round(currentMs / 1000)}
+          aria-valuetext={t.valueText(formatTimecode(currentMs), formatTimecode(totalMs))}
+          onKeyDown={handleKeyDown}
+          className="w-full rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        />
         {!isReady && (
           <div className="pointer-events-none absolute inset-0 flex items-center">
             {/* Quiet skeleton bars while the audio decodes — no spinner. */}
-            <div className="flex h-[56px] w-full items-end gap-[2px] opacity-40">
+            <div className="flex h-[72px] w-full items-end gap-[2px] opacity-40">
               {Array.from({ length: 64 }).map((_, i) => (
                 <span
                   key={i}
@@ -146,7 +233,7 @@ export const WaveformPlayer = forwardRef<
         <Button
           variant="secondary"
           size="icon-sm"
-          aria-label={isPlaying ? "Pause" : "Play"}
+          aria-label={isPlaying ? t.pause : t.play}
           disabled={!isReady}
           onClick={() => wavesurfer?.playPause()}
         >
@@ -155,7 +242,7 @@ export const WaveformPlayer = forwardRef<
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="Restart"
+          aria-label={t.restart}
           disabled={!isReady}
           className="text-muted-foreground"
           onClick={() => {

@@ -115,6 +115,51 @@ struct CleanupOutput {
 // ponytail: rules + a few illustrative examples, NOT a term dump — over-stuffing a glossary
 // is counterproductive (WMT'25 terminology work). The product context (below) is the entity
 // phrase-list that anchors named-entity / brand spellings the model otherwise can't recover.
+// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / glossary.rs / diff.rs so it
+// can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
+// константой во все стадии"). Do NOT diverge the wording per file.
+const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
+    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
+    better than guessing.\n\
+    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
+    numbers, and NO markdown headings inside string fields of the JSON.";
+
+// A COMPACT recognition-context block from the cycle's guide: main-block theme titles + the
+// questions under them (NO hypotheses, NO expected conclusions). Cleanup uses it ONLY to
+// disambiguate unclear spans — never to add or change meaning — so we deliberately leave out the
+// hypotheses/goals that could bias the model into "concluding" rather than transcribing.
+// ponytail: a flat JSON of [{title, questions:[…]}]; renders empty when the cycle has no template,
+// so it stays out of the prompt then.
+fn build_guide_topics(template: &crate::synthesis::GuideTemplate) -> Value {
+    let blocks: Vec<Value> = template
+        .main_blocks
+        .iter()
+        .filter_map(|b| {
+            let title = b.title.trim();
+            let questions: Vec<&str> = b
+                .questions
+                .iter()
+                .map(|q| q.text.trim())
+                .filter(|q| !q.is_empty())
+                .collect();
+            if title.is_empty() && questions.is_empty() {
+                return None;
+            }
+            let mut o = json!({});
+            if !title.is_empty() {
+                o["title"] = json!(title);
+            }
+            if !questions.is_empty() {
+                o["questions"] = json!(questions);
+            }
+            Some(o)
+        })
+        .collect();
+    json!(blocks)
+}
+
 fn guidelines_for(language: Option<&str>) -> String {
     let lang = language.unwrap_or("the original");
     format!(
@@ -178,6 +223,8 @@ fn build_batch_input(
     language: Option<&str>,
     product_desc: &str,
     glossary: &Value,
+    // The cycle's guide topics (main-block titles + questions), recognition-context ONLY.
+    topics: &Value,
     ids: &[usize],
     batch: &[Segment],
 ) -> Value {
@@ -195,6 +242,7 @@ fn build_batch_input(
     let mut input = json!({
         "task": "transcript-cleanup",
         "language": language.unwrap_or("auto"),
+        "rules": UNIFIED_LLM_RULES,
         "guidelines": guidelines_for(language),
         // Explicit, contract-restating instruction (belt + suspenders with the schema):
         // the renderer in adapter.rs also says "return ONLY JSON matching the schema".
@@ -202,7 +250,9 @@ fn build_batch_input(
                          Include EVERY input segment id exactly once. Change ONLY the text — apply the \
                          `guidelines` (grammar, filler, and the English-terms / anglicism normalization), \
                          using the `glossary` (term→canonical, with aliases) as the AUTHORITY for term \
-                         spellings and `product_desc` for any other product/brand/domain term. Do not add, \
+                         spellings and `product_desc` for any other product/brand/domain term. When present, \
+                         `guide_topics` lists the interview's themes/questions — use them ONLY to \
+                         disambiguate unclear spans, never to add or change meaning. Do not add, \
                          drop, merge, split, reorder, or translate segments.",
         "segments": segments
     });
@@ -215,6 +265,11 @@ fn build_batch_input(
     // recovery. Only included when non-empty so an empty glossary stays out of the prompt.
     if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
         input["glossary"] = glossary.clone();
+    }
+    // Guide topics (recognition-context ONLY): only present when the cycle has a template, so a
+    // legacy/templateless guide stays out of the prompt. NOT an authority — disambiguation only.
+    if topics.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["guide_topics"] = topics.clone();
     }
     input
 }
@@ -404,18 +459,25 @@ async fn product_context_for_interview_db(
     pool: &SqlitePool,
     interview_id: &str,
 ) -> Result<String, String> {
-    let cycle_id: Option<String> =
-        sqlx::query_scalar("SELECT cycle_id FROM interview WHERE id = ?")
-            .bind(interview_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let Some(cycle_id) = cycle_id else {
+    let Some(cycle_id) = cycle_id_for_interview_db(pool, interview_id).await? else {
         return Ok(String::new());
     };
     Ok(crate::synthesis::effective_product_db(pool, &cycle_id)
         .await?
         .unwrap_or_default())
+}
+
+// The cycle an interview belongs to (None when the interview row is missing). Local helper so the
+// product-context + guide-topics lookups share one source. Best-effort: a DB error propagates.
+async fn cycle_id_for_interview_db(
+    pool: &SqlitePool,
+    interview_id: &str,
+) -> Result<Option<String>, String> {
+    sqlx::query_scalar("SELECT cycle_id FROM interview WHERE id = ?")
+        .bind(interview_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // Store the cleaned segments as the `cleaned` transcript version. Overwrites any
@@ -490,6 +552,7 @@ async fn clean_one_batch(
     language: Option<&str>,
     product_desc: &str,
     glossary: &Value,
+    topics: &Value,
     ids: &[usize],
     raw: &[Segment],
     // The user's per-bucket model override (None → the plugin's manifest default).
@@ -499,7 +562,7 @@ async fn clean_one_batch(
     // let the caller fall back to batching.
     max_attempts: usize,
 ) -> Result<Vec<Segment>, String> {
-    let input = build_batch_input(language, product_desc, glossary, ids, raw);
+    let input = build_batch_input(language, product_desc, glossary, topics, ids, raw);
     let schema = output_schema();
 
     let attempts = max_attempts.max(1);
@@ -586,6 +649,7 @@ async fn clean_segments(
     language: Option<&str>,
     product_desc: &str,
     glossary: &Value,
+    topics: &Value,
     raw: &[Segment],
     // The user's per-bucket model override (None → the plugin's manifest default).
     model_override: Option<&str>,
@@ -605,7 +669,7 @@ async fn clean_segments(
             emit_cleanup(app, interview_id, STATUS_CLEANING, 0, 1, None);
         }
         let all_ids: Vec<usize> = (0..total).collect();
-        match clean_one_batch(adapter, language, product_desc, glossary, &all_ids, raw, model_override, 1).await {
+        match clean_one_batch(adapter, language, product_desc, glossary, topics, &all_ids, raw, model_override, 1).await {
             Ok(cleaned) => {
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, 1, 1, None);
@@ -652,7 +716,7 @@ async fn clean_segments(
         let wave_futs = wave.iter().map(|(b, ids, chunk)| {
             let done = &done;
             async move {
-                let res = clean_one_batch(adapter, language, product_desc, glossary, ids, chunk, model_override, 2).await;
+                let res = clean_one_batch(adapter, language, product_desc, glossary, topics, ids, chunk, model_override, 2).await;
                 let completed = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if let Some(app) = app {
                     emit_cleanup(app, interview_id, STATUS_CLEANING, completed, total_batches, None);
@@ -818,6 +882,17 @@ pub async fn clean_transcript(
             .unwrap_or_default(),
     );
 
+    // Guide topics (recognition-context ONLY): the cycle's templated themes + questions, used to
+    // disambiguate unclear spans — never to add meaning. Resolved via the interview's cycle.
+    // Best-effort: a missing cycle/template just yields `[]` (omitted from the prompt).
+    let topics = match cycle_id_for_interview_db(&db.pool, &interview_id).await {
+        Ok(Some(cid)) => crate::synthesis::effective_guide_template_db(&db.pool, &cid)
+            .await
+            .map(|t| build_guide_topics(&t))
+            .unwrap_or_else(|_| json!([])),
+        _ => json!([]),
+    };
+
     // Capture the status BEFORE we flip to `cleaning`, so a failed cleanup can restore it. The
     // raw/cleaned transcript is intact — cleanup is an enrichment, not the interview's terminal
     // state — so a failure must NOT mark the whole interview `error` (that locked the user out of a
@@ -843,7 +918,7 @@ pub async fn clean_transcript(
         model_override.as_deref().unwrap_or("<plugin-default>"),
         adapter.id
     );
-    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &glossary, &raw, model_override.as_deref()).await {
+    match clean_segments(Some(&app), &interview_id, &adapter, lang, &product_desc, &glossary, &topics, &raw, model_override.as_deref()).await {
         Ok(cleaned) => {
             let tid = store_cleaned_db(&db.pool, &interview_id, lang, &cleaned).await.map_err(|e| {
                 log::error!(target: "interviewlab::cleanup", "[E-CLEAN-STORE] clean_transcript: interview '{interview_id}': cleaned OK but STORING failed: {e}");
@@ -892,6 +967,7 @@ fn build_rewrite_input(language: Option<&str>, product_desc: &str, glossary: &Va
     let mut input = json!({
         "task": "transcript-cleanup",
         "language": language.unwrap_or("auto"),
+        "rules": UNIFIED_LLM_RULES,
         "guidelines": guidelines_for(language),
         "instructions": "Rewrite the ONE segment in `text` per `guidelines` (grammar, filler, the \
                          English-terms / anglicism normalization), using the `glossary` \
@@ -1104,11 +1180,13 @@ mod tests {
     fn batch_input_carries_ids_and_language() {
         let raw = raw3();
         let ids = vec![10usize, 11, 12];
-        let input = build_batch_input(Some("ru"), "", &json!([]), &ids, &raw);
+        let input = build_batch_input(Some("ru"), "", &json!([]), &json!([]), &ids, &raw);
         assert_eq!(input["language"], "ru");
         let g = input["guidelines"].as_str().unwrap();
         assert!(g.contains("translate")); // the no-translate rule survives
         assert!(g.contains("anglicism")); // the English-terms/anglicism normalization guidance is present
+        // The unified LLM-stage rules ride along on every cleanup request.
+        assert!(input["rules"].as_str().unwrap().contains("Anti-hallucination"));
         let segs = input["segments"].as_array().unwrap();
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0]["id"], 10);
@@ -1123,14 +1201,14 @@ mod tests {
         let raw = raw3();
         let ids = vec![0usize, 1, 2];
         let product = "Acme Analytics — funnels + retention; the product is called 'Acme'.";
-        let with = build_batch_input(Some("ru"), product, &json!([]), &ids, &raw);
+        let with = build_batch_input(Some("ru"), product, &json!([]), &json!([]), &ids, &raw);
         assert_eq!(
             with["product_desc"], product,
             "product context flows into the cleanup prompt"
         );
 
         // Empty product context is omitted from the prompt (kept lean).
-        let without = build_batch_input(Some("ru"), "   ", &json!([]), &ids, &raw);
+        let without = build_batch_input(Some("ru"), "   ", &json!([]), &json!([]), &ids, &raw);
         assert!(
             without.get("product_desc").is_none(),
             "empty product context is not added to the prompt"
@@ -1144,15 +1222,60 @@ mod tests {
         let raw = raw3();
         let ids = vec![0usize, 1, 2];
         let glossary = json!([{ "canonical": "API", "aliases": ["эй-пи-ай", "апишка"] }]);
-        let with = build_batch_input(Some("ru"), "", &glossary, &ids, &raw);
+        let with = build_batch_input(Some("ru"), "", &glossary, &json!([]), &ids, &raw);
         assert_eq!(with["glossary"], glossary, "glossary flows into the cleanup prompt");
         assert!(
             with["instructions"].as_str().unwrap().contains("glossary"),
             "instructions point the model at the glossary"
         );
 
-        let without = build_batch_input(Some("ru"), "", &json!([]), &ids, &raw);
+        let without = build_batch_input(Some("ru"), "", &json!([]), &json!([]), &ids, &raw);
         assert!(without.get("glossary").is_none(), "empty glossary is omitted");
+    }
+
+    // Guide topics are recognition-context ONLY: present when the cycle has a template, omitted
+    // (kept lean) when empty, and never an authority (the instruction says disambiguate-only).
+    #[test]
+    fn batch_input_includes_guide_topics_when_present() {
+        let raw = raw3();
+        let ids = vec![0usize, 1, 2];
+        let topics = json!([{ "title": "Onboarding", "questions": ["Как вы начали?"] }]);
+        let with = build_batch_input(Some("ru"), "", &json!([]), &topics, &ids, &raw);
+        assert_eq!(with["guide_topics"], topics, "guide topics flow into the cleanup prompt");
+        assert!(
+            with["instructions"].as_str().unwrap().contains("disambiguate"),
+            "instructions scope topics to disambiguation only"
+        );
+
+        let without = build_batch_input(Some("ru"), "", &json!([]), &json!([]), &ids, &raw);
+        assert!(without.get("guide_topics").is_none(), "empty topics omitted");
+    }
+
+    // build_guide_topics keeps titles + questions, drops empty blocks, and omits the
+    // hypotheses/goals (recognition-context must not carry conclusions).
+    #[test]
+    fn guide_topics_renders_titles_and_questions_only() {
+        use crate::synthesis::{GuideTemplate, QuestionBlock, TemplateItem};
+        let t = GuideTemplate {
+            hypotheses: vec![TemplateItem { id: "H1".into(), text: "secret hypothesis".into() }],
+            tasks: vec![TemplateItem { id: "G1".into(), text: "secret goal".into() }],
+            main_blocks: vec![
+                QuestionBlock {
+                    title: "Onboarding".into(),
+                    questions: vec![TemplateItem { id: "Q1".into(), text: "Как вы начали?".into() }],
+                },
+                QuestionBlock { title: "  ".into(), questions: vec![] }, // empty → dropped
+            ],
+            ..Default::default()
+        };
+        let v = build_guide_topics(&t);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "empty block dropped");
+        assert_eq!(arr[0]["title"], "Onboarding");
+        assert_eq!(arr[0]["questions"][0], "Как вы начали?");
+        // No hypotheses/goals leak into recognition context.
+        let blob = v.to_string();
+        assert!(!blob.contains("secret"), "topics carry no hypotheses/goals");
     }
 
     // The per-segment rewrite input carries ONE `text` (not a segments array) plus the same
@@ -1355,7 +1478,7 @@ mod tests {
 
         let total_batches = raw.len().div_ceil(BATCH_SIZE);
         let started = std::time::Instant::now();
-        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &json!([]), &raw, None)
+        let cleaned = clean_segments(None, "perf-verify", &adapter, Some("ru"), "", &json!([]), &json!([]), &raw, None)
             .await
             .expect("real parallel cleanup should succeed");
         let elapsed = started.elapsed();
@@ -1420,7 +1543,7 @@ mod tests {
             Segment { start_ms: 40200, end_ms: 45000, speaker_label: "S2".into(), text: "ну наверное когда сам разберусь чтобы было что показать коллегам понимаете".into() },
         ];
 
-        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &json!([]), &raw, None)
+        let cleaned = clean_segments(None, "m7-verify", &adapter, Some("ru"), "", &json!([]), &json!([]), &raw, None)
             .await
             .expect("real cleanup should succeed");
 
@@ -1538,7 +1661,7 @@ mod tests {
             if has_cleaned.is_none() {
                 set_status_db(&pool, iv, STATUS_CLEANING).await.unwrap();
                 println!("cleaning {iv}: {} segments via claude ...", raw.len());
-                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &json!([]), &raw, None)
+                let cleaned = clean_segments(None, iv, &adapter, language.as_deref(), "", &json!([]), &json!([]), &raw, None)
                     .await
                     .expect("real cleanup should succeed");
                 assert_eq!(cleaned.len(), raw.len(), "segment count preserved for {iv}");

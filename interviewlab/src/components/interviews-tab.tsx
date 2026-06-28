@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BookText,
   FileAudio,
@@ -30,13 +30,14 @@ import {
   useDeleteInterview,
   useInterviews,
 } from "@/lib/interview-queries";
-import { useModels } from "@/lib/asr-queries";
+import { asrKeys, useModels } from "@/lib/asr-queries";
 import { useUiStore } from "@/lib/ui-store";
 import {
   ASR_PROGRESS_EVENT,
   cancelTranscription,
   CLEANUP_PROGRESS_EVENT,
   cleanTranscript,
+  diarizationModelsPresent,
   DIAR_PROGRESS_EVENT,
   IN_TAURI,
   importTranscriptFile,
@@ -50,6 +51,7 @@ import {
   transcribeInterview,
 } from "@/lib/tauri";
 import { GlossarySuggestDialog } from "@/components/glossary-suggest-dialog";
+import { useT, tr } from "@/lib/i18n";
 // dev-mock: browser-only, never active under Tauri.
 import {
   mockOnAsrProgress,
@@ -77,10 +79,187 @@ const MEDIA_EXTS = [
 // `asr://progress` event. Drives the row's "Transcribing… N%" label.
 type AsrState = Record<string, number>;
 
+const STR = {
+  ru: {
+    mediaPrepFailed: (err: string) => `Не удалось подготовить медиа: ${err}`,
+    unknown: "неизвестно",
+    noSupportedFiles: "В перетащенных файлах нет поддерживаемого аудио/видео",
+    transcriptionFailed: (err: string) => `Не удалось транскрибировать: ${err}`,
+    cleanupFailed: (err: string) => `Не удалось очистить: ${err}`,
+    reTranscribeConfirm: (title: string) =>
+      `Перетранскрибировать «${title}»? Это перезапишет существующий транскрипт и ручные правки/разметку спикеров.`,
+    modelNotDownloaded: (label: string) =>
+      `Модель «${label}» ещё не скачана — скачайте её в Настройки → Транскрипция.`,
+    diarNotDownloaded: "Модель диаризации не скачана — спикеры (S1/S2…) не будут размечены.",
+    settings: "Настройки",
+    couldntTranscribe: (err: string) => `Не удалось транскрибировать. ${err}`,
+    importTxtDesktopOnly: "Импорт файла транскрипта работает в десктоп-приложении.",
+    transcriptFilterName: "Транскрипт",
+    importedTranscript: (title: string, segments: number, speakers: number) =>
+      `Импортирован транскрипт для «${title}» — ${segments} ${
+        segments === 1 ? "сегмент" : "сегм."
+      }, ${speakers} ${speakers === 1 ? "спикер" : "спик."}`,
+    couldntImport: (err: string) => `Не удалось импортировать транскрипт. ${err}`,
+    stopping: (title: string) => `Останавливаю «${title}»…`,
+    couldntStop: (err: string) => `Не удалось остановить. ${err}`,
+    reDiarizeConfirm: (title: string) =>
+      `Заново разметить спикеров в «${title}»? Это перезапишет существующую разметку спикеров и ручные правки.`,
+    reDiarized: (title: string, speakers: number) =>
+      `Спикеры заново размечены в «${title}» — обнаружено ${speakers} ${
+        speakers === 1 ? "спикер" : "спик."
+      }`,
+    couldntRediarize: (err: string) => `Не удалось переразметить спикеров. ${err}`,
+    reCleanConfirm: (title: string) =>
+      `Очистить заново «${title}»? Это перезапишет существующий очищенный текст и ручные правки.`,
+    cleaned: (title: string) => `Очищено «${title}»`,
+    couldntClean: (err: string) => `Не удалось очистить. ${err}`,
+    importing: (n: number) => `Импортирую ${n} ${n === 1 ? "файл" : "файлов"}…`,
+    couldntStartImport: (err: string) => `Не удалось начать импорт. ${err}`,
+    audioVideoFilterName: "Аудио/Видео",
+    colInterview: "Интервью",
+    colDuration: "Длительность",
+    colStatus: "Статус",
+    diarizing: "Размечаю спикеров…",
+    transcribing: (pct: number | null) =>
+      `Транскрибирую${pct != null ? ` ${pct}%` : "…"}`,
+    cleaning: (pct: number | null) =>
+      `Очищаю${pct != null ? ` ${pct}%` : "…"}`,
+    transcribed: "Транскрибировано",
+    cleanedBadge: "Очищено",
+    edited: "Отредактировано",
+    stop: "Остановить",
+    stopAria: (title: string) => `Остановить транскрибацию «${title}»`,
+    openEditor: "Открыть редактор",
+    openEditorAria: (title: string) => `Открыть редактор для «${title}»`,
+    cleanAria: (title: string) => `Очистить транскрипт «${title}»`,
+    reClean: "Очистить заново",
+    clean: "Очистить",
+    glossary: "Глоссарий",
+    glossaryAria: (title: string) => `Предложить термины глоссария из «${title}»`,
+    reDiarize: "Переразметить",
+    reDiarizeAria: (title: string) => `Переразметить спикеров в «${title}»`,
+    importTxt: "Импорт .txt",
+    importTxtAria: (title: string) => `Импортировать файл транскрипта для «${title}»`,
+    reTranscribe: "Перетранскрибировать",
+    transcribe: "Транскрибировать",
+    transcribeAria: (title: string) => `Транскрибировать «${title}»`,
+    deleteAria: (title: string) => `Удалить «${title}»`,
+    deleteConfirm: (title: string) =>
+      `Удалить «${title}»? Это нельзя отменить — удалятся транскрипт, правки и саммари.`,
+    deleted: "Удалено",
+    couldntDelete: (err: string) => `Не удалось удалить. ${err}`,
+    dragHereOr: "Перетащите сюда аудио или видео, или",
+    addFiles: "Добавить файлы",
+    dragHere: "Перетащите сюда аудио или видео файлы",
+    emptyHint: (
+      <>
+        Каждый файл становится интервью и нормализуется в аудио 16 кГц. Уже есть
+        транскрипт с разметкой спикеров? Используйте <em>Импорт .txt</em> в строке,
+        чтобы прикрепить его вместо транскрибации.
+      </>
+    ),
+    preparing: (n: number) => `${n} ${n === 1 ? "файл" : "файлов"}`,
+    preparingPrefix: "Подготавливаю",
+    noInterviews: "Пока нет интервью",
+    noInterviewsHint: "Перетащите записи выше, чтобы загрузить интервью этой волны.",
+  },
+  en: {
+    mediaPrepFailed: (err: string) => `Media prep failed: ${err}`,
+    unknown: "unknown",
+    noSupportedFiles: "No supported audio/video files in the drop",
+    transcriptionFailed: (err: string) => `Transcription failed: ${err}`,
+    cleanupFailed: (err: string) => `Cleanup failed: ${err}`,
+    reTranscribeConfirm: (title: string) =>
+      `Re-transcribe "${title}"? This overwrites the existing transcript and any manual edits / speaker labels.`,
+    modelNotDownloaded: (label: string) =>
+      `The "${label}" model isn't downloaded yet — get it in Settings → Transcription.`,
+    diarNotDownloaded: "Diarization model isn't downloaded — speakers (S1/S2…) won't be labeled.",
+    settings: "Settings",
+    couldntTranscribe: (err: string) => `Couldn't transcribe. ${err}`,
+    importTxtDesktopOnly: "Importing a transcript file works in the desktop app.",
+    transcriptFilterName: "Transcript",
+    importedTranscript: (title: string, segments: number, speakers: number) =>
+      `Imported transcript for "${title}" — ${segments} segment${
+        segments === 1 ? "" : "s"
+      }, ${speakers} speaker${speakers === 1 ? "" : "s"}`,
+    couldntImport: (err: string) => `Couldn't import the transcript. ${err}`,
+    stopping: (title: string) => `Stopping "${title}"…`,
+    couldntStop: (err: string) => `Couldn't stop. ${err}`,
+    reDiarizeConfirm: (title: string) =>
+      `Re-diarize "${title}"? This overwrites the existing speaker labels and manual edits.`,
+    reDiarized: (title: string, speakers: number) =>
+      `Re-diarized "${title}" — ${speakers} speaker${
+        speakers === 1 ? "" : "s"
+      } detected`,
+    couldntRediarize: (err: string) => `Couldn't re-diarize. ${err}`,
+    reCleanConfirm: (title: string) =>
+      `Re-clean "${title}"? This overwrites the existing cleaned text and manual edits.`,
+    cleaned: (title: string) => `Cleaned "${title}"`,
+    couldntClean: (err: string) => `Couldn't clean. ${err}`,
+    importing: (n: number) => `Importing ${n} file${n > 1 ? "s" : ""}…`,
+    couldntStartImport: (err: string) => `Couldn't start the import. ${err}`,
+    audioVideoFilterName: "Audio/Video",
+    colInterview: "Interview",
+    colDuration: "Duration",
+    colStatus: "Status",
+    diarizing: "Diarizing…",
+    transcribing: (pct: number | null) =>
+      `Transcribing${pct != null ? ` ${pct}%` : "…"}`,
+    cleaning: (pct: number | null) =>
+      `Cleaning${pct != null ? ` ${pct}%` : "…"}`,
+    transcribed: "Transcribed",
+    cleanedBadge: "Cleaned",
+    edited: "Edited",
+    stop: "Stop",
+    stopAria: (title: string) => `Stop transcribing ${title}`,
+    openEditor: "Open editor",
+    openEditorAria: (title: string) => `Open editor for ${title}`,
+    cleanAria: (title: string) => `Clean transcript for ${title}`,
+    reClean: "Re-clean",
+    clean: "Clean",
+    glossary: "Glossary",
+    glossaryAria: (title: string) => `Suggest glossary terms from ${title}`,
+    reDiarize: "Re-diarize",
+    reDiarizeAria: (title: string) => `Re-diarize ${title}`,
+    importTxt: "Import .txt",
+    importTxtAria: (title: string) => `Import a transcript file for ${title}`,
+    reTranscribe: "Re-transcribe",
+    transcribe: "Transcribe",
+    transcribeAria: (title: string) => `Transcribe ${title}`,
+    deleteAria: (title: string) => `Delete ${title}`,
+    deleteConfirm: (title: string) =>
+      `Delete "${title}"? This can't be undone — the transcript, edits, and summary are removed.`,
+    deleted: "Deleted",
+    couldntDelete: (err: string) => `Couldn't delete. ${err}`,
+    dragHereOr: "Drag audio or video files here, or",
+    addFiles: "Add files",
+    dragHere: "Drag audio or video files here",
+    emptyHint: (
+      <>
+        Each file becomes an interview, normalized to 16 kHz audio. Already
+        have a diarized transcript? Use a row's <em>Import .txt</em> to
+        attach it instead of transcribing.
+      </>
+    ),
+    preparing: (n: number) => `${n} file${n > 1 ? "s" : ""}`,
+    preparingPrefix: "Preparing",
+    noInterviews: "No interviews yet",
+    noInterviewsHint: "Drop recordings above to ingest this wave's interviews.",
+  },
+};
+
 export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const navigate = useNavigate();
+  const t = useT(STR);
   const { data: interviews, isPending } = useInterviews(cycleId);
   const { data: models } = useModels();
+  // Whether the speaker-diarization model files are on disk — same small bool read
+  // Settings uses (settings.tsx:127). Lets us warn before a Transcribe run that would
+  // skip diarization because the model isn't downloaded yet.
+  const { data: diarPresent } = useQuery({
+    queryKey: asrKeys.diarPresent,
+    queryFn: diarizationModelsPresent,
+  });
   const addFiles = useAddInterviewFiles(cycleId);
   const deleteInterview = useDeleteInterview(cycleId);
   const qc = useQueryClient();
@@ -117,7 +296,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         if (payload.cycle_id !== cycleId) return;
         qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
         if (payload.status === "error") {
-          toast.error(`Media prep failed: ${payload.error ?? "unknown"}`);
+          const s = tr(STR);
+          toast.error(s.mediaPrepFailed(payload.error ?? s.unknown));
         }
       });
       return unlisten;
@@ -128,7 +308,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         if (event.payload.cycle_id !== cycleId) return;
         qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
         if (event.payload.status === "error") {
-          toast.error(`Media prep failed: ${event.payload.error ?? "unknown"}`);
+          const s = tr(STR);
+          toast.error(s.mediaPrepFailed(event.payload.error ?? s.unknown));
         }
       },
     );
@@ -153,7 +334,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         const paths = filterMedia(event.payload.paths);
         if (paths.length) ingest(paths);
         else if (event.payload.paths.length)
-          toast.error("No supported audio/video files in the drop");
+          toast.error(tr(STR).noSupportedFiles);
       } else {
         setIsDragOver(false);
       }
@@ -188,7 +369,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         });
         qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
         if (p.status === "error") {
-          toast.error(`Transcription failed: ${p.error ?? "unknown"}`);
+          const s = tr(STR);
+          toast.error(s.transcriptionFailed(p.error ?? s.unknown));
         }
       }
     }
@@ -245,7 +427,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       if (p.status === "cleaned" || p.status === "error") {
         qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
         if (p.status === "error") {
-          toast.error(`Cleanup failed: ${p.error ?? "unknown"}`);
+          const s = tr(STR);
+          toast.error(s.cleanupFailed(p.error ?? s.unknown));
         }
       }
     }
@@ -272,11 +455,25 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // Transcribe one interview with the Settings-chosen model + language. Optimistically
   // flips the row to 'transcribing'; the asr://progress stream + invalidation do the rest.
   async function transcribe(row: InterviewRow) {
-    if (!selectedModel?.downloaded) {
-      toast.error(
-        `The "${selectedModel?.label ?? asrModelId}" model isn't downloaded yet — get it in Settings → Transcription.`,
-      );
+    // Re-running on an already-processed interview overwrites the transcript and any
+    // manual edits / speaker labels — guard it (ponytail: native confirm, like delete).
+    const s = tr(STR);
+    if (row.status !== "new" && !confirm(s.reTranscribeConfirm(row.title)))
       return;
+    if (!selectedModel?.downloaded) {
+      toast.error(s.modelNotDownloaded(selectedModel?.label ?? asrModelId));
+      return;
+    }
+    // Diarization is best-effort: if its model isn't on disk the transcript still runs,
+    // just without speaker labels. Hint (non-blocking) with a jump to Settings so the
+    // user can grab it. diarPresent === undefined → status not loaded yet, don't nag.
+    if (diarPresent === false) {
+      toast.warning(s.diarNotDownloaded, {
+        action: {
+          label: s.settings,
+          onClick: () => navigate("/settings"),
+        },
+      });
     }
     setAsrProgress((prev) => ({ ...prev, [row.id]: 0 }));
     try {
@@ -287,7 +484,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         delete next[row.id];
         return next;
       });
-      toast.error(`Couldn't transcribe. ${String(e)}`);
+      toast.error(s.couldntTranscribe(String(e)));
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
     }
@@ -299,23 +496,22 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // refreshes so Edit/Clean/Re-diarize unlock. The audio stays attached, so media seek,
   // clearing a segment and re-transcribing a range keep working.
   async function importTxt(row: InterviewRow) {
+    const s = tr(STR);
     if (!IN_TAURI) {
-      toast.error("Importing a transcript file works in the desktop app.");
+      toast.error(s.importTxtDesktopOnly);
       return;
     }
     const selected = await openFileDialog({
       multiple: false,
-      filters: [{ name: "Transcript", extensions: ["txt"] }],
+      filters: [{ name: s.transcriptFilterName, extensions: ["txt"] }],
     });
     if (!selected) return;
     const path = Array.isArray(selected) ? selected[0] : selected;
     try {
       const res = await importTranscriptFile(row.id, path);
-      toast.success(
-        `Imported transcript for "${row.title}" — ${res.segments} segment${res.segments === 1 ? "" : "s"}, ${res.speakers} speaker${res.speakers === 1 ? "" : "s"}`,
-      );
+      toast.success(s.importedTranscript(row.title, res.segments, res.speakers));
     } catch (e) {
-      toast.error(`Couldn't import the transcript. ${String(e)}`);
+      toast.error(s.couldntImport(String(e)));
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
     }
@@ -332,9 +528,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
         delete next[row.id];
         return next;
       });
-      toast.message(`Stopping "${row.title}"…`);
+      toast.message(tr(STR).stopping(row.title));
     } catch (e) {
-      toast.error(`Couldn't stop. ${String(e)}`);
+      toast.error(tr(STR).couldntStop(String(e)));
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
     }
@@ -345,31 +541,39 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // fresh S1/S2/… labels (the editor re-reads them on open). ponytail: no optimistic row
   // badge — re-diarize is quick and doesn't change the interview's status.
   async function rediarize(row: InterviewRow) {
+    const s = tr(STR);
+    if (!confirm(s.reDiarizeConfirm(row.title))) return;
     try {
       const speakers = await rediarizeInterview(row.id, expectedSpeakers);
-      toast.success(
-        `Re-diarized "${row.title}" — ${speakers} speaker${speakers === 1 ? "" : "s"} detected`,
-      );
+      toast.success(s.reDiarized(row.title, speakers));
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
     } catch (e) {
-      toast.error(`Couldn't re-diarize. ${String(e)}`);
+      toast.error(s.couldntRediarize(String(e)));
     }
   }
 
   // Run the "no grammar errors" cleanup pass (spec §6.7). Optimistically flips the row
   // to 'cleaning'; the cleanup://progress stream + invalidation do the rest.
   async function clean(row: InterviewRow) {
+    // First Clean on a raw transcript is non-destructive enough; but Re-clean over a
+    // cleaned/edited version overwrites manual edits — guard those.
+    const s = tr(STR);
+    if (
+      (row.status === "cleaned" || row.status === "edited") &&
+      !confirm(s.reCleanConfirm(row.title))
+    )
+      return;
     setCleanProgress((prev) => ({ ...prev, [row.id]: 0 }));
     try {
       await cleanTranscript(row.id);
-      toast.success(`Cleaned "${row.title}"`);
+      toast.success(s.cleaned(row.title));
     } catch (e) {
       setCleanProgress((prev) => {
         const next = { ...prev };
         delete next[row.id];
         return next;
       });
-      toast.error(`Couldn't clean. ${String(e)}`);
+      toast.error(s.couldntClean(String(e)));
     } finally {
       qc.invalidateQueries({ queryKey: interviewKeys.list(cycleId) });
     }
@@ -400,11 +604,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   async function ingest(paths: string[]) {
     try {
       await addFiles.mutateAsync(paths);
-      toast.success(
-        `Importing ${paths.length} file${paths.length > 1 ? "s" : ""}…`,
-      );
+      toast.success(tr(STR).importing(paths.length));
     } catch (e) {
-      toast.error(`Couldn't start the import. ${String(e)}`);
+      toast.error(tr(STR).couldntStartImport(String(e)));
     }
   }
 
@@ -423,7 +625,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     }
     const selected = await openFileDialog({
       multiple: true,
-      filters: [{ name: "Audio/Video", extensions: MEDIA_EXTS }],
+      filters: [{ name: tr(STR).audioVideoFilterName, extensions: MEDIA_EXTS }],
     });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
@@ -434,7 +636,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     () => [
       {
         accessorKey: "title",
-        header: "Interview",
+        header: t.colInterview,
         cell: ({ row }) => (
           <span className="flex items-center gap-2 font-medium">
             <FileAudio className="size-4 shrink-0 text-muted-foreground" />
@@ -444,7 +646,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       },
       {
         accessorKey: "duration_ms",
-        header: () => <span className="block text-right">Duration</span>,
+        header: () => <span className="block text-right">{t.colDuration}</span>,
         cell: ({ row }) => (
           <span className="block text-right font-numeric text-xs text-muted-foreground">
             {formatDuration(row.original.duration_ms)}
@@ -453,7 +655,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       },
       {
         accessorKey: "status",
-        header: "Status",
+        header: t.colStatus,
         cell: ({ row }) => {
           const s = row.original.status;
           const live = asrProgress[row.original.id];
@@ -465,7 +667,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
             return (
               <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
                 <Loader2 className="size-3 animate-spin" />
-                <span>Diarizing…</span>
+                <span>{t.diarizing}</span>
               </span>
             );
           }
@@ -475,7 +677,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
               <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
                 <Loader2 className="size-3 animate-spin" />
                 <span className="font-numeric">
-                  Transcribing{live != null ? ` ${live}%` : "…"}
+                  {t.transcribing(live != null ? live : null)}
                 </span>
               </span>
             );
@@ -485,7 +687,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
               <span className="inline-flex items-center gap-1.5 text-xs text-status-processing">
                 <Loader2 className="size-3 animate-spin" />
                 <span className="font-numeric">
-                  Cleaning{cleanLive != null ? ` ${cleanLive}%` : "…"}
+                  {t.cleaning(cleanLive != null ? cleanLive : null)}
                 </span>
               </span>
             );
@@ -494,7 +696,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
             return (
               <span className="inline-flex items-center gap-1.5 text-xs text-status-ready">
                 <span className="size-1.5 shrink-0 rounded-full bg-status-ready" />
-                <span>Transcribed</span>
+                <span>{t.transcribed}</span>
               </span>
             );
           }
@@ -502,7 +704,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
             return (
               <span className="inline-flex items-center gap-1.5 text-xs text-status-ready">
                 <span className="size-1.5 shrink-0 rounded-full bg-status-ready" />
-                <span>Cleaned</span>
+                <span>{t.cleanedBadge}</span>
               </span>
             );
           }
@@ -510,7 +712,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
             return (
               <span className="inline-flex items-center gap-1.5 text-xs text-primary">
                 <span className="size-1.5 shrink-0 rounded-full bg-primary" />
-                <span>Edited</span>
+                <span>{t.edited}</span>
               </span>
             );
           }
@@ -555,7 +757,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                 <Button
                   variant="ghost"
                   size="sm"
-                  aria-label={`Stop transcribing ${row.original.title}`}
+                  aria-label={t.stopAria(row.original.title)}
                   className="text-status-error opacity-100 transition-opacity"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -563,14 +765,14 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <Square className="size-3.5 fill-current" />
-                  Stop
+                  {t.stop}
                 </Button>
               )}
               {canEdit(row.original) && (
                 <Button
                   variant="ghost"
                   size="sm"
-                  aria-label={`Open editor for ${row.original.title}`}
+                  aria-label={t.openEditorAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -578,7 +780,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <PencilLine className="size-3.5" />
-                  Open editor
+                  {t.openEditor}
                 </Button>
               )}
               {canClean && (
@@ -586,7 +788,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   variant="ghost"
                   size="sm"
                   disabled={busy}
-                  aria-label={`Clean transcript for ${row.original.title}`}
+                  aria-label={t.cleanAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -594,7 +796,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <Sparkles className="size-3.5" />
-                  {s === "cleaned" ? "Re-clean" : "Clean"}
+                  {s === "cleaned" ? t.reClean : t.clean}
                 </Button>
               )}
               {canClean && (
@@ -602,7 +804,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   variant="ghost"
                   size="sm"
                   disabled={busy}
-                  aria-label={`Suggest glossary terms from ${row.original.title}`}
+                  aria-label={t.glossaryAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -610,7 +812,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <BookText className="size-3.5" />
-                  Glossary
+                  {t.glossary}
                 </Button>
               )}
               {canRediarize && (
@@ -618,7 +820,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   variant="ghost"
                   size="sm"
                   disabled={busy}
-                  aria-label={`Re-diarize ${row.original.title}`}
+                  aria-label={t.reDiarizeAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -626,7 +828,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <Users className="size-3.5" />
-                  Re-diarize
+                  {t.reDiarize}
                 </Button>
               )}
               {canImport && (
@@ -634,7 +836,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   variant="ghost"
                   size="sm"
                   disabled={busy}
-                  aria-label={`Import a transcript file for ${row.original.title}`}
+                  aria-label={t.importTxtAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -642,7 +844,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <FileUp className="size-3.5" />
-                  Import .txt
+                  {t.importTxt}
                 </Button>
               )}
               {canTranscribe && (
@@ -650,7 +852,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   variant="ghost"
                   size="sm"
                   disabled={busy}
-                  aria-label={`Transcribe ${row.original.title}`}
+                  aria-label={t.transcribeAria(row.original.title)}
                   className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -658,18 +860,27 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                   }}
                 >
                   <FileText className="size-3.5" />
-                  {s === "transcribed" ? "Re-transcribe" : "Transcribe"}
+                  {s === "transcribed" ? t.reTranscribe : t.transcribe}
                 </Button>
               )}
               <Button
                 variant="ghost"
                 size="icon-sm"
                 disabled={busy}
-                aria-label={`Delete ${row.original.title}`}
+                aria-label={t.deleteAria(row.original.title)}
                 className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                 onClick={(e) => {
                   e.stopPropagation();
-                  deleteInterview.mutate(row.original.id);
+                  // ponytail: native confirm() guard, same pattern as guides.tsx:148
+                  // / cycle-chat-panel.tsx:309 — no AlertDialog needed for a destructive
+                  // one-off. Toast confirms after; undo is out of scope (hard delete).
+                  if (!confirm(tr(STR).deleteConfirm(row.original.title)))
+                    return;
+                  deleteInterview.mutate(row.original.id, {
+                    onSuccess: () => toast.success(tr(STR).deleted),
+                    onError: (e) =>
+                      toast.error(tr(STR).couldntDelete(String(e))),
+                  });
                 }}
               >
                 <Trash2 className="size-4" />
@@ -688,56 +899,83 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       asrModelId,
       asrLanguage,
       expectedSpeakers,
+      t,
     ],
   );
 
   const importing =
     interviews?.filter((i) => i.status === "importing").length ?? 0;
+  // Once the list has interviews, collapse the big dropzone into a slim strip so it
+  // doesn't eat vertical space (ui-backlog #4). Full zone only on the empty list.
+  const hasInterviews = !!interviews && interviews.length > 0;
 
   return (
     <div className="flex flex-col gap-4 pt-2">
       {/* Calm dashed dropzone — obvious target, unobtrusive chrome. The native
           drag-drop listener above covers the whole window; this is the affordance. */}
-      <div
-        className={cn(
-          "flex flex-col items-center gap-2.5 rounded-lg border border-dashed px-6 py-8 text-center transition-colors",
-          isDragOver
-            ? "border-primary bg-primary/5"
-            : "border-border hover:border-border-strong",
-        )}
-      >
-        <span className="flex size-9 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
-          <Upload className="size-4" />
-        </span>
-        <div className="flex flex-col gap-0.5">
-          <p className="text-sm font-medium text-foreground">
-            Drag audio or video files here
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Each file becomes an interview, normalized to 16 kHz audio. Already
-            have a diarized transcript? Use a row's <em>Import .txt</em> to attach
-            it instead of transcribing.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handlePick}
-          disabled={addFiles.isPending}
+      {hasInterviews ? (
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 rounded-lg border border-dashed px-3 py-2 text-left transition-colors",
+            isDragOver
+              ? "border-primary bg-primary/5"
+              : "border-border hover:border-border-strong",
+          )}
         >
-          <Upload className="size-4" />
-          Add files
-        </Button>
-      </div>
+          <span className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Upload className="size-3.5 shrink-0" />
+            {t.dragHereOr}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handlePick}
+            disabled={addFiles.isPending}
+          >
+            <Upload className="size-4" />
+            {t.addFiles}
+          </Button>
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "flex flex-col items-center gap-2.5 rounded-lg border border-dashed px-6 py-8 text-center transition-colors",
+            isDragOver
+              ? "border-primary bg-primary/5"
+              : "border-border hover:border-border-strong",
+          )}
+        >
+          <span className="flex size-9 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
+            <Upload className="size-4" />
+          </span>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-sm font-medium text-foreground">
+              {t.dragHere}
+            </p>
+            <p className="text-xs text-muted-foreground">{t.emptyHint}</p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handlePick}
+            disabled={addFiles.isPending}
+          >
+            <Upload className="size-4" />
+            {t.addFiles}
+          </Button>
+        </div>
+      )}
 
       {/* Live ingest progress while files are being prepared (no spinner). */}
       {importing > 0 && (
         <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
           <StatusDot kind="importing" label={false} />
           <span>
-            Preparing{" "}
-            <span className="font-numeric text-foreground/80">{importing}</span>{" "}
-            file{importing > 1 ? "s" : ""}…
+            {t.preparingPrefix}{" "}
+            <span className="font-numeric text-foreground/80">
+              {t.preparing(importing)}
+            </span>
+            …
           </span>
         </div>
       )}
@@ -758,11 +996,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       ) : !interviews || interviews.length === 0 ? (
         <div className="flex flex-col items-center gap-1 rounded-lg border border-border px-6 py-10 text-center">
           <p className="text-sm font-medium text-foreground">
-            No interviews yet
+            {t.noInterviews}
           </p>
-          <p className="text-xs text-muted-foreground">
-            Drop recordings above to ingest this wave's interviews.
-          </p>
+          <p className="text-xs text-muted-foreground">{t.noInterviewsHint}</p>
         </div>
       ) : (
         <DataTable

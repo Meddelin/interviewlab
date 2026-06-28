@@ -139,27 +139,66 @@ pub struct ModelInfo {
     pub label: String,
     pub file: String,
     pub approx_mb: u64,
-    pub default: bool,   // the app default (large-v3, spec §6.4)
+    pub default: bool,    // the app default (large-v3, spec §6.4)
     pub downloaded: bool, // resolved at list time from models/ on disk
+    // --- characteristics shown in the model picker so the user can choose with eyes open ---
+    pub multilingual: bool, // false = English-only (".en" weights)
+    pub quantized: bool,    // q5_0 — ~⅓ the size, near-identical quality, a touch slower on CPU
+    pub speed: String,      // "fastest" | "fast" | "medium" | "slow" | "slowest"
+    pub accuracy: String,   // "lowest" | "basic" | "good" | "high" | "highest"
+    pub note: String,       // short human description of the tradeoffs (RU)
 }
 
-// The catalog. Default = large-v3 (best Russian accuracy, spec §6.4); turbo + medium
-// are the speed/VRAM knobs the spec calls out. tiny/base are small models for dev
-// verification (kept selectable so the M4 verify can avoid a 3 GB download).
+// The full whisper.cpp ggml catalog (https://github.com/ggml-org/whisper.cpp/blob/master/models).
+// Any of these can be downloaded. Default = large-v3 (best Russian accuracy). `.en` = English-only;
+// `-q5_0` = quantized (smaller, ~same quality); `-turbo` = faster large-v3; `-tdrz` = tinydiarize
+// speaker tokens (English only). approx_mb is rough on-disk size for the UI.
 struct CatalogEntry {
     id: &'static str,
     label: &'static str,
     file: &'static str,
     approx_mb: u64,
     default: bool,
+    multilingual: bool,
+    quantized: bool,
+    speed: &'static str,
+    accuracy: &'static str,
+    note: &'static str,
 }
 
 const CATALOG: &[CatalogEntry] = &[
-    CatalogEntry { id: "large-v3", label: "Large v3 (best, Russian default)", file: "ggml-large-v3.bin", approx_mb: 3094, default: true },
-    CatalogEntry { id: "large-v3-turbo", label: "Large v3 Turbo (faster)", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false },
-    CatalogEntry { id: "medium", label: "Medium (lighter)", file: "ggml-medium.bin", approx_mb: 1533, default: false },
-    CatalogEntry { id: "base", label: "Base (small, for testing)", file: "ggml-base.bin", approx_mb: 148, default: false },
-    CatalogEntry { id: "tiny", label: "Tiny (smallest, for testing)", file: "ggml-tiny.bin", approx_mb: 78, default: false },
+    CatalogEntry { id: "large-v3", label: "Large v3", file: "ggml-large-v3.bin", approx_mb: 3094, default: true, multilingual: true, quantized: false, speed: "slowest", accuracy: "highest",
+        note: "Лучшее качество, рекомендуется для русского. Тяжёлая — комфортно на GPU." },
+    CatalogEntry { id: "large-v3-turbo", label: "Large v3 Turbo", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false, multilingual: true, quantized: false, speed: "fast", accuracy: "high",
+        note: "Ускоренная large-v3: заметно быстрее, качество чуть ниже флагмана. Хороший баланс." },
+    CatalogEntry { id: "large-v3-turbo-q5_0", label: "Large v3 Turbo (q5_0)", file: "ggml-large-v3-turbo-q5_0.bin", approx_mb: 574, default: false, multilingual: true, quantized: true, speed: "fast", accuracy: "high",
+        note: "Квантованный turbo: самый компактный из топовых (~0.5 ГБ), быстрый, качество близко к turbo." },
+    CatalogEntry { id: "large-v3-q5_0", label: "Large v3 (q5_0)", file: "ggml-large-v3-q5_0.bin", approx_mb: 1100, default: false, multilingual: true, quantized: true, speed: "slow", accuracy: "highest",
+        note: "Квантованная large-v3: ~⅓ размера при почти том же качестве, чуть медленнее на CPU." },
+    CatalogEntry { id: "large-v2", label: "Large v2", file: "ggml-large-v2.bin", approx_mb: 3094, default: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high",
+        note: "Прошлое поколение large. Обычно лучше брать v3, но иногда стабильнее на отдельных языках." },
+    CatalogEntry { id: "large-v2-q5_0", label: "Large v2 (q5_0)", file: "ggml-large-v2-q5_0.bin", approx_mb: 1100, default: false, multilingual: true, quantized: true, speed: "slow", accuracy: "high",
+        note: "Квантованная large-v2: компактная версия предыдущего поколения." },
+    CatalogEntry { id: "large-v1", label: "Large v1", file: "ggml-large-v1.bin", approx_mb: 3094, default: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high",
+        note: "Самая старая large. Как правило уступает v3 — берите только для совместимости." },
+    CatalogEntry { id: "medium", label: "Medium", file: "ggml-medium.bin", approx_mb: 1533, default: false, multilingual: true, quantized: false, speed: "medium", accuracy: "good",
+        note: "Компромисс качество/скорость для скромного железа без сильного GPU." },
+    CatalogEntry { id: "small", label: "Small", file: "ggml-small.bin", approx_mb: 488, default: false, multilingual: true, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Лёгкая модель: ок для черновика или слабой машины, заметно теряет на сложной речи." },
+    CatalogEntry { id: "base", label: "Base", file: "ggml-base.bin", approx_mb: 148, default: false, multilingual: true, quantized: false, speed: "fastest", accuracy: "basic",
+        note: "Маленькая, для быстрых черновиков и тестов. Низкая точность на русском." },
+    CatalogEntry { id: "tiny", label: "Tiny", file: "ggml-tiny.bin", approx_mb: 78, default: false, multilingual: true, quantized: false, speed: "fastest", accuracy: "lowest",
+        note: "Самая маленькая. Только для проверки пайплайна или очень слабых машин." },
+    CatalogEntry { id: "medium.en", label: "Medium (English-only)", file: "ggml-medium.en.bin", approx_mb: 1533, default: false, multilingual: false, quantized: false, speed: "medium", accuracy: "good",
+        note: "Только английский: точнее на англ. речи, но НЕ подходит для русского." },
+    CatalogEntry { id: "small.en", label: "Small (English-only)", file: "ggml-small.en.bin", approx_mb: 488, default: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Только английский, лёгкая." },
+    CatalogEntry { id: "small.en-tdrz", label: "Small (English, tinydiarize)", file: "ggml-small.en-tdrz.bin", approx_mb: 488, default: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic",
+        note: "Только англ., со встроенными токенами смены говорящего (tinydiarize). Узкоспециальная." },
+    CatalogEntry { id: "base.en", label: "Base (English-only)", file: "ggml-base.en.bin", approx_mb: 148, default: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "basic",
+        note: "Только английский, маленькая." },
+    CatalogEntry { id: "tiny.en", label: "Tiny (English-only)", file: "ggml-tiny.en.bin", approx_mb: 78, default: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "lowest",
+        note: "Только английский, самая маленькая." },
 ];
 
 fn catalog_entry(id: &str) -> Option<&'static CatalogEntry> {
@@ -190,6 +229,12 @@ pub struct DeviceInfo {
     pub gpu_name: Option<String>, // e.g. "NVIDIA GeForce RTX 5080" when an Nvidia GPU is present
     pub cuda_build: bool,      // whether this binary was compiled with the cuda feature
     pub detail: String,        // human-readable reason for the chosen device
+    // What the UI should offer the user (drives the Device step's action button):
+    //   "gpu_active"      — GPU is in use (CUDA or Metal); nothing to do.
+    //   "get_gpu_build"   — a supported GPU is present but THIS build can't use it →
+    //                       offer to download the GPU-accelerated build (heavy-dep install).
+    //   "cpu_only_no_gpu" — no supported GPU; CPU is the only option, nothing to offer.
+    pub recommendation: String,
 }
 
 // True only when compiled with the `cuda` Cargo feature (whisper.cpp CUDA backend).
@@ -249,12 +294,23 @@ pub fn detect_device() -> DeviceInfo {
         (false, None) => "No Nvidia GPU detected — using CPU.".to_string(),
     };
 
+    let recommendation = if use_gpu {
+        "gpu_active"
+    } else if gpu.is_some() {
+        // A supported Nvidia GPU is present but this build is CPU-only → offer the GPU build.
+        "get_gpu_build"
+    } else {
+        "cpu_only_no_gpu"
+    }
+    .to_string();
+
     DeviceInfo {
         device: if use_gpu { "cuda".into() } else { "cpu".into() },
         use_gpu,
         gpu_name: gpu,
         cuda_build: build,
         detail,
+        recommendation,
     }
 }
 
@@ -274,6 +330,7 @@ pub fn detect_device() -> DeviceInfo {
             gpu_name: Some("Apple Silicon GPU".into()),
             cuda_build: false,
             detail: "Metal backend (Apple Silicon) built — using the GPU.".to_string(),
+            recommendation: "gpu_active".into(),
         }
     } else {
         DeviceInfo {
@@ -281,9 +338,11 @@ pub fn detect_device() -> DeviceInfo {
             use_gpu: false,
             gpu_name: None,
             cuda_build: false,
-            detail: "CPU build on macOS — rebuild with `--features metal` for GPU \
-                     acceleration on Apple Silicon."
+            detail: "CPU build on macOS — install the Metal (Apple Silicon) build for \
+                     GPU acceleration."
                 .to_string(),
+            // A CPU-only build on Apple Silicon → offer the GPU (Metal) build.
+            recommendation: "get_gpu_build".into(),
         }
     }
 }
@@ -942,7 +1001,6 @@ struct AsrProgress {
     interview_id: String,
     status: String,        // 'transcribing' | 'transcribed' | 'error'
     progress: i32,         // 0..100, or -1 on a live segment tick
-    segment_text: Option<String>, // most-recent segment text (live preview), if any
     // The full live segment (timing + text) emitted as whisper decodes it, so a watcher (the
     // open transcript editor) can accumulate the transcript in real time — not just the last
     // line. None on percent/terminal ticks. Carries the placeholder "S1" until diarization.
@@ -966,9 +1024,8 @@ fn emit_asr(app: &tauri::AppHandle, interview_id: &str, status: &str, progress: 
             interview_id: interview_id.to_string(),
             status: status.to_string(),
             progress,
-            // Keep segment_text populated from the live segment for back-compat with any
-            // text-only consumer; new consumers read the full `segment`.
-            segment_text: segment.as_ref().map(|s| s.text.clone()),
+            // ponytail: dropped the duplicate `segment_text` — the full `segment` already carries
+            // the text and is the only field the frontend (live-asr-store) reads.
             segment,
             error,
         },
@@ -1061,6 +1118,11 @@ pub async fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, String
             approx_mb: e.approx_mb,
             default: e.default,
             downloaded,
+            multilingual: e.multilingual,
+            quantized: e.quantized,
+            speed: e.speed.to_string(),
+            accuracy: e.accuracy.to_string(),
+            note: e.note.to_string(),
         });
     }
     Ok(out)
@@ -1221,6 +1283,11 @@ pub async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(
 // 16 kHz mono → 16 samples per millisecond (our prepared wav is always 16k mono).
 const SAMPLES_PER_MS: usize = 16;
 
+// Min spacing between percentage progress emits (the live segment ticks are unthrottled —
+// they carry real content). whisper.cpp's progress callback fires far more often than this.
+// ponytail: tunable knob.
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
 // Run whisper over an interview's audio (optionally just a time SLICE) under the cancel
 // flag + watchdog, streaming live progress/segment events and accumulating the decoded
 // segments into `sink` for the checkpoint writer. Returns the segments with timestamps
@@ -1234,7 +1301,9 @@ async fn run_guarded_whisper(
     app: &tauri::AppHandle,
     interview_id: &str,
     model: PathBuf,
-    audio_path: PathBuf,
+    // Full 16k mono samples, read once by the caller and shared with diarization (avoids the
+    // second on-disk decode of the same wav). The slice for `range_ms` is taken from these.
+    all_samples: Arc<Vec<f32>>,
     range_ms: Option<(i64, i64)>,
     language: Option<String>,
     initial_prompt: String,
@@ -1251,28 +1320,45 @@ async fn run_guarded_whisper(
     let offset_ms = range_ms.map(|(s, _)| s.max(0)).unwrap_or(0);
 
     let task = tauri::async_runtime::spawn_blocking(move || {
-        let all = read_wav_16k_mono(&audio_path)?;
         // Slice to the requested range (clamped to bounds); None → the whole file.
-        let samples: Vec<f32> = match range_ms {
+        let samples: &[f32] = match range_ms {
             Some((s, e)) => {
-                let a = (s.max(0) as usize * SAMPLES_PER_MS).min(all.len());
-                let b = (e.max(0) as usize * SAMPLES_PER_MS).min(all.len());
-                all[a..b.max(a)].to_vec()
+                let a = (s.max(0) as usize * SAMPLES_PER_MS).min(all_samples.len());
+                let b = (e.max(0) as usize * SAMPLES_PER_MS).min(all_samples.len());
+                &all_samples[a..b.max(a)]
             }
-            None => all,
+            None => &all_samples[..],
         };
         let segs = run_whisper(
             &model,
-            &samples,
+            samples,
             language.as_deref(),
             Some(initial_prompt.as_str()),
             use_gpu,
             Some(cancel_for_run),
-            // progress callback → throttled event
+            // progress callback → throttled event. whisper.cpp fires this very frequently and
+            // often with the SAME percent; each emit broadcasts a serialized payload to every
+            // window. Dedup on value + rate-limit to ~once/300ms so the IPC stream stays sane.
+            // 100 always passes (the terminal tick) regardless of the time gate.
             {
                 let app = app_for_cb.clone();
                 let iv = iv_for_cb.clone();
-                move |p: i32| emit_asr(&app, &iv, STATUS_TRANSCRIBING, p, None, None)
+                let mut last_pct = -1i32;
+                let mut last_emit = std::time::Instant::now()
+                    .checked_sub(PROGRESS_THROTTLE)
+                    .unwrap_or_else(std::time::Instant::now);
+                move |p: i32| {
+                    if p == last_pct {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    if p < 100 && now.duration_since(last_emit) < PROGRESS_THROTTLE {
+                        return;
+                    }
+                    last_pct = p;
+                    last_emit = now;
+                    emit_asr(&app, &iv, STATUS_TRANSCRIBING, p, None, None);
+                }
             },
             // segment callback → offset into the full timeline, emit live + feed the checkpoint buffer
             {
@@ -1371,7 +1457,9 @@ async fn diarize_and_store(
     language: Option<String>,
     expected_speakers: Option<i32>,
     duration_ms: Option<i64>,
-    audio_path: PathBuf,
+    // Full 16k mono samples shared with the whisper run — diarization reuses them instead of
+    // decoding the same wav from disk a second time.
+    all_samples: Arc<Vec<f32>>,
 ) -> Result<String, String> {
     let diar_dir = crate::diarize::diarization_dir(app)?;
     let mut engine = base_engine;
@@ -1380,8 +1468,7 @@ async fn diarize_and_store(
         let seg_model = diar_dir.join(crate::diarize::SEGMENTATION_FILE);
         let emb_model = diar_dir.join(crate::diarize::EMBEDDING_FILE);
         let diar_task = tauri::async_runtime::spawn_blocking(move || {
-            let samples = read_wav_16k_mono(&audio_path)?;
-            crate::diarize::diarize_samples(&seg_model, &emb_model, &samples, 16000, expected_speakers)
+            crate::diarize::diarize_samples(&seg_model, &emb_model, &all_samples, 16000, expected_speakers)
         });
         let diar_budget = std::time::Duration::from_millis(
             (duration_ms.unwrap_or(0).max(0) as u64).saturating_mul(8).max(180_000),
@@ -1397,7 +1484,7 @@ async fn diarize_and_store(
             Ok(turns) => {
                 crate::diarize::assign_speakers(&mut segments, &turns);
                 let n_spk = turns.iter().map(|t| t.speaker).collect::<std::collections::BTreeSet<_>>().len();
-                engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
+                engine = format!("{engine} + sherpa-onnx:pyannote-seg-3.0/wespeaker-resnet34@cpu({n_spk}spk)");
                 emit_diar(app, interview_id, "done", 100, Some(n_spk as i32));
             }
             Err(e) => {
@@ -1454,6 +1541,15 @@ async fn resolve_audio_path(pool: &SqlitePool, interview_id: &str) -> Result<Pat
         return Err(format!("audio file missing on disk: {audio}"));
     }
     Ok(p)
+}
+
+// Decode the prepared 16k wav into shared samples ONCE per run (off the async pool — a long
+// interview is tens of MB to read + resample). The returned Arc is handed to both the whisper
+// run and diarization so the same buffer isn't decoded from disk twice.
+async fn read_samples_shared(audio_path: PathBuf) -> Result<Arc<Vec<f32>>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_wav_16k_mono(&audio_path).map(Arc::new))
+        .await
+        .map_err(|_| "wav read task panicked".to_string())?
 }
 
 // Build whisper's initial_prompt (glossary canonical terms + product context) for an
@@ -1525,6 +1621,13 @@ pub async fn transcribe_interview(
         .map_err(|e| format!("set transcribing: {e}"))?;
     emit_asr(&app, &interview_id, STATUS_TRANSCRIBING, 0, None, None);
 
+    // Read the 16k wav ONCE and share it with both whisper and diarization (avoids a second
+    // on-disk decode of the same ~100MB-for-an-hour buffer).
+    let samples = read_samples_shared(audio_path).await.map_err(|e| {
+        log::error!(target: "interviewlab::asr", "[E-ASR-AUDIO-MISSING] transcribe: interview='{interview_id}': {e}");
+        e
+    })?;
+
     // Whole-file run (range None, offset 0). The live buffer feeds the periodic checkpoint
     // writer so a crash/kill mid-run loses at most a few seconds — and the editor can resume.
     let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
@@ -1534,7 +1637,7 @@ pub async fn transcribe_interview(
     );
 
     let run = run_guarded_whisper(
-        &app, &interview_id, model.clone(), audio_path.clone(), None,
+        &app, &interview_id, model.clone(), samples.clone(), None,
         language.clone(), initial_prompt, device.use_gpu, budget, sink.clone(),
     )
     .await;
@@ -1544,7 +1647,7 @@ pub async fn transcribe_interview(
         Ok(segments) => {
             diarize_and_store(
                 &app, &db.pool, &interview_id, segments, engine, language,
-                expected_speakers, duration_ms, audio_path,
+                expected_speakers, duration_ms, samples,
             )
             .await
         }
@@ -1707,7 +1810,7 @@ pub async fn rediarize_interview(
         .as_deref()
         .map(|e| e.split(" + ").next().unwrap_or(e).to_string())
         .unwrap_or_else(|| "whisper.cpp".to_string());
-    let engine = format!("{base_engine} + sherpa-onnx:pyannote-seg-3.0/eres2net@cpu({n_spk}spk)");
+    let engine = format!("{base_engine} + sherpa-onnx:pyannote-seg-3.0/wespeaker-resnet34@cpu({n_spk}spk)");
     let segments_json = serde_json::to_string(&segments).map_err(|e| format!("serialize segments: {e}"))?;
     store_raw_transcript_db(&db.pool, &interview_id, raw.language.as_deref(), &engine, &segments_json)
         .await
@@ -1845,11 +1948,14 @@ pub async fn retranscribe_range(
         .map_err(|e| format!("set transcribing: {e}"))?;
     emit_asr(&app, &interview_id, STATUS_TRANSCRIBING, 0, None, None);
 
+    // Read the wav once; the slice for whisper and the whole-audio diarization share it.
+    let samples = read_samples_shared(audio_path).await?;
+
     // No checkpoint writer here: a range redo is short and the ORIGINAL transcript stays
     // intact on failure (we only store on success), so there's nothing to resume.
     let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
     let run = run_guarded_whisper(
-        &app, &interview_id, model, audio_path.clone(), Some((start_ms, end_ms)),
+        &app, &interview_id, model, samples.clone(), Some((start_ms, end_ms)),
         language.clone(), initial_prompt, device.use_gpu, budget, sink,
     )
     .await;
@@ -1860,7 +1966,7 @@ pub async fn retranscribe_range(
             let lang = raw.language.clone().or_else(|| language.clone());
             diarize_and_store(
                 &app, &db.pool, &interview_id, merged, engine, lang,
-                expected_speakers, duration_ms, audio_path,
+                expected_speakers, duration_ms, samples,
             )
             .await
         }
@@ -1926,6 +2032,9 @@ pub async fn resume_transcription(
 
     // Keep checkpointing during the resume too (prefix + the new tail), so a SECOND crash is
     // also recoverable.
+    // Read the wav once; the resume slice and the whole-audio diarization share it.
+    let samples = read_samples_shared(audio_path).await?;
+
     let sink = Arc::new(StdMutex::new(Vec::<Segment>::new()));
     let ckpt_task = spawn_checkpoint_writer(
         db.pool.clone(), interview_id.clone(), sink.clone(),
@@ -1933,7 +2042,7 @@ pub async fn resume_transcription(
     );
 
     let run = run_guarded_whisper(
-        &app, &interview_id, model, audio_path.clone(), Some((start_ms, total_ms)),
+        &app, &interview_id, model, samples.clone(), Some((start_ms, total_ms)),
         lang.clone(), initial_prompt, device.use_gpu, budget, sink.clone(),
     )
     .await;
@@ -1946,7 +2055,7 @@ pub async fn resume_transcription(
             let merged = splice_segments(&prefix, tail, start_ms, total_ms);
             diarize_and_store(
                 &app, &db.pool, &interview_id, merged, engine, lang,
-                expected_speakers, duration_ms, audio_path,
+                expected_speakers, duration_ms, samples,
             )
             .await
         }

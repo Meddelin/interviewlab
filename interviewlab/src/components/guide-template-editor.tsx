@@ -14,6 +14,80 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { GuideTemplate, TemplateItem } from "@/lib/tauri";
 import { templateIsEmpty } from "@/lib/tauri";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    remove: "Удалить",
+    removeBlock: "Удалить блок",
+    // Preview titles
+    pHypotheses: "Гипотезы",
+    pTasks: "Задачи интервью",
+    pQualifying: "Квалифицирующие вопросы",
+    pMain: "Основная часть вопросов",
+    pHypQuestions: "Вопросы по гипотезам",
+    // Editor blocks
+    hypothesesTitle: "Гипотезы",
+    hypothesesDesc:
+      "Гипотезы для проверки. Синтез возвращает по каждой вердикт (подтверждена / частично / опровергнута / неоднозначно).",
+    addHypothesis: "Добавить гипотезу",
+    hypothesisPlaceholder: "напр. Новые аккаунты отваливаются, потому что настройка занимает слишком много времени",
+    tasksTitle: "Задачи интервью",
+    tasksDesc:
+      "Исследовательские задачи, которые должно решить это интервью. Они становятся целями синтеза (G1, G2…), по которым выравниваются findings и дифф.",
+    addTask: "Добавить задачу",
+    taskPlaceholder: "напр. Понять, что блокирует активацию",
+    qualifyingTitle: "Квалифицирующие вопросы",
+    qualifyingDesc: "Отсеивающие вопросы, чтобы убедиться, что респондент подходит под целевую аудиторию.",
+    addQualifying: "Добавить квалифицирующий вопрос",
+    qualifyingPlaceholder: "напр. Какая у вас роль в команде?",
+    mainTitle: "Основная часть вопросов",
+    mainDesc:
+      "Основные вопросы, сгруппированные в тематические блоки. Добавьте блок под каждую тему, затем добавляйте в него вопросы.",
+    themePlaceholder: (n: number) => `Тема ${n} (напр. Онбординг)`,
+    mainQuestionPlaceholder: "напр. Проведите меня по вашему первому дню",
+    addQuestion: "Добавить вопрос",
+    addBlock: "Добавить блок вопросов",
+    hypQTitle: "Вопросы по гипотезам",
+    hypQDesc: "Вопросы, нацеленные прямо на проверку гипотез выше.",
+    addHypQuestion: "Добавить вопрос по гипотезе",
+    hypQPlaceholder: "напр. Заплатили бы вы при регистрации?",
+  },
+  en: {
+    remove: "Remove",
+    removeBlock: "Remove block",
+    pHypotheses: "Hypotheses",
+    pTasks: "Interview tasks",
+    pQualifying: "Qualifying questions",
+    pMain: "Main questions",
+    pHypQuestions: "Hypothesis questions",
+    hypothesesTitle: "Hypotheses",
+    hypothesesDesc:
+      "Hypotheses to validate. The synthesis returns a verdict (confirmed / partial / refuted / inconclusive) for each.",
+    addHypothesis: "Add hypothesis",
+    hypothesisPlaceholder: "e.g. New accounts churn because setup takes too long",
+    tasksTitle: "Interview tasks",
+    tasksDesc:
+      "Research tasks this interview should solve. These become the synthesis goals (G1, G2…) the findings + diff align on.",
+    addTask: "Add task",
+    taskPlaceholder: "e.g. Understand the activation blocker",
+    qualifyingTitle: "Qualifying questions",
+    qualifyingDesc: "Screening questions to confirm the respondent fits the target.",
+    addQualifying: "Add qualifying question",
+    qualifyingPlaceholder: "e.g. What's your role on the team?",
+    mainTitle: "Main questions",
+    mainDesc:
+      "The core questions, grouped into themed blocks. Add a block per theme, then add questions inside it.",
+    themePlaceholder: (n: number) => `Theme ${n} (e.g. Onboarding)`,
+    mainQuestionPlaceholder: "e.g. Walk me through your first day",
+    addQuestion: "Add question",
+    addBlock: "Add question block",
+    hypQTitle: "Hypothesis questions",
+    hypQDesc: "Questions aimed directly at testing the hypotheses above.",
+    addHypQuestion: "Add hypothesis question",
+    hypQPlaceholder: "e.g. Would you have paid at signup?",
+  },
+};
 
 // The structured, templated-guide editor (req: "шаблонизировать гайд"). Five fixed blocks the
 // user fills by clicking "+ add": hypotheses to validate, research tasks (= the synthesis
@@ -87,6 +161,7 @@ function ItemRow({
   onChange: (v: string) => void;
   onRemove: () => void;
 }) {
+  const t = useT(STR);
   return (
     <div className="group flex items-start gap-2">
       <GripVertical className="mt-2 size-3.5 shrink-0 text-muted-foreground/30" aria-hidden />
@@ -106,7 +181,7 @@ function ItemRow({
         type="button"
         variant="ghost"
         size="icon-sm"
-        aria-label="Remove"
+        aria-label={t.remove}
         onClick={onRemove}
         className="mt-0.5 text-muted-foreground/60 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
       >
@@ -214,19 +289,20 @@ function PreviewBlock({
 }
 
 export function GuideTemplatePreview({ template }: { template: GuideTemplate }) {
+  const t = useT(STR);
   if (templateIsEmpty(template)) return null;
   const mainQuestions = template.main_blocks.flatMap((b) => b.questions);
   return (
     <div className="flex flex-col gap-3">
-      <PreviewBlock icon={FlaskConical} title="Гипотезы" items={template.hypotheses} />
-      <PreviewBlock icon={Target} title="Задачи интервью" items={template.tasks} />
-      <PreviewBlock icon={ListChecks} title="Квалифицирующие вопросы" items={template.qualifying_questions} />
+      <PreviewBlock icon={FlaskConical} title={t.pHypotheses} items={template.hypotheses} />
+      <PreviewBlock icon={Target} title={t.pTasks} items={template.tasks} />
+      <PreviewBlock icon={ListChecks} title={t.pQualifying} items={template.qualifying_questions} />
       {/* Main questions: show per themed block so the structure reads. */}
       {mainQuestions.length > 0 && (
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
             <Layers className="size-3.5 text-primary/70" aria-hidden />
-            Основная часть вопросов
+            {t.pMain}
             <span className="font-numeric text-foreground/60">{mainQuestions.length}</span>
           </div>
           <div className="flex flex-col gap-2 pl-1">
@@ -253,7 +329,7 @@ export function GuideTemplatePreview({ template }: { template: GuideTemplate }) 
           </div>
         </div>
       )}
-      <PreviewBlock icon={HelpCircle} title="Вопросы по гипотезам" items={template.hypothesis_questions} />
+      <PreviewBlock icon={HelpCircle} title={t.pHypQuestions} items={template.hypothesis_questions} />
     </div>
   );
 }
@@ -265,6 +341,7 @@ export function GuideTemplateEditor({
   template: GuideTemplate;
   onChange: (t: GuideTemplate) => void;
 }) {
+  const tx = useT(STR);
   // Seed the local row model once (and again only when the caller swaps to a different guide,
   // which it signals by remounting via a `key`). The editor owns the live state after that.
   const [state, setState] = useState<LocalState>(() => fromTemplate(template));
@@ -347,10 +424,10 @@ export function GuideTemplateEditor({
     <div className="flex flex-col gap-4">
       <Block
         icon={FlaskConical}
-        title="Гипотезы"
-        description="Hypotheses to validate. The synthesis returns a verdict (confirmed / partial / refuted / inconclusive) for each."
-        addLabel="Add hypothesis"
-        placeholder="e.g. New accounts churn because setup takes too long"
+        title={tx.hypothesesTitle}
+        description={tx.hypothesesDesc}
+        addLabel={tx.addHypothesis}
+        placeholder={tx.hypothesisPlaceholder}
         rows={state.hypotheses}
         idFor={(i) => `H${i + 1}`}
         onAdd={() => addRow("hypotheses")}
@@ -360,10 +437,10 @@ export function GuideTemplateEditor({
 
       <Block
         icon={Target}
-        title="Задачи интервью"
-        description="Research tasks this interview should solve. These become the synthesis goals (G1, G2…) the findings + diff align on."
-        addLabel="Add task"
-        placeholder="e.g. Understand the activation blocker"
+        title={tx.tasksTitle}
+        description={tx.tasksDesc}
+        addLabel={tx.addTask}
+        placeholder={tx.taskPlaceholder}
         rows={state.tasks}
         idFor={(i) => `G${i + 1}`}
         onAdd={() => addRow("tasks")}
@@ -373,10 +450,10 @@ export function GuideTemplateEditor({
 
       <Block
         icon={ListChecks}
-        title="Квалифицирующие вопросы"
-        description="Screening questions to confirm the respondent fits the target."
-        addLabel="Add qualifying question"
-        placeholder="e.g. What's your role on the team?"
+        title={tx.qualifyingTitle}
+        description={tx.qualifyingDesc}
+        addLabel={tx.addQualifying}
+        placeholder={tx.qualifyingPlaceholder}
         rows={state.qualifying}
         idFor={(i) => `Q${i + 1}`}
         onAdd={() => addRow("qualifying")}
@@ -389,11 +466,10 @@ export function GuideTemplateEditor({
         <div className="flex flex-col gap-0.5">
           <h3 className="flex items-center gap-2 text-sm font-medium text-foreground">
             <Layers className="size-4 text-primary/80" aria-hidden />
-            Основная часть вопросов
+            {tx.mainTitle}
           </h3>
           <p className="pl-6 text-xs text-muted-foreground">
-            The core questions, grouped into themed blocks. Add a block per theme, then add
-            questions inside it.
+            {tx.mainDesc}
           </p>
         </div>
 
@@ -403,14 +479,14 @@ export function GuideTemplateEditor({
               <Input
                 value={b.title}
                 onChange={(e) => changeBlockTitle(bi, e.target.value)}
-                placeholder={`Theme ${bi + 1} (e.g. Onboarding)`}
+                placeholder={tx.themePlaceholder(bi + 1)}
                 className="h-8 flex-1 text-[13px] font-medium"
               />
               <Button
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                aria-label="Remove block"
+                aria-label={tx.removeBlock}
                 onClick={() => removeBlock(bi)}
                 className="text-muted-foreground/60 hover:text-destructive"
               >
@@ -424,7 +500,7 @@ export function GuideTemplateEditor({
                     key={r.key}
                     value={r.text}
                     idLabel={`Q${mainStart(bi) + qi}`}
-                    placeholder="e.g. Walk me through your first day"
+                    placeholder={tx.mainQuestionPlaceholder}
                     onChange={(v) => changeBlockQuestion(bi, qi, v)}
                     onRemove={() => removeBlockQuestion(bi, qi)}
                   />
@@ -439,23 +515,23 @@ export function GuideTemplateEditor({
               className="w-fit"
             >
               <Plus className="size-3.5" />
-              Add question
+              {tx.addQuestion}
             </Button>
           </div>
         ))}
 
         <Button type="button" variant="secondary" size="sm" onClick={addBlock} className="w-fit">
           <Plus className="size-3.5" />
-          Add question block
+          {tx.addBlock}
         </Button>
       </section>
 
       <Block
         icon={HelpCircle}
-        title="Вопросы по гипотезам"
-        description="Questions aimed directly at testing the hypotheses above."
-        addLabel="Add hypothesis question"
-        placeholder="e.g. Would you have paid at signup?"
+        title={tx.hypQTitle}
+        description={tx.hypQDesc}
+        addLabel={tx.addHypQuestion}
+        placeholder={tx.hypQPlaceholder}
         rows={state.hypothesisQuestions}
         idFor={(i) => `Q${hypQStart + i}`}
         onAdd={() => addRow("hypothesisQuestions")}

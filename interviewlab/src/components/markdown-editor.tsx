@@ -74,6 +74,68 @@ import {
 } from "lucide-react";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    bold: "Полужирный",
+    italic: "Курсив",
+    underline: "Подчёркнутый",
+    strikethrough: "Зачёркнутый",
+    inlineCode: "Строчный код",
+    heading1: "Заголовок 1",
+    heading2: "Заголовок 2",
+    heading3: "Заголовок 3",
+    bulletedList: "Маркированный список",
+    numberedList: "Нумерованный список",
+    taskList: "Список задач",
+    blockquote: "Цитата",
+    divider: "Разделитель",
+    codeBlock: "Блок кода",
+    link: "Ссылка",
+    undo: "Отменить",
+    redo: "Повторить",
+    clearFormatting: "Очистить форматирование",
+    table: "Таблица",
+    insertTable: "Вставить таблицу",
+    rowAbove: "Строка выше",
+    rowBelow: "Строка ниже",
+    columnLeft: "Столбец слева",
+    columnRight: "Столбец справа",
+    deleteRow: "Удалить строку",
+    deleteColumn: "Удалить столбец",
+    deleteTable: "Удалить таблицу",
+  },
+  en: {
+    bold: "Bold",
+    italic: "Italic",
+    underline: "Underline",
+    strikethrough: "Strikethrough",
+    inlineCode: "Inline code",
+    heading1: "Heading 1",
+    heading2: "Heading 2",
+    heading3: "Heading 3",
+    bulletedList: "Bulleted list",
+    numberedList: "Numbered list",
+    taskList: "Task list",
+    blockquote: "Blockquote",
+    divider: "Divider",
+    codeBlock: "Code block",
+    link: "Link",
+    undo: "Undo",
+    redo: "Redo",
+    clearFormatting: "Clear formatting",
+    table: "Table",
+    insertTable: "Insert table",
+    rowAbove: "Row above",
+    rowBelow: "Row below",
+    columnLeft: "Column left",
+    columnRight: "Column right",
+    deleteRow: "Delete row",
+    deleteColumn: "Delete column",
+    deleteTable: "Delete table",
+  },
+} as const;
 
 // Plate markdown editor (M10a, reuse-landscape.md: "Синтез/markdown → Plate").
 //
@@ -375,10 +437,11 @@ function ListButton({ nodeType, title, children }: { nodeType: string; title: st
 
 // Link button — official v53 link hook (opens the floating link UI / wraps the selection).
 function LinkButton() {
+  const t = useT(STR);
   const state = useLinkToolbarButtonState();
   const { props } = useLinkToolbarButton(state);
   return (
-    <ToolbarButton active={props.pressed} onClick={props.onClick} onMouseDown={props.onMouseDown} title="Link">
+    <ToolbarButton active={props.pressed} onClick={props.onClick} onMouseDown={props.onMouseDown} title={t.link}>
       <LinkIcon />
     </ToolbarButton>
   );
@@ -387,10 +450,11 @@ function LinkButton() {
 // Divider button — HorizontalRulePlugin has no insert helper; insert the void hr node and a
 // trailing paragraph so the caret has somewhere to land after it.
 function DividerButton() {
+  const t = useT(STR);
   const editor = useEditorRef();
   return (
     <ToolbarButton
-      title="Divider"
+      title={t.divider}
       onClick={() => {
         const hrType = editor.getType(HorizontalRulePlugin.key);
         editor.tf.insertNodes(
@@ -410,6 +474,7 @@ function DividerButton() {
 // Code-block button — CodeBlockPlugin binds its toggle under tf.<key>.toggle() (key is
 // 'code_block'), same shape as the basic-node block plugins. Wraps/unwraps a fenced block.
 function CodeBlockButton() {
+  const t = useT(STR);
   const editor = useEditorRef();
   const active = useEditorSelector(
     (ed) => ed.api.some({ match: { type: ed.getType(CodeBlockPlugin.key) } }),
@@ -418,7 +483,7 @@ function CodeBlockButton() {
   return (
     <ToolbarButton
       active={active}
-      title="Code block"
+      title={t.codeBlock}
       onClick={() => (editor.tf as any)[CodeBlockPlugin.key]?.toggle()}
     >
       <Code2 />
@@ -430,6 +495,7 @@ function CodeBlockButton() {
 // be too long with six standalone buttons). Uses the v53 namespaced transforms:
 // tf.insert.table / tf.insert.tableRow|tableColumn / tf.remove.tableRow|tableColumn.
 function TableMenu() {
+  const t = useT(STR);
   const editor = useEditorRef();
   // ponytail: table transforms (tf.insert.table / tf.remove.tableRow …) exist at runtime via
   // TablePlugin but aren't on useEditorRef's base tf type — one `as any` beats per-call casts.
@@ -454,8 +520,8 @@ function TableMenu() {
       <PopoverTrigger asChild>
         <button
           type="button"
-          title="Table"
-          aria-label="Table"
+          title={t.table}
+          aria-label={t.table}
           onMouseDown={(e) => e.preventDefault()}
           className={cn(
             "flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors",
@@ -469,20 +535,20 @@ function TableMenu() {
       <PopoverContent align="start" className="w-48">
         <Item
           icon={<Plus />}
-          label="Insert table"
+          label={t.insertTable}
           onClick={() => tf.insert.table({ rowCount: 3, colCount: 3, header: true })}
         />
         {inTable && (
           <>
             <div className="my-1 h-px bg-border" />
-            <Item icon={<Rows2 />} label="Row above" onClick={() => tf.insert.tableRow({ before: true })} />
-            <Item icon={<Rows2 />} label="Row below" onClick={() => tf.insert.tableRow()} />
-            <Item icon={<Columns2 />} label="Column left" onClick={() => tf.insert.tableColumn({ before: true })} />
-            <Item icon={<Columns2 />} label="Column right" onClick={() => tf.insert.tableColumn()} />
+            <Item icon={<Rows2 />} label={t.rowAbove} onClick={() => tf.insert.tableRow({ before: true })} />
+            <Item icon={<Rows2 />} label={t.rowBelow} onClick={() => tf.insert.tableRow()} />
+            <Item icon={<Columns2 />} label={t.columnLeft} onClick={() => tf.insert.tableColumn({ before: true })} />
+            <Item icon={<Columns2 />} label={t.columnRight} onClick={() => tf.insert.tableColumn()} />
             <div className="my-1 h-px bg-border" />
-            <Item icon={<Trash2 />} label="Delete row" onClick={() => tf.remove.tableRow()} />
-            <Item icon={<Trash2 />} label="Delete column" onClick={() => tf.remove.tableColumn()} />
-            <Item icon={<Trash2 />} label="Delete table" onClick={() => tf.remove.table()} />
+            <Item icon={<Trash2 />} label={t.deleteRow} onClick={() => tf.remove.tableRow()} />
+            <Item icon={<Trash2 />} label={t.deleteColumn} onClick={() => tf.remove.tableColumn()} />
+            <Item icon={<Trash2 />} label={t.deleteTable} onClick={() => tf.remove.table()} />
           </>
         )}
       </PopoverContent>
@@ -493,6 +559,7 @@ function TableMenu() {
 // History (undo/redo) — disabled when the respective stack is empty. We read the stacks via a
 // selector so the buttons re-evaluate on each change.
 function HistoryButton({ kind }: { kind: "undo" | "redo" }) {
+  const t = useT(STR);
   const editor = useEditorRef();
   const canRun = useEditorSelector(
     (ed) => (kind === "undo" ? ed.history.undos.length > 0 : ed.history.redos.length > 0),
@@ -500,7 +567,7 @@ function HistoryButton({ kind }: { kind: "undo" | "redo" }) {
   );
   return (
     <ToolbarButton
-      title={kind === "undo" ? "Undo" : "Redo"}
+      title={kind === "undo" ? t.undo : t.redo}
       disabled={!canRun}
       onClick={() => (kind === "undo" ? editor.tf.undo() : editor.tf.redo())}
     >
@@ -511,61 +578,63 @@ function HistoryButton({ kind }: { kind: "undo" | "redo" }) {
 
 // Clear formatting — remove all marks from the selection (nice-to-have).
 function ClearFormattingButton() {
+  const t = useT(STR);
   const editor = useEditorRef();
   return (
-    <ToolbarButton title="Clear formatting" onClick={() => editor.tf.removeMarks()}>
+    <ToolbarButton title={t.clearFormatting} onClick={() => editor.tf.removeMarks()}>
       <RemoveFormatting />
     </ToolbarButton>
   );
 }
 
 function EditorToolbar() {
+  const t = useT(STR);
   // Hide the toolbar entirely in read-only mode (consumers pass readOnly).
   const readOnly = useEditorReadOnly();
   if (readOnly) return null;
   return (
     <div className="sticky top-0 z-10 flex flex-wrap items-center gap-0.5 rounded-t-lg border-b border-border bg-card/80 px-1.5 py-1 backdrop-blur-sm">
       {/* marks */}
-      <MarkButton nodeType="bold" title="Bold">
+      <MarkButton nodeType="bold" title={t.bold}>
         <Bold />
       </MarkButton>
-      <MarkButton nodeType="italic" title="Italic">
+      <MarkButton nodeType="italic" title={t.italic}>
         <Italic />
       </MarkButton>
-      <MarkButton nodeType="underline" title="Underline">
+      <MarkButton nodeType="underline" title={t.underline}>
         <Underline />
       </MarkButton>
-      <MarkButton nodeType="strikethrough" title="Strikethrough">
+      <MarkButton nodeType="strikethrough" title={t.strikethrough}>
         <Strikethrough />
       </MarkButton>
-      <MarkButton nodeType="code" title="Inline code">
+      <MarkButton nodeType="code" title={t.inlineCode}>
         <Code />
       </MarkButton>
       <ToolbarSeparator />
       {/* headings */}
-      <BlockButton pluginKey="h1" title="Heading 1">
+      <BlockButton pluginKey="h1" title={t.heading1}>
         <Heading1 />
       </BlockButton>
-      <BlockButton pluginKey="h2" title="Heading 2">
+      <BlockButton pluginKey="h2" title={t.heading2}>
         <Heading2 />
       </BlockButton>
-      <BlockButton pluginKey="h3" title="Heading 3">
+      <BlockButton pluginKey="h3" title={t.heading3}>
         <Heading3 />
       </BlockButton>
       <ToolbarSeparator />
       {/* lists + tasks */}
-      <ListButton nodeType="disc" title="Bulleted list">
+      <ListButton nodeType="disc" title={t.bulletedList}>
         <ListIcon />
       </ListButton>
-      <ListButton nodeType="decimal" title="Numbered list">
+      <ListButton nodeType="decimal" title={t.numberedList}>
         <ListOrdered />
       </ListButton>
-      <ListButton nodeType="todo" title="Task list">
+      <ListButton nodeType="todo" title={t.taskList}>
         <ListChecks />
       </ListButton>
       <ToolbarSeparator />
       {/* blocks: quote / divider / code / table */}
-      <BlockButton pluginKey="blockquote" title="Blockquote">
+      <BlockButton pluginKey="blockquote" title={t.blockquote}>
         <Quote />
       </BlockButton>
       <DividerButton />

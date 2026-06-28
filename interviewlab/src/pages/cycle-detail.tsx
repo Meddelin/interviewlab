@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
-import { Link, useLocation, useParams } from "react-router-dom";
-import { ArrowUpRight, Target } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Link,
+  useBlocker,
+  useLocation,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
+import { ArrowUpRight, ChevronRight, Target } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,6 +30,92 @@ import { InterviewsTab } from "@/components/interviews-tab";
 import { SynthesisTab } from "@/components/synthesis-tab";
 import { DiffTab } from "@/components/diff-tab";
 import { absoluteDate } from "@/lib/format";
+import { useT } from "@/lib/i18n";
+
+const STR = {
+  ru: {
+    empty: "Здесь пусто.",
+    discardConfirm: "Отменить несохранённые изменения цикла?",
+    untitledCycle: "Цикл без названия",
+    cycleSaved: "Цикл сохранён",
+    saveError: (e: string) => `Не удалось сохранить изменения. ${e}`,
+    name: "Название",
+    product: "Продукт",
+    productHint:
+      "Выберите готовый продукт из библиотеки — его контекст используется при транскрипции, очистке и синтезе.",
+    selectProduct: "Выберите продукт",
+    noProduct: "Без продукта",
+    editProduct: "Изменить продукт",
+    createProduct: "Создать продукт",
+    productPlaceholder:
+      "Продукт не привязан. Выберите его выше или напишите описание продукта прямо здесь (markdown):\n\n# Продукт\n…",
+    guide: "Гайд интервью",
+    guideHint:
+      "Выберите готовый гайд из библиотеки — синтез связывает находки с его целями.",
+    selectGuide: "Выберите гайд",
+    noGuide: "Без гайда",
+    editGuide: "Изменить гайд",
+    createGuide: "Создать гайд",
+    guidePlaceholder:
+      "Гайд не привязан. Выберите его выше или напишите гайд прямо здесь:\n\nЦели:\n- G1 …\n- G2 …",
+    goals: (n: number) => `${n} ${n === 1 ? "цель" : "целей"}`,
+    previousWave: "Предыдущая волна",
+    previousWaveHint:
+      "Необязательно. Используется позже для сравнения находок с предыдущей волной.",
+    noPreviousWave: "Без предыдущей волны",
+    created: "Создан",
+    lastUpdated: "Обновлён",
+    saving: "Сохранение…",
+    saveChanges: "Сохранить изменения",
+    breadcrumb: "Хлебные крошки",
+    cycles: "Циклы",
+    tabOverview: "Обзор",
+    tabInterviews: "Интервью",
+    tabSynthesis: "Синтез",
+    tabDiff: "Сравнение",
+  },
+  en: {
+    empty: "This is empty.",
+    discardConfirm: "Discard unsaved changes to this cycle?",
+    untitledCycle: "Untitled cycle",
+    cycleSaved: "Cycle saved",
+    saveError: (e: string) => `Couldn't save your changes. ${e}`,
+    name: "Name",
+    product: "Product",
+    productHint:
+      "Pick a reusable product from the library — its context feeds transcription, cleanup, and synthesis.",
+    selectProduct: "Select a product",
+    noProduct: "No product",
+    editProduct: "Edit product",
+    createProduct: "Create product",
+    productPlaceholder:
+      "No product linked. Either pick one above, or write an inline product description (markdown):\n\n# Product\n…",
+    guide: "Interview guide",
+    guideHint:
+      "Pick a reusable guide from the library — synthesis ties findings back to its goals.",
+    selectGuide: "Select a guide",
+    noGuide: "No guide",
+    editGuide: "Edit guide",
+    createGuide: "Create guide",
+    guidePlaceholder:
+      "No guide linked. Either pick one above, or write an inline guide:\n\nGoals:\n- G1 …\n- G2 …",
+    goals: (n: number) => `${n} goal${n === 1 ? "" : "s"}`,
+    previousWave: "Previous wave",
+    previousWaveHint:
+      "Optional. Used later to diff findings against the prior wave.",
+    noPreviousWave: "No previous wave",
+    created: "Created",
+    lastUpdated: "Last updated",
+    saving: "Saving…",
+    saveChanges: "Save changes",
+    breadcrumb: "Breadcrumb",
+    cycles: "Cycles",
+    tabOverview: "Overview",
+    tabInterviews: "Interviews",
+    tabSynthesis: "Synthesis",
+    tabDiff: "Diff",
+  },
+};
 
 // Sentinel for "no previous cycle" — radix Select forbids an empty-string item value.
 const NO_PREV = "none";
@@ -58,9 +150,10 @@ function Field({
 // markdown (headings, bullets, bold) instead of showing raw `##`/`-` text. `key` forces a
 // re-seed when the content changes (the editor seeds once on mount).
 function MarkdownPreview({ value }: { value: string }) {
+  const t = useT(STR);
   const trimmed = value.trim();
   if (!trimmed) {
-    return <p className="text-xs text-muted-foreground">This is empty.</p>;
+    return <p className="text-xs text-muted-foreground">{t.empty}</p>;
   }
   return (
     <MarkdownEditor
@@ -73,6 +166,7 @@ function MarkdownPreview({ value }: { value: string }) {
 }
 
 function OverviewTab({ cycleId }: { cycleId: string }) {
+  const t = useT(STR);
   const { data: cycle, isPending } = useCycle(cycleId);
   const { data: allCycles } = useCycles();
   const { data: guides } = useGuides();
@@ -97,6 +191,44 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
     setPrevCycleId(cycle.prev_cycle_id ?? NO_PREV);
   }, [cycle]);
 
+  // Dirty = a local buffer diverges from the loaded cycle. Compared field-by-field so a
+  // re-seed (after Save invalidates the query) clears it without extra bookkeeping.
+  const dirty = useMemo(() => {
+    if (!cycle) return false;
+    return (
+      name !== cycle.name ||
+      productDesc !== cycle.product_desc ||
+      productId !== (cycle.product_id ?? NO_PRODUCT) ||
+      guide !== cycle.guide ||
+      guideId !== (cycle.guide_id ?? NO_GUIDE) ||
+      prevCycleId !== (cycle.prev_cycle_id ?? NO_PREV)
+    );
+  }, [cycle, name, productDesc, productId, guide, guideId, prevCycleId]);
+
+  // Warn on window close/reload while there are unsaved Overview edits.
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  // Guard in-app navigation away from a dirty Overview (back, breadcrumb, Cmd+K, links).
+  // ponytail: a native confirm() matches the existing guard pattern (guides.tsx:148,
+  // cycle-chat-panel.tsx:309) — no AlertDialog plumbing needed.
+  const blocker = useBlocker(dirty);
+  useEffect(() => {
+    if (blocker.state !== "blocked") return;
+    if (window.confirm(t.discardConfirm)) {
+      blocker.proceed();
+    } else {
+      blocker.reset();
+    }
+  }, [blocker]);
+
   if (isPending || !cycle) {
     return (
       <div className="flex flex-col gap-6 pt-2">
@@ -119,22 +251,22 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
     try {
       await updateCycle.mutateAsync({
         id: cycleId,
-        name: name.trim() || "Untitled cycle",
+        name: name.trim() || t.untitledCycle,
         product_desc: productDesc,
         product_id: productId === NO_PRODUCT ? null : productId,
         guide,
         guide_id: guideId === NO_GUIDE ? null : guideId,
         prev_cycle_id: prevCycleId === NO_PREV ? null : prevCycleId,
       });
-      toast.success("Cycle saved");
+      toast.success(t.cycleSaved);
     } catch (e) {
-      toast.error(`Couldn't save your changes. ${String(e)}`);
+      toast.error(t.saveError(String(e)));
     }
   }
 
   return (
-    <div className="flex max-w-2xl flex-col gap-7 pt-2">
-      <Field label="Name">
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-7 pt-2 2xl:max-w-3xl">
+      <Field label={t.name}>
         <Input
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -142,18 +274,15 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
         />
       </Field>
 
-      <Field
-        label="Product"
-        hint="Pick a reusable product from the library — its context feeds transcription, cleanup, and synthesis."
-      >
+      <Field label={t.product} hint={t.productHint}>
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <Select value={productId} onValueChange={setProductId}>
               <SelectTrigger className="w-full max-w-xs">
-                <SelectValue placeholder="Select a product" />
+                <SelectValue placeholder={t.selectProduct} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={NO_PRODUCT}>No product</SelectItem>
+                <SelectItem value={NO_PRODUCT}>{t.noProduct}</SelectItem>
                 {(products ?? []).map((p) => (
                   <SelectItem key={p.id} value={p.id}>
                     {p.name}
@@ -163,7 +292,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
             </Select>
             <Button asChild variant="outline" size="sm">
               <Link to="/products">
-                {selectedProduct ? "Edit product" : "Create product"}
+                {selectedProduct ? t.editProduct : t.createProduct}
                 <ArrowUpRight className="size-3.5" />
               </Link>
             </Button>
@@ -180,7 +309,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
             // enough for the fallback — the rich Plate editor lives in the Products library.
             <Textarea
               className="min-h-28 leading-relaxed"
-              placeholder={"No product linked. Either pick one above, or write an inline product description (markdown):\n\n# Product\n…"}
+              placeholder={t.productPlaceholder}
               value={productDesc}
               onChange={(e) => setProductDesc(e.target.value)}
             />
@@ -188,18 +317,15 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
         </div>
       </Field>
 
-      <Field
-        label="Interview guide"
-        hint="Pick a reusable guide from the library — synthesis ties findings back to its goals."
-      >
+      <Field label={t.guide} hint={t.guideHint}>
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <Select value={guideId} onValueChange={setGuideId}>
               <SelectTrigger className="w-full max-w-xs">
-                <SelectValue placeholder="Select a guide" />
+                <SelectValue placeholder={t.selectGuide} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={NO_GUIDE}>No guide</SelectItem>
+                <SelectItem value={NO_GUIDE}>{t.noGuide}</SelectItem>
                 {(guides ?? []).map((g) => (
                   <SelectItem key={g.id} value={g.id}>
                     {g.name}
@@ -209,7 +335,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
             </Select>
             <Button asChild variant="outline" size="sm">
               <Link to="/guides">
-                {selectedGuide ? "Edit guide" : "Create guide"}
+                {selectedGuide ? t.editGuide : t.createGuide}
                 <ArrowUpRight className="size-3.5" />
               </Link>
             </Button>
@@ -230,8 +356,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
                     <div className="flex flex-col gap-1.5 border-t border-border pt-3">
                       <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                         <Target className="size-3.5" />
-                        {selectedGuide.goals.length} goal
-                        {selectedGuide.goals.length === 1 ? "" : "s"}
+                        {t.goals(selectedGuide.goals.length)}
                       </div>
                       <ul className="flex flex-col gap-1">
                         {selectedGuide.goals.map((g) => (
@@ -254,7 +379,7 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
             // enough for the fallback — the rich Plate editor lives in the Guides library.
             <Textarea
               className="min-h-28 leading-relaxed"
-              placeholder={"No guide linked. Either pick one above, or write an inline guide:\n\nGoals:\n- G1 …\n- G2 …"}
+              placeholder={t.guidePlaceholder}
               value={guide}
               onChange={(e) => setGuide(e.target.value)}
             />
@@ -264,16 +389,13 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
 
       {/* Secondary metadata — prev wave + dates read quiet, below the document. */}
       <div className="flex flex-col gap-5 border-t border-border pt-6">
-        <Field
-          label="Previous wave"
-          hint="Optional. Used later to diff findings against the prior wave."
-        >
+        <Field label={t.previousWave} hint={t.previousWaveHint}>
           <Select value={prevCycleId} onValueChange={setPrevCycleId}>
             <SelectTrigger className="w-full max-w-xs">
-              <SelectValue placeholder="No previous wave" />
+              <SelectValue placeholder={t.noPreviousWave} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={NO_PREV}>No previous wave</SelectItem>
+              <SelectItem value={NO_PREV}>{t.noPreviousWave}</SelectItem>
               {otherCycles.map((c) => (
                 <SelectItem key={c.id} value={c.id}>
                   {c.name}
@@ -285,13 +407,13 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
 
         <dl className="flex flex-wrap gap-x-10 gap-y-2 text-xs">
           <div className="flex flex-col gap-0.5">
-            <dt className="text-muted-foreground">Created</dt>
+            <dt className="text-muted-foreground">{t.created}</dt>
             <dd className="font-numeric text-foreground/80">
               {absoluteDate(cycle.created_at)}
             </dd>
           </div>
           <div className="flex flex-col gap-0.5">
-            <dt className="text-muted-foreground">Last updated</dt>
+            <dt className="text-muted-foreground">{t.lastUpdated}</dt>
             <dd className="font-numeric text-foreground/80">
               {absoluteDate(cycle.updated_at)}
             </dd>
@@ -301,22 +423,51 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
 
       <div className="flex justify-end border-t border-border pt-5">
         <Button onClick={handleSave} disabled={updateCycle.isPending} size="sm">
-          {updateCycle.isPending ? "Saving…" : "Save changes"}
+          {updateCycle.isPending ? t.saving : t.saveChanges}
         </Button>
       </div>
     </div>
   );
 }
 
+const TABS = ["overview", "interviews", "synthesis", "diff"] as const;
+
 export function CycleDetailPage() {
+  const t = useT(STR);
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { data: cycle } = useCycle(id);
 
-  // Controlled tab so a chat finding-citation (#finding-Fn) can switch to the Synthesis
-  // tab — where the synthesis tab's own effect then scrolls the finding into view (M11).
-  const [tab, setTab] = useState("overview");
+  // Active tab is mirrored in ?tab= for deep-linking. The query param is the source of
+  // truth; an unknown/missing value falls back to overview.
+  const tabParam = searchParams.get("tab") ?? "";
+  const tab = (TABS as readonly string[]).includes(tabParam)
+    ? tabParam
+    : "overview";
+
+  // Switching tabs writes ?tab= via the router; this IS a navigation, so leaving a dirty
+  // Overview is caught by that tab's own useBlocker (no separate confirm needed here).
+  const setTab = useCallback(
+    (next: string) => {
+      setSearchParams(
+        (prev) => {
+          const sp = new URLSearchParams(prev);
+          if (next === "overview") sp.delete("tab");
+          else sp.set("tab", next);
+          return sp;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // A chat finding-citation (#finding-Fn) deep-links into the Synthesis tab — where the
+  // synthesis tab's own effect then scrolls the finding into view (M11).
   useEffect(() => {
     if (location.hash.startsWith("#finding-")) setTab("synthesis");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.hash, location.key]);
 
   if (!id) return null;
@@ -325,13 +476,35 @@ export function CycleDetailPage() {
   // persist on EVERY cycle screen incl. the transcript editor. This page is now just the
   // cycle's tabs; the shell docks the panel against the whole content area.
   return (
-    <div className="flex h-full min-h-0 flex-col gap-5">
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-screen-xl flex-col gap-5 2xl:max-w-screen-2xl">
+      {/* Quiet wayfinding above the tabs: Cycles / {name}, Linear-style — no heavy H1. */}
+      <div className="flex flex-col gap-1">
+        <nav
+          aria-label={t.breadcrumb}
+          className="flex items-center gap-1 text-xs text-muted-foreground"
+        >
+          <Link
+            to="/cycles"
+            className="rounded-sm transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+          >
+            {t.cycles}
+          </Link>
+          <ChevronRight className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+          <span className="truncate text-foreground/80">
+            {cycle?.name ?? "…"}
+          </span>
+        </nav>
+        <h1 className="truncate text-sm font-medium tracking-[-0.01em] text-foreground">
+          {cycle?.name ?? " "}
+        </h1>
+      </div>
+
       <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1 gap-5">
         <TabsList variant="line" className="border-b border-border pb-0">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="interviews">Interviews</TabsTrigger>
-          <TabsTrigger value="synthesis">Synthesis</TabsTrigger>
-          <TabsTrigger value="diff">Diff</TabsTrigger>
+          <TabsTrigger value="overview">{t.tabOverview}</TabsTrigger>
+          <TabsTrigger value="interviews">{t.tabInterviews}</TabsTrigger>
+          <TabsTrigger value="synthesis">{t.tabSynthesis}</TabsTrigger>
+          <TabsTrigger value="diff">{t.tabDiff}</TabsTrigger>
         </TabsList>
         <TabsContent value="overview">
           <OverviewTab cycleId={id} />

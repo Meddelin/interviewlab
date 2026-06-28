@@ -17,23 +17,37 @@ Built with **Tauri 2** (Rust backend + React/shadcn frontend). Everything heavy 
 - 🟡 **macOS (Apple Silicon)** support is implemented in code (Metal feature, device detection, bundle config)
   but not yet run on real hardware.
 
-## Run it
+## Install from source (one command, all dependencies, GPU‑accelerated)
 
-**macOS (Apple Silicon)** — start here: **[docs/mac-run-for-agent.md](docs/mac-run-for-agent.md)** (a step‑by‑step
-guide written for an AI coding agent to set up + run, including how to tell a plugin‑folder fix from a
-source‑code fix).
+There are no prebuilt downloads — you build from source. A setup script installs **every**
+dependency (toolchain, native build tools, and the GPU toolkit) and then builds (or runs) the app.
+It auto‑detects your GPU: **CUDA** on Windows + Nvidia, **Metal** on Apple Silicon. Re‑running is safe.
 
-**Windows + NVIDIA (CUDA)** — needs CUDA Toolkit 13.3 + the build env; see
-[docs/goal-progress.md](docs/goal-progress.md) and `_e2e/gpu_dev.cmd` for the exact launcher.
-
-Generic dev (CPU):
-```bash
-cd interviewlab
-npm install
-npm run tauri dev          # add `-- --features cuda` (NVIDIA) or `-- --features metal` (Apple Silicon)
+**Windows + Nvidia (GPU/CUDA)** — in PowerShell, from the repo root:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1        # install deps + build
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Run   # install deps + run the app
 ```
+Installs (via `winget`): VS 2022 Build Tools (C++), Rust, Node, LLVM/libclang, CMake, Ninja, and the
+CUDA Toolkit. Then builds the CUDA backend (`--features cuda`). First build compiles whisper.cpp's
+CUDA kernels and takes a while.
+
+**macOS (Apple Silicon, GPU/Metal)** — in Terminal/iTerm, from the repo root:
+```bash
+bash scripts/setup-macos.sh         # install deps + build
+bash scripts/setup-macos.sh --run   # install deps + run the app
+```
+Installs Xcode Command Line Tools, Homebrew, Node, Rust, CMake, Ninja, then builds the Metal backend
+(`--features metal`; add `--coreml` for the ANE encoder, which needs full Xcode).
+
+After the build the script prints where the installer / `.app` landed. Then **download the ASR model**
+with the in‑app button and **connect your AI CLI** — see the onboarding wizard on first launch.
+
+> Manual dev build (no setup script): `cd interviewlab && npm install && npm run tauri dev -- --features cuda`
+> (Nvidia) or `--features metal` (Apple Silicon). You must already have the toolchain above.
 
 ## Layout
+- `scripts/` — one‑shot from‑source setup: `setup-windows.ps1` (CUDA) and `setup-macos.sh` (Metal).
 - `interviewlab/` — the Tauri app (`src/` React UI, `src-tauri/` Rust backend, `migrations/` SQLite schema).
 - `docs/` — design + build docs (`mac-run-for-agent.md`, `mac-build.md`, `feature-*.md`, `product-spec.md`, …).
 - `_e2e/` — the CDP driver (`cdp.mjs`) + Windows GPU launcher (`gpu_dev.cmd`) used to drive the real app over WebView2.

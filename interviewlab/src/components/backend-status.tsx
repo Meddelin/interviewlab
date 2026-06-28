@@ -5,11 +5,26 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { dbHealth } from "@/lib/tauri";
+import { useT } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const STR = {
+  ru: {
+    connecting: "Подключение…",
+    offline: "Бэкенд недоступен",
+    ok: (v: number) => `Бэкенд в порядке · схема v${v}`,
+  },
+  en: {
+    connecting: "Connecting…",
+    offline: "Backend offline",
+    ok: (v: number) => `Backend OK · schema v${v}`,
+  },
+} as const;
 
 // A quiet status dot (not a big pill). Calls `db_health` on load; in the browser
 // dev server there's no Tauri runtime so invoke rejects — expected, shown as offline.
 export function BackendStatus() {
+  const t = useT(STR);
   const { data, isPending, isError } = useQuery({
     queryKey: ["db_health"],
     queryFn: dbHealth,
@@ -17,10 +32,10 @@ export function BackendStatus() {
   });
 
   const state = isPending
-    ? { dot: "bg-status-importing motion-safe:animate-pulse", label: "Connecting…" }
+    ? { dot: "bg-status-importing motion-safe:animate-pulse", label: t.connecting }
     : isError || !data
-      ? { dot: "bg-muted-foreground/50", label: "Backend offline" }
-      : { dot: "bg-status-ready", label: `Backend OK · schema v${data.schema_version}` };
+      ? { dot: "bg-muted-foreground/50", label: t.offline }
+      : { dot: "bg-status-ready", label: t.ok(data.schema_version) };
 
   return (
     <Tooltip>

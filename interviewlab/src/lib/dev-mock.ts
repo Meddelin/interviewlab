@@ -667,12 +667,26 @@ export function mockAudioSrc(_interviewId: string): string {
 
 // dev-mock ASR catalog: in the browser preview, pretend the small "base" model is
 // already downloaded so the Transcribe button is enabled for design review.
+// Mirrors the Rust CATALOG in src-tauri/src/asr.rs (the full whisper.cpp ggml catalog) so the
+// model picker shows the same 16 models with their characteristics. downloaded=false for all
+// except "base" (pretend it's already downloaded so the Transcribe button is enabled for review).
 const mockModels: ModelInfo[] = [
-  { id: "large-v3", label: "Large v3 (best, Russian default)", file: "ggml-large-v3.bin", approx_mb: 3094, default: true, downloaded: false },
-  { id: "large-v3-turbo", label: "Large v3 Turbo (faster)", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false, downloaded: false },
-  { id: "medium", label: "Medium (lighter)", file: "ggml-medium.bin", approx_mb: 1533, default: false, downloaded: false },
-  { id: "base", label: "Base (small, for testing)", file: "ggml-base.bin", approx_mb: 148, default: false, downloaded: true },
-  { id: "tiny", label: "Tiny (smallest, for testing)", file: "ggml-tiny.bin", approx_mb: 78, default: false, downloaded: false },
+  { id: "large-v3", label: "Large v3", file: "ggml-large-v3.bin", approx_mb: 3094, default: true, downloaded: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "highest", note: "Лучшее качество, рекомендуется для русского. Тяжёлая — комфортно на GPU." },
+  { id: "large-v3-turbo", label: "Large v3 Turbo", file: "ggml-large-v3-turbo.bin", approx_mb: 1624, default: false, downloaded: false, multilingual: true, quantized: false, speed: "fast", accuracy: "high", note: "Ускоренная large-v3: заметно быстрее, качество чуть ниже флагмана. Хороший баланс." },
+  { id: "large-v3-turbo-q5_0", label: "Large v3 Turbo (q5_0)", file: "ggml-large-v3-turbo-q5_0.bin", approx_mb: 574, default: false, downloaded: false, multilingual: true, quantized: true, speed: "fast", accuracy: "high", note: "Квантованный turbo: самый компактный из топовых (~0.5 ГБ), быстрый, качество близко к turbo." },
+  { id: "large-v3-q5_0", label: "Large v3 (q5_0)", file: "ggml-large-v3-q5_0.bin", approx_mb: 1100, default: false, downloaded: false, multilingual: true, quantized: true, speed: "slow", accuracy: "highest", note: "Квантованная large-v3: ~⅓ размера при почти том же качестве, чуть медленнее на CPU." },
+  { id: "large-v2", label: "Large v2", file: "ggml-large-v2.bin", approx_mb: 3094, default: false, downloaded: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high", note: "Прошлое поколение large. Обычно лучше брать v3, но иногда стабильнее на отдельных языках." },
+  { id: "large-v2-q5_0", label: "Large v2 (q5_0)", file: "ggml-large-v2-q5_0.bin", approx_mb: 1100, default: false, downloaded: false, multilingual: true, quantized: true, speed: "slow", accuracy: "high", note: "Квантованная large-v2: компактная версия предыдущего поколения." },
+  { id: "large-v1", label: "Large v1", file: "ggml-large-v1.bin", approx_mb: 3094, default: false, downloaded: false, multilingual: true, quantized: false, speed: "slowest", accuracy: "high", note: "Самая старая large. Как правило уступает v3 — берите только для совместимости." },
+  { id: "medium", label: "Medium", file: "ggml-medium.bin", approx_mb: 1533, default: false, downloaded: false, multilingual: true, quantized: false, speed: "medium", accuracy: "good", note: "Компромисс качество/скорость для скромного железа без сильного GPU." },
+  { id: "small", label: "Small", file: "ggml-small.bin", approx_mb: 488, default: false, downloaded: false, multilingual: true, quantized: false, speed: "fast", accuracy: "basic", note: "Лёгкая модель: ок для черновика или слабой машины, заметно теряет на сложной речи." },
+  { id: "base", label: "Base", file: "ggml-base.bin", approx_mb: 148, default: false, downloaded: true, multilingual: true, quantized: false, speed: "fastest", accuracy: "basic", note: "Маленькая, для быстрых черновиков и тестов. Низкая точность на русском." },
+  { id: "tiny", label: "Tiny", file: "ggml-tiny.bin", approx_mb: 78, default: false, downloaded: false, multilingual: true, quantized: false, speed: "fastest", accuracy: "lowest", note: "Самая маленькая. Только для проверки пайплайна или очень слабых машин." },
+  { id: "medium.en", label: "Medium (English-only)", file: "ggml-medium.en.bin", approx_mb: 1533, default: false, downloaded: false, multilingual: false, quantized: false, speed: "medium", accuracy: "good", note: "Только английский: точнее на англ. речи, но НЕ подходит для русского." },
+  { id: "small.en", label: "Small (English-only)", file: "ggml-small.en.bin", approx_mb: 488, default: false, downloaded: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic", note: "Только английский, лёгкая." },
+  { id: "small.en-tdrz", label: "Small (English, tinydiarize)", file: "ggml-small.en-tdrz.bin", approx_mb: 488, default: false, downloaded: false, multilingual: false, quantized: false, speed: "fast", accuracy: "basic", note: "Только англ., со встроенными токенами смены говорящего (tinydiarize). Узкоспециальная." },
+  { id: "base.en", label: "Base (English-only)", file: "ggml-base.en.bin", approx_mb: 148, default: false, downloaded: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "basic", note: "Только английский, маленькая." },
+  { id: "tiny.en", label: "Tiny (English-only)", file: "ggml-tiny.en.bin", approx_mb: 78, default: false, downloaded: false, multilingual: false, quantized: false, speed: "fastest", accuracy: "lowest", note: "Только английский, самая маленькая." },
 ];
 
 // Transcripts the mock stored per interview (so get_transcript reflects a run).
@@ -1732,14 +1746,16 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     // --- ASR (Milestone 4) ---------------------------------------------------
 
     case "asr_device": {
-      // The browser preview can't probe a GPU; report the CPU fallback the same
-      // way a CUDA-less build would (matches Rust detect_device on a CPU build).
+      // The app now always ships with the GPU (CUDA) build, so the preview seeds a
+      // GPU-active state: an Nvidia GPU detected + used by a CUDA build.
       const info: DeviceInfo = {
-        device: "cpu",
-        use_gpu: false,
-        gpu_name: null,
-        cuda_build: false,
-        detail: "Browser preview — device probe runs only in the desktop app (CPU).",
+        device: "cuda",
+        use_gpu: true,
+        gpu_name: "NVIDIA GeForce RTX 5080",
+        cuda_build: true,
+        detail:
+          "Browser preview — an Nvidia GPU was detected and is used by this CUDA build.",
+        recommendation: "gpu_active",
       };
       return Promise.resolve(info as T);
     }
@@ -2166,6 +2182,13 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 
     case "plugin_manifest_schema": {
       return Promise.resolve(MOCK_MANIFEST_SCHEMA as T);
+    }
+
+    // ponytail: browser preview has no plugins folder; accept the writes as no-ops so
+    // the Settings form's Save/Delete don't error-toast outside Tauri.
+    case "save_plugin_manifest":
+    case "delete_plugin": {
+      return Promise.resolve(undefined as T);
     }
 
     // --- M8 cycle synthesis ----------------------------------------------------

@@ -1,4 +1,10 @@
+import { useT } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const STR = {
+  ru: { unassigned: "Без роли" },
+  en: { unassigned: "Unassigned" },
+} as const;
 
 // Quiet inline role chip (design-direction: "speaker/role tags as quiet inline chips").
 //
@@ -26,6 +32,7 @@ export function RoleChip({
   tone?: "plain" | "soft";
   className?: string;
 }) {
+  const t = useT(STR);
   if (unassigned || !color) {
     return (
       <span
@@ -38,7 +45,7 @@ export function RoleChip({
           className="size-1.5 shrink-0 rounded-full bg-muted-foreground/50"
           aria-hidden
         />
-        {label ?? "Unassigned"}
+        {label ?? t.unassigned}
       </span>
     );
   }
