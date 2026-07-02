@@ -220,6 +220,21 @@
     font-feature-settings: "tnum" 1;
     letter-spacing: 0;
   }
+
+  /* Thin indeterminate progress (task center): a sliding accent segment. Under
+     prefers-reduced-motion the global rule below freezes it to a static segment. */
+  .progress-indeterminate {
+    animation: progress-slide 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
 }
 
 /* Calm, fast motion. Honor reduced-motion: drop all animation/transition. */

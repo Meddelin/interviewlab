@@ -1,9 +1,20 @@
 import { useEffect, useState } from "react";
-import { Code2, FileText, LayoutTemplate, Plus, Target, Trash2 } from "lucide-react";
+import {
+  Code2,
+  FileText,
+  LayoutTemplate,
+  Loader2,
+  Plus,
+  Sparkles,
+  Target,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -12,18 +23,28 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { GuideTemplateEditor } from "@/components/guide-template-editor";
 import {
+  guideKeys,
   useCreateGuide,
   useDeleteGuide,
   useGuides,
   useUpdateGuide,
 } from "@/lib/guide-queries";
+import { useProducts } from "@/lib/product-queries";
 import { relativeTime } from "@/lib/format";
 import { mod } from "@/lib/platform";
 import {
   EMPTY_TEMPLATE,
+  generateGuideDraft,
   templateGoals,
   templateIsEmpty,
   type Guide,
@@ -68,6 +89,22 @@ const STR = {
       "Создайте переиспользуемый гайд интервью — его цели управляют синтезом и сохраняют диффы стабильными между волнами.",
     goals: (n: number) => `${n} ${n === 1 ? "цель" : n >= 2 && n <= 4 ? "цели" : "целей"}`,
     selectToEdit: "Выберите гайд для редактирования.",
+    generateFromProduct: "Сгенерировать из продукта",
+    genDialogTitle: "Сгенерировать черновик гайда",
+    genDialogDescription:
+      "Черновик гайда (цели, гипотезы, вопросы) по описанию продукта. Черновик можно свободно править перед использованием.",
+    genProductLabel: "Продукт",
+    genProductPlaceholder: "Выберите продукт…",
+    genNoProducts:
+      "Сначала добавьте продукт в библиотеку продуктов (Настройки → Продукты).",
+    genQuestionsLabel: "Исследовательские вопросы",
+    genQuestionsOptional: "необязательно",
+    genQuestionsPlaceholder:
+      "Что вы хотите узнать? Например: почему пользователи бросают онбординг; что мешает пригласить коллегу…",
+    generating: "Генерируем…",
+    generate: "Сгенерировать",
+    generated: (name: string) => `Черновик гайда готов: «${name}»`,
+    generateError: (e: string) => `Не удалось сгенерировать гайд. ${e}`,
   },
   en: {
     newGuide: "New guide",
@@ -104,6 +141,22 @@ const STR = {
       "Create a reusable interview guide — its goals drive synthesis and keep diffs stable across waves.",
     goals: (n: number) => `${n} goal${n === 1 ? "" : "s"}`,
     selectToEdit: "Select a guide to edit.",
+    generateFromProduct: "Generate from product",
+    genDialogTitle: "Generate a guide draft",
+    genDialogDescription:
+      "A draft guide (goals, hypotheses, questions) from a product description. Edit the draft freely before using it.",
+    genProductLabel: "Product",
+    genProductPlaceholder: "Pick a product…",
+    genNoProducts:
+      "Add a product to the products library first (Settings → Products).",
+    genQuestionsLabel: "Research questions",
+    genQuestionsOptional: "optional",
+    genQuestionsPlaceholder:
+      "What do you want to learn? E.g. why users abandon onboarding; what blocks inviting a teammate…",
+    generating: "Generating…",
+    generate: "Generate",
+    generated: (name: string) => `Guide draft ready: “${name}”`,
+    generateError: (e: string) => `Couldn't generate the guide. ${e}`,
   },
 };
 
@@ -163,6 +216,112 @@ function CreateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
             disabled={!name.trim() || createGuide.isPending}
           >
             {createGuide.isPending ? t.creating : t.create}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── Generate-guide dialog (v3 F2) ──────────────────────────────────────────────
+// "Сгенерировать из продукта": pick a product from the library, optionally describe the
+// research questions, and generateGuideDraft() stores a new draft guide (goals / hypotheses /
+// question blocks) that opens for editing on success. Backend errors arrive as readable
+// "[E-GUIDE-GEN] …" strings — surfaced verbatim in the toast.
+function GenerateGuideDialog({ onCreated }: { onCreated: (g: Guide) => void }) {
+  const [open, setOpen] = useState(false);
+  const [productId, setProductId] = useState<string>("");
+  const [questions, setQuestions] = useState("");
+  const { data: products } = useProducts();
+  const qc = useQueryClient();
+  const t = useT(STR);
+
+  const generate = useMutation({
+    mutationFn: () => generateGuideDraft(productId, questions.trim()),
+    onSuccess: () => qc.invalidateQueries({ queryKey: guideKeys.all }),
+  });
+
+  async function submit() {
+    if (!productId || generate.isPending) return;
+    try {
+      const g = await generate.mutateAsync();
+      setOpen(false);
+      setQuestions("");
+      toast.success(t.generated(g.name));
+      onCreated(g);
+    } catch (e) {
+      toast.error(t.generateError(String(e)));
+    }
+  }
+
+  const hasProducts = (products?.length ?? 0) > 0;
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => !generate.isPending && setOpen(v)}>
+      <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
+        <Sparkles className="size-3.5" />
+        {t.generateFromProduct}
+      </Button>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t.genDialogTitle}</DialogTitle>
+          <DialogDescription>{t.genDialogDescription}</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {t.genProductLabel}
+            </label>
+            {hasProducts ? (
+              <Select value={productId} onValueChange={setProductId}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder={t.genProductPlaceholder} />
+                </SelectTrigger>
+                <SelectContent>
+                  {(products ?? []).map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <p className="text-xs text-muted-foreground">{t.genNoProducts}</p>
+            )}
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-medium text-muted-foreground">
+              {t.genQuestionsLabel}{" "}
+              <span className="font-normal text-muted-foreground/60">
+                · {t.genQuestionsOptional}
+              </span>
+            </label>
+            <Textarea
+              value={questions}
+              onChange={(e) => setQuestions(e.target.value)}
+              placeholder={t.genQuestionsPlaceholder}
+              rows={4}
+              className="resize-none text-sm"
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            size="sm"
+            onClick={submit}
+            disabled={!productId || !hasProducts || generate.isPending}
+          >
+            {generate.isPending ? (
+              <>
+                <Loader2 className="size-3.5 animate-spin" />
+                {t.generating}
+              </>
+            ) : (
+              <>
+                <Sparkles className="size-3.5" />
+                {t.generate}
+              </>
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -381,7 +540,10 @@ export function GuidesPage() {
           </h1>
           <p className="text-xs text-muted-foreground">{t.subtitle}</p>
         </div>
-        <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+        <div className="flex items-center gap-2">
+          <GenerateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+          <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+        </div>
       </header>
 
       {isPending ? (
@@ -398,7 +560,10 @@ export function GuidesPage() {
             <p className="text-sm font-medium text-foreground">{t.emptyTitle}</p>
             <p className="text-xs text-muted-foreground">{t.emptyBody}</p>
           </div>
-          <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+          <div className="flex items-center gap-2">
+            <GenerateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+            <CreateGuideDialog onCreated={(g) => setSelectedId(g.id)} />
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-[260px_1fr] gap-6">

@@ -10,10 +10,11 @@
 // parameterized, each #[tauri::command] is a thin wrapper over a testable `*_db` helper.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::synthesis::{derive_goals, render_template_md, Goal, GuideTemplate};
+use crate::synthesis::{derive_goals, render_template_md, Goal, GuideTemplate, QuestionBlock, TemplateItem};
 use crate::Db;
 
 fn now_ms() -> i64 {
@@ -204,6 +205,169 @@ async fn delete_guide_db(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+// --- guide draft generation (v3 B1: "generate a guide from the product") -------
+//
+// One `guide-generate` CLI task turns a product's context + the researcher's research
+// questions into a STRUCTURED draft: goals (цели), hypotheses (гипотезы), qualifying
+// questions and per-goal question blocks. We deliberately ask the model for structured
+// JSON (not markdown) and render content_md through the SAME render_template_md /
+// normalized() path every hand-authored templated guide uses — so derive_goals reads the
+// generated guide back with IDENTICAL stable goal ids (unit-tested below). The prompt is
+// in Russian (primary audience: RU researchers), with glossary + product context injected.
+
+// The raw model output (lenient: every field defaulted; re-validated by draft_to_template).
+#[derive(Deserialize, Default, Debug)]
+struct GuideDraftOutput {
+    #[serde(default)]
+    goals: Vec<String>,
+    #[serde(default)]
+    hypotheses: Vec<String>,
+    #[serde(default)]
+    qualifying_questions: Vec<String>,
+    #[serde(default)]
+    question_blocks: Vec<DraftQuestionBlock>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+struct DraftQuestionBlock {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    questions: Vec<String>,
+}
+
+// Turn the raw draft into a NORMALIZED GuideTemplate: goals → tasks (the G1.. spine
+// derive_goals aligns on), hypotheses → H1.., all questions → the global Q counter.
+// normalized() trims + drops blanks + stamps stable ids exactly like a manual save. Pure.
+fn draft_to_template(d: &GuideDraftOutput) -> GuideTemplate {
+    let items = |texts: &[String]| -> Vec<TemplateItem> {
+        texts
+            .iter()
+            .map(|t| TemplateItem { id: String::new(), text: t.clone() })
+            .collect()
+    };
+    GuideTemplate {
+        hypotheses: items(&d.hypotheses),
+        tasks: items(&d.goals),
+        qualifying_questions: items(&d.qualifying_questions),
+        main_blocks: d
+            .question_blocks
+            .iter()
+            .map(|b| QuestionBlock { title: b.title.trim().to_string(), questions: items(&b.questions) })
+            .collect(),
+        hypothesis_questions: Vec::new(),
+    }
+    .normalized()
+}
+
+// The output JSON schema handed to the CLI so the model returns clean structured_output.
+fn draft_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["goals", "hypotheses", "question_blocks"],
+        "properties": {
+            "goals": { "type": "array", "items": { "type": "string" } },
+            "hypotheses": { "type": "array", "items": { "type": "string" } },
+            "qualifying_questions": { "type": "array", "items": { "type": "string" } },
+            "question_blocks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["title", "questions"],
+                    "properties": {
+                        "title": { "type": "string" },
+                        "questions": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            }
+        }
+    })
+}
+
+// Build the guide-generate input. Instructions in Russian (the primary audience), with the
+// product context + glossary injected so the draft speaks the product's language. Pure.
+fn build_draft_input(
+    product_name: &str,
+    product_md: &str,
+    glossary: &Value,
+    research_questions: &str,
+) -> Value {
+    let mut input = json!({
+        "task": "guide-generate",
+        "instructions": "Ты — опытный UX-исследователь. Составь ЧЕРНОВИК гайда пользовательского \
+            интервью на естественном русском языке по описанию продукта (`product`) и исследовательским \
+            вопросам заказчика (`research_questions`). Верни ТОЛЬКО JSON по схеме: \
+            `goals` — 3-5 чётких целей исследования (что должны узнать); \
+            `hypotheses` — 2-4 фальсифицируемые гипотезы: конкретное утверждение о поведении или его \
+            причине, которое интервью может ОПРОВЕРГНУТЬ («Пользователи бросают настройку, потому что \
+            не находят токен доступа»), а не пожелание и не банальность («пользователям важно удобство» — \
+            нельзя); \
+            `qualifying_questions` — 1-3 квалифицирующих вопроса (роль, опыт, контекст респондента); \
+            `question_blocks` — по ОДНОМУ тематическому блоку на каждую цель (title = тема цели, \
+            3-5 открытых вопросов в блоке). Правила для вопросов: \
+            открытые, разговорные, без наводящих формулировок и без жаргона; \
+            внутри блока — воронка: сначала контекст («Расскажите, как вы обычно…»), затем конкретный \
+            недавний эпизод («Вспомните последний раз, когда…»), затем детали и трудности; \
+            ровно ОДНА мысль на вопрос — никаких двойных вопросов («и…, и…»); \
+            вместо «почему» предпочитай «что/как/расскажите» («Что вас остановило?» лучше, чем «Почему \
+            вы не продолжили?»); \
+            про прошлый реальный опыт, а не про гипотетическое будущее («стали бы вы пользоваться…» — \
+            нельзя). \
+            Термины пиши в канонической форме из `glossary`. Не выдумывай фактов о продукте.",
+        "product": { "name": product_name, "content_md": product_md },
+        "research_questions": research_questions,
+    });
+    if glossary.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        input["glossary"] = glossary.clone();
+    }
+    input
+}
+
+// The draft guide's name: "Draft: <product name> (<date>)".
+fn draft_guide_name(product_name: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    format!("Draft: {} ({})", product_name.trim(), now.format("%Y-%m-%d"))
+}
+
+// The task to run. Prefer the dedicated `guide-generate` task; fall back to the synthesis
+// task for a plugin manifest that predates it (a user's on-disk manifest OVERRIDES the
+// bundled one — same pattern as coverage/glossary task fallbacks).
+fn draft_task_name(adapter: &crate::adapter::Adapter) -> &'static str {
+    if adapter.tasks.contains_key("guide-generate") {
+        "guide-generate"
+    } else {
+        "cycle-synthesis"
+    }
+}
+
+// The product's glossary rendered for the prompt. Best-effort: any failure → empty array
+// (generation never gates on the glossary). Raw SQL here because glossary.rs exposes
+// per-interview/per-cycle resolution only, and the draft starts from a bare product_id.
+async fn glossary_for_product_prompt(pool: &SqlitePool, product_id: &str) -> Value {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT canonical, aliases_json, notes FROM glossary_term WHERE product_id = ? \
+         ORDER BY canonical COLLATE NOCASE",
+    )
+    .bind(product_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let terms: Vec<crate::glossary::GlossaryTerm> = rows
+        .into_iter()
+        .map(|(canonical, aliases_json, notes)| crate::glossary::GlossaryTerm {
+            id: String::new(),
+            product_id: product_id.to_string(),
+            canonical,
+            aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+            notes,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    crate::glossary::render_for_prompt(&terms)
+}
+
 // --- Tauri commands (thin wrappers; stringify errors for the frontend) --------
 
 #[tauri::command]
@@ -229,6 +393,82 @@ pub async fn update_guide(db: tauri::State<'_, Db>, req: UpdateGuide) -> Result<
 #[tauri::command]
 pub async fn delete_guide(db: tauri::State<'_, Db>, id: String) -> Result<(), String> {
     delete_guide_db(&db.pool, &id).await.map_err(|e| e.to_string())
+}
+
+// Generate a guide DRAFT from a product + the researcher's research questions (v3 B1):
+// one `guide-generate` CLI call → a structured template (цели / гипотезы / вопросные
+// блоки) → a new Guide row named "Draft: <product> (<date>)" whose content_md is rendered
+// canonically (derive_goals-compatible). Returns the stored guide, ready to edit/link.
+#[tauri::command]
+pub async fn generate_guide_draft(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    product_id: String,
+    research_questions: String,
+    adapter_id: Option<String>,
+) -> Result<Guide, String> {
+    log::info!(target: "interviewlab::guides", "generate_guide_draft: product='{product_id}' (adapter override: {adapter_id:?})");
+
+    // The product grounds the draft; without one there's nothing to generate from.
+    let product: Option<(String, String)> =
+        sqlx::query_as("SELECT name, content_md FROM product WHERE id = ?")
+            .bind(&product_id)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((product_name, product_md)) = product else {
+        let msg = "продукт не найден — выберите продукт из библиотеки".to_string();
+        log::error!(target: "interviewlab::guides", "[E-GUIDE-GEN] generate_guide_draft: product='{product_id}': {msg}");
+        return Err(msg);
+    };
+
+    let glossary = glossary_for_product_prompt(&db.pool, &product_id).await;
+
+    // Resolve the adapter (explicit id → that one; else the active one).
+    let id = match adapter_id {
+        Some(id) => id,
+        None => crate::adapter::active_adapter_id(&db.pool).await?,
+    };
+    let adapter = crate::adapter::resolve_adapter_pub(&app, Some(&id))?;
+    let task = draft_task_name(&adapter);
+    let model_override = crate::adapter::task_model_override(&db.pool, "guide-generate").await;
+
+    let input = build_draft_input(&product_name, &product_md, &glossary, research_questions.trim());
+    let schema = draft_schema();
+    let value = crate::adapter::run_cli_task_model(&adapter, task, &input, Some(&schema), model_override.as_deref())
+        .await
+        .map_err(|e| {
+            log::error!(target: "interviewlab::guides", "[E-GUIDE-GEN] generate_guide_draft: product='{product_id}': CLI task failed: {e}");
+            e.to_string()
+        })?;
+    let draft: GuideDraftOutput = serde_json::from_value(value.clone()).map_err(|e| {
+        let msg = format!("guide-generate output shape invalid: {e}; got {value}");
+        log::error!(target: "interviewlab::guides", "[E-GUIDE-GEN] generate_guide_draft: product='{product_id}': {msg}");
+        msg
+    })?;
+
+    let template = draft_to_template(&draft);
+    if template.goals().is_empty() {
+        let msg = "модель не вернула ни одной цели — попробуйте уточнить исследовательские вопросы".to_string();
+        log::error!(target: "interviewlab::guides", "[E-GUIDE-GEN] generate_guide_draft: product='{product_id}': {msg}");
+        return Err(msg);
+    }
+
+    let name = draft_guide_name(&product_name, chrono::Local::now());
+    // Same write path as a manual create: content_md rendered from the template, goals from
+    // its tasks — so the generated guide is byte-compatible with everything downstream.
+    let guide = create_guide_db(&db.pool, &CreateGuide { name, content_md: String::new(), template })
+        .await
+        .map_err(|e| {
+            log::error!(target: "interviewlab::guides", "[E-GUIDE-GEN] generate_guide_draft: product='{product_id}': storing the draft failed: {e}");
+            e.to_string()
+        })?;
+    log::info!(
+        target: "interviewlab::guides",
+        "generate_guide_draft: product='{product_id}': DONE — guide '{}' with {} goal(s)",
+        guide.id, guide.goals.len()
+    );
+    Ok(guide)
 }
 
 #[cfg(test)]
@@ -299,6 +539,71 @@ mod tests {
         assert!(guide_id.is_none(), "guide_id cleared on delete");
         assert_eq!(inline, "inline text", "inline guide text preserved for back-compat");
         assert_eq!(list_guides_db(&pool).await.unwrap().len(), 0);
+    }
+
+    // CRITICAL (v3 B1): the generated draft's markdown must be byte-compatible with the
+    // app's goal derivation — derive_goals over the rendered content_md must read back the
+    // template's tasks with IDENTICAL stable ids. Exercises the exact write path the
+    // command uses (draft_to_template → create_guide_db) on a canned model output.
+    #[tokio::test]
+    async fn generated_draft_roundtrips_through_derive_goals() {
+        let draft = GuideDraftOutput {
+            goals: vec![
+                "Понять, почему новые аккаунты не доходят до первой воронки.".into(),
+                "  Выяснить, какой шаг онбординга путает сильнее всего.  ".into(),
+                "".into(), // blank → dropped by normalized()
+            ],
+            hypotheses: vec!["Пользователи стопорятся на подключении источника данных.".into()],
+            qualifying_questions: vec!["Какая у вас роль и как давно пользуетесь продуктом?".into()],
+            question_blocks: vec![DraftQuestionBlock {
+                title: "Онбординг".into(),
+                questions: vec![
+                    "Расскажите про вашу первую сессию после регистрации.".into(),
+                    "Где вы застряли и что сделали дальше?".into(),
+                ],
+            }],
+        };
+        let template = draft_to_template(&draft);
+
+        // Pure check: derive_goals(render_template_md(template)) == template.goals().
+        let md = render_template_md(&template);
+        let derived = derive_goals(&md);
+        assert_eq!(derived, template.goals(), "derive_goals reads back identical goal ids/texts");
+        assert_eq!(derived.len(), 2, "blank goal dropped, two remain");
+        assert_eq!(derived[0].id, "G1");
+        assert_eq!(derived[1].id, "G2");
+        assert_eq!(derived[1].text, "Выяснить, какой шаг онбординга путает сильнее всего.");
+
+        // Full write path: the stored guide carries the same goals + the rendered markdown.
+        let pool = test_pool().await;
+        let name = draft_guide_name("Acme Analytics", chrono::Local::now());
+        assert!(name.starts_with("Draft: Acme Analytics ("), "name is 'Draft: <product> (<date>)'");
+        let g = create_guide_db(&pool, &CreateGuide { name, content_md: String::new(), template: template.clone() })
+            .await
+            .unwrap();
+        assert_eq!(g.goals, template.goals(), "stored guide's goals match the template spine");
+        assert_eq!(g.content_md, md, "content_md rendered canonically from the template");
+        assert_eq!(derive_goals(&g.content_md), g.goals, "derivation over the STORED markdown agrees");
+        // The hypotheses + question ids survive the normalized stamping.
+        assert_eq!(g.template.hypotheses[0].id, "H1");
+        assert_eq!(g.template.qualifying_questions[0].id, "Q1");
+        assert_eq!(g.template.main_blocks[0].questions[0].id, "Q2");
+    }
+
+    // The draft input pack: RU instructions + product + research questions + glossary
+    // (omitted when empty) — and a fully-empty model output yields an empty template.
+    #[test]
+    fn draft_input_and_empty_output_shapes() {
+        let glossary = serde_json::json!([{ "canonical": "API" }]);
+        let input = build_draft_input("Acme", "# Acme\nproduct md", &glossary, "Почему падает активация?");
+        assert_eq!(input["product"]["name"], "Acme");
+        assert_eq!(input["research_questions"], "Почему падает активация?");
+        assert_eq!(input["glossary"][0]["canonical"], "API");
+        let no_gloss = build_draft_input("Acme", "", &serde_json::json!([]), "q");
+        assert!(no_gloss.get("glossary").is_none(), "empty glossary omitted");
+
+        let empty = draft_to_template(&GuideDraftOutput::default());
+        assert!(empty.is_empty(), "empty model output → empty template (command rejects it)");
     }
 
     // The 0002 data-migration: a pre-existing cycle with inline guide text gets a guide

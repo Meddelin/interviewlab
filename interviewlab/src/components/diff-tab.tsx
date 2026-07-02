@@ -88,6 +88,10 @@ const STR = {
       prev ? `У волны «${prev}» ещё нет синтеза` : "У предыдущей волны ещё нет синтеза",
     preNoPrevSynthBody:
       "Дифф сравнивает два синтеза. Откройте предыдущую волну и запустите её синтез, затем вернитесь сюда.",
+    confidenceWord: "уверенность",
+    confHigh: "высокая",
+    confMedium: "средняя",
+    confLow: "низкая",
   },
   en: {
     copied: "Copied to clipboard",
@@ -141,8 +145,27 @@ const STR = {
       prev ? `${prev} has no synthesis yet` : "The previous wave has no synthesis yet",
     preNoPrevSynthBody:
       "The diff compares two syntheses. Open the previous wave and run its synthesis first, then return here.",
+    confidenceWord: "confidence",
+    confHigh: "high",
+    confMedium: "medium",
+    confLow: "low",
   },
 };
+
+// Confidence value → localized label ("—" for absent). Used by the on-screen shift line
+// and the markdown projection alike.
+function confidenceLabel(
+  t: (typeof STR)["ru"],
+  v: string | null | undefined,
+): string {
+  if (!v) return "—";
+  const map: Record<string, string> = {
+    high: t.confHigh,
+    medium: t.confMedium,
+    low: t.confLow,
+  };
+  return map[v.toLowerCase()] ?? v;
+}
 
 // Russian plural helper (1 / 2-4 / 5+), used in diff-complete toast.
 function plural(n: number, one: string, few: string, many: string): string {
@@ -202,7 +225,12 @@ function renderDiffMarkdown(doc: DiffDoc): string {
       continue;
     }
     for (const e of entries) {
-      lines.push(`- [${e.status}] ${e.statement}`);
+      // Include the prev→current confidence shift when the doc carries it (older rows don't).
+      const conf =
+        e.confidence || e.prev_confidence
+          ? ` (${s.confidenceWord}: ${confidenceLabel(s, e.prev_confidence)} → ${confidenceLabel(s, e.confidence)})`
+          : "";
+      lines.push(`- [${e.status}] ${e.statement}${conf}`);
       if (e.why) lines.push(`  - ${e.why}`);
     }
     lines.push("");
@@ -338,8 +366,11 @@ function StatusBadge({ status }: { status: DiffStatus }) {
   );
 }
 
-// One diff entry row: status badge + statement + the `why` rationale beneath.
+// One diff entry row: status badge + statement, the prev→current confidence shift when
+// the doc carries it (mirrors the hypotheses' verdict arrow), and the `why` beneath.
 function DiffEntryRow({ entry }: { entry: DiffEntry }) {
+  const t = useT(STR);
+  const hasConfidence = !!(entry.confidence || entry.prev_confidence);
   return (
     <div className="flex flex-col gap-1.5 border-l border-border pl-3">
       <div className="flex items-start justify-between gap-3">
@@ -350,6 +381,25 @@ function DiffEntryRow({ entry }: { entry: DiffEntry }) {
           <StatusBadge status={entry.status} />
         </div>
       </div>
+      {hasConfidence && (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="text-muted-foreground/70">{t.confidenceWord}:</span>
+          <span className={cn(!entry.prev_confidence && "text-muted-foreground/50")}>
+            {confidenceLabel(t, entry.prev_confidence)}
+          </span>
+          <ArrowRightLeft
+            className="size-3 text-muted-foreground/50"
+            aria-hidden="true"
+          />
+          <span
+            className={cn(
+              entry.confidence ? "text-foreground/80" : "text-muted-foreground/50",
+            )}
+          >
+            {confidenceLabel(t, entry.confidence)}
+          </span>
+        </p>
+      )}
       {entry.why && (
         <p className="text-xs leading-relaxed text-muted-foreground">
           {entry.why}

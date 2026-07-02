@@ -55,14 +55,21 @@ use crate::Db;
 // Tauri event the Diff tab subscribes to for progress (single-stage: diffing → done).
 pub const DIFF_PROGRESS_EVENT: &str = "diff://progress";
 
-// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / glossary.rs / diff.rs so it
+// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / diff.rs / coverage.rs so it
 // can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
-// константой во все стадии"). Do NOT diverge the wording per file.
+// константой во все стадии"). Do NOT diverge the wording across these files. (glossary.rs carries
+// the previous wording — owned by a parallel change; re-align it when hoisting.)
 const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
-    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Output language = the language of the interview (for Russian interviews — Russian; mirror \
+    the interview's language otherwise); do NOT translate terms the speaker used.\n\
+    - Own prose (findings, summaries, notes — never transcript text or quotes) must read as \
+    natural, professional Russian, not translationese: no канцелярит («имеет место непонимание» → \
+    «пользователи не понимают»); state conclusions as assertions, not as «было выявлено, что…».\n\
     - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
     better than guessing.\n\
-    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Terminology: in your own prose use the canonical spellings from the glossary; a Latin \
+    original, its Cyrillic transliteration, and declined forms are the SAME term \
+    (фича = feature, «в Слаке» = Slack). Quotes copied from the transcript stay verbatim.\n\
     - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
     numbers, and NO markdown headings inside string fields of the JSON.";
 
@@ -269,6 +276,12 @@ impl DiffStatus {
 
 // One validated diff entry (§7.3.3 shape). `finding_id` resolves into the current
 // synthesis, `prev_finding_id` into the previous — present only where the status implies.
+//
+// `confidence` / `prev_confidence` are the referenced findings' confidence labels resolved AT
+// WRITE TIME (from the two syntheses, by the resolved refs) so the stored diff_json is
+// SELF-CONTAINED for exports — the HTML wave report renders prev→current confidence without
+// re-reading either synthesis. None when that side has no resolving ref (new/dropped). Older
+// stored rows deserialize with None (serde default).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DiffEntry {
     pub status: DiffStatus,
@@ -277,6 +290,10 @@ pub struct DiffEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_finding_id: Option<String>,
     pub statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_confidence: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
 }
@@ -469,14 +486,19 @@ fn build_diff_input(
         "system": crate::synthesis::analysis_system_prompt(),
         "rules": UNIFIED_LLM_RULES,
         "instructions": "You are comparing two research waves at the level of CONCLUSIONS — \
-            this is a FINDINGS-LEVEL diff, NOT a text diff. \
+            this is a FINDINGS-LEVEL diff, NOT a text diff: never match findings by surface \
+            wording or string similarity — two differently-phrased statements of the same \
+            conclusion are the SAME finding, and similar wording about different causes is NOT. \
             (A) For EACH goal, align the current wave's findings with the previous wave's findings \
             BY MEANING (same underlying conclusion = a match, even if worded differently), then \
             classify each as: `new` (a conclusion present this wave with no match last wave), \
             `changed` (the same conclusion as a previous finding but with a shift in confidence, \
-            root cause, or recommendation), `dropped` (a previous conclusion with no match this \
+            root cause, scope, or recommendation), `dropped` (a previous conclusion with no match this \
             wave), or `unchanged` (the same conclusion with no material shift). Give every entry a \
-            short `why`; for `changed`, say WHAT shifted. Reference findings by id: set `finding_id` \
+            `why` — ONE crisp sentence in the findings' language (Russian for Russian findings) \
+            naming exactly WHAT shifted: «уверенность выросла low→high», «формулировка сузилась до \
+            новичков», «причина уточнена: не хватает прав на источник», «рекомендация сменилась». \
+            Never restate the finding itself as the `why`. Reference findings by id: set `finding_id` \
             to the CURRENT finding's id (leave \"\" for `dropped`) and `prev_finding_id` to the \
             PREVIOUS finding's id (leave \"\" for `new`); these ids are kept as clickable deep-links \
             back to the synthesis cards, so they MUST be real ids from the inputs (the evidence \
@@ -487,7 +509,8 @@ fn build_diff_input(
             labels themselves are fixed; you only explain the change. \
             When a `glossary` is provided, use its canonical spellings for any term in your prose. \
             Use ONLY the goal_ids / finding ids / hypothesis ids provided. End with a one-line \
-            `summary` of what changed this wave. Return ONLY JSON matching the schema.",
+            `summary` of what changed this wave — plain language, in the findings' language, naming \
+            the biggest shifts first. Return ONLY JSON matching the schema.",
         "goals": goals,
         "current_findings": current,
         "previous_findings": previous,
@@ -518,6 +541,8 @@ fn assemble_diff(
     let prev_ids: HashSet<&str> = previous.iter().map(|f| f.id.as_str()).collect();
     let current_stmt = |id: &str| current.iter().find(|f| f.id == id).map(|f| f.statement.clone());
     let prev_stmt = |id: &str| previous.iter().find(|f| f.id == id).map(|f| f.statement.clone());
+    let current_conf = |id: &str| current.iter().find(|f| f.id == id).map(|f| f.confidence.clone());
+    let prev_conf = |id: &str| previous.iter().find(|f| f.id == id).map(|f| f.confidence.clone());
 
     let mut by_goal: Vec<GoalDiff> = Vec::new();
 
@@ -582,11 +607,18 @@ fn assemble_diff(
                 continue; // nothing to show
             }
 
+            // Confidence labels resolved from the referenced findings AT WRITE TIME so the
+            // stored doc is export-ready (see DiffEntry).
+            let confidence = finding_id.as_deref().and_then(current_conf);
+            let prev_confidence = prev_finding_id.as_deref().and_then(prev_conf);
+
             entries.push(DiffEntry {
                 status,
                 finding_id,
                 prev_finding_id,
                 statement,
+                confidence,
+                prev_confidence,
                 why: ch.why.trim().to_string(),
             });
         }
@@ -733,6 +765,25 @@ async fn store_diff_db(
         .map_err(|e| e.to_string())?;
         Ok(id)
     }
+}
+
+// The latest diff's one-line `summary` for a cycle (the wave-over-wave delta of THAT cycle vs
+// its own predecessor). pub(crate) so synthesis.rs can carry it into the NEXT wave's REDUCE
+// prompt (cumulative synthesis) without re-parsing the whole DiffDoc. Best-effort: any DB /
+// parse failure or a blank summary yields None (the continuity block just omits it).
+pub(crate) async fn latest_diff_summary_db(pool: &SqlitePool, cycle_id: &str) -> Option<String> {
+    let diff_json: Option<String> = sqlx::query_scalar(
+        "SELECT diff_json FROM diff WHERE cycle_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(cycle_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    diff_json
+        .and_then(|j| serde_json::from_str::<DiffDoc>(&j).ok())
+        .map(|d| d.summary.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 async fn get_diff_db(pool: &SqlitePool, cycle_id: &str) -> Result<Option<DiffRow>, String> {
@@ -1044,24 +1095,31 @@ mod tests {
         assert_eq!(doc.by_goal[1].goal_id, "G2");
         assert_eq!(doc.by_goal[2].goal_id, "G3");
 
-        // G1: changed, both refs resolve.
+        // G1: changed, both refs resolve; prev/current confidence resolved at write time so the
+        // stored diff_json is self-contained for the HTML export.
         let g1 = &doc.by_goal[0].entries[0];
         assert_eq!(g1.status, DiffStatus::Changed);
         assert_eq!(g1.finding_id.as_deref(), Some("F1"));
         assert_eq!(g1.prev_finding_id.as_deref(), Some("pF1"));
+        assert_eq!(g1.confidence.as_deref(), Some("high"), "current confidence from F1");
+        assert_eq!(g1.prev_confidence.as_deref(), Some("low"), "previous confidence from pF1");
         assert!(g1.why.contains("Confidence"));
 
-        // G2: new, only current ref.
+        // G2: new, only current ref (+ only current confidence).
         let g2 = &doc.by_goal[1].entries[0];
         assert_eq!(g2.status, DiffStatus::New);
         assert_eq!(g2.finding_id.as_deref(), Some("F2"));
         assert!(g2.prev_finding_id.is_none());
+        assert_eq!(g2.confidence.as_deref(), Some("medium"));
+        assert!(g2.prev_confidence.is_none());
 
-        // G3: dropped, only previous ref.
+        // G3: dropped, only previous ref (+ only previous confidence).
         let g3 = &doc.by_goal[2].entries[0];
         assert_eq!(g3.status, DiffStatus::Dropped);
         assert!(g3.finding_id.is_none());
         assert_eq!(g3.prev_finding_id.as_deref(), Some("pF3"));
+        assert!(g3.confidence.is_none());
+        assert_eq!(g3.prev_confidence.as_deref(), Some("high"));
 
         assert!(doc.summary.starts_with("Net:"));
         // Goals carried for the UI.
@@ -1227,6 +1285,11 @@ mod tests {
             .fetch_one(&pool).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(get_diff_db(&pool, "cur").await.unwrap().unwrap().doc.summary, "v2");
+
+        // latest_diff_summary_db surfaces the stored summary (for the NEXT wave's cumulative
+        // reduce context) and reads None for a cycle with no diff.
+        assert_eq!(latest_diff_summary_db(&pool, "cur").await.as_deref(), Some("v2"));
+        assert!(latest_diff_summary_db(&pool, "prev").await.is_none());
     }
 
     #[tokio::test]

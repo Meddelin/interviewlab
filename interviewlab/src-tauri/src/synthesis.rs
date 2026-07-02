@@ -486,10 +486,15 @@ pub fn analysis_system_prompt() -> &'static str {
      5. EVIDENCE: weight RESPONDENT statements over interviewer prompts. Quote VERBATIM, in the \
         original language — never translate or paraphrase a quote — and cite the segment_id it \
         came from. Prefer a few strong quotes over many weak ones.\n\
-     5a. OUTPUT LANGUAGE: write EVERY piece of prose you author — point summaries, question \
+     5a. OUTPUT LANGUAGE & STYLE: write EVERY piece of prose you author — point summaries, question \
         answers, hypothesis rationales/notes, findings, recommendations, the executive summary — \
         in the SAME language as the interview transcript and the guide. If the interview is in \
-        Russian, answer in Russian; do NOT translate your analysis into English. Only the field \
+        Russian, write natural, professional Russian; do NOT translate your analysis into English \
+        and never produce calqued/translationese constructions. No канцелярит: «пользователи не \
+        понимают шаг», not «имеет место непонимание шага». State findings as assertions, not \
+        retellings: «Пользователи бросают настройку на подключении источника», not «Было выявлено, \
+        что…». Keep glossary terms in their canonical spelling; never translate a term the \
+        respondent said in English. Only the field \
         names / enum values stay in English (the schema); everything you write for a human reads \
         in the source language.\n\
      6. BE HONEST ABOUT GAPS. Do not invent findings, do not overstate confidence, and do not \
@@ -856,6 +861,12 @@ pub struct SynthesisRow {
     pub content_md: String,
     pub model_meta: Option<String>,
     pub created_at: i64,
+    // True when the user saved content_md AFTER the last machine synthesis run — the editable
+    // markdown has DIVERGED from the machine findings_json that the diff/chat read (v3 P0: the
+    // user must see that machine consumers don't see their edits). Derived from an `md_edited`
+    // marker inside model_meta (set by save_cycle_markdown_db, cleared because run_synthesis
+    // writes a fresh marker-less model_meta) — model_meta is free-form TEXT, so no migration.
+    pub edited_diverged: bool,
 }
 
 // --- output JSON schemas handed to the CLI (--json-schema → structured_output) -
@@ -1051,11 +1062,15 @@ fn reduce_schema() -> Value {
 // in a later refactor pass (req: "вставь одинаковый текст … НЕ создавай общий модуль").
 const STAGE_RULES: &str = " \
     Unified rules (apply to every stage): \
-    (a) OUTPUT LANGUAGE = the language of the interview; do NOT translate terms. \
+    (a) OUTPUT LANGUAGE = the language of the interview; do NOT translate terms the speaker used. \
+    Your own prose (points, answers, notes, findings — never quotes) reads as natural, professional \
+    Russian for Russian interviews: no translationese, no канцелярит («имеет место непонимание» → \
+    «пользователи не понимают»), assertions instead of «было выявлено, что…». \
     (b) ANTI-HALLUCINATION: never invent names, numbers, or quotes; \"not established / no answer\" \
     is better than guessing. \
     (c) TERMINOLOGY: use the canonical spellings from the `glossary` (when provided) — both in your \
-    prose and inside quotes. \
+    prose and inside quotes; a Latin original, its Cyrillic transliteration, and declined forms are \
+    the SAME term (фича = feature, «в Слаке» = Slack). \
     (d) ARTIFACT STYLE: neutral analytical tone, no filler, one consistent format for quotes and \
     numbers, and NO markdown headings inside string JSON fields.";
 
@@ -1072,16 +1087,22 @@ fn build_extract_input(
         "task": "cycle-synthesis-extract",
         "system": analysis_system_prompt(),
         "instructions": format!("You are summarizing ONE user-research interview, structured by the guide. \
-            (1) For EACH goal, extract the concrete, goal-relevant `points` THIS interview supports, each with \
-            short VERBATIM quotes (original language — never translate) + the `segment_id`. \
+            (1) For EACH goal, extract the concrete, goal-relevant `points` THIS interview supports. Write \
+            each point as a grounded assertion about this respondent («не понимает, чем тарифы отличаются», \
+            not «обсуждались тарифы»), each with short VERBATIM quotes + the `segment_id`. Copy quotes \
+            word-for-word from the transcript — original language, the speaker's own word choice, fillers and \
+            all; never translate, paraphrase, or tidy a quote. \
             (2) For EVERY guide question in `questions`, output a `question_answers` entry: set `status` to \
             `direct` (asked & answered), `indirect` (answered while discussing something else — credit it even \
             if never asked verbatim), or `not_answered`; give a one-to-two sentence `summary` (empty when \
             not_answered) and the supporting `quotes`. Do not skip any question. \
             (3) For EVERY hypothesis in `hypotheses`, output a `hypothesis_signals` entry: `stance` is \
             `supports`, `contradicts`, `mixed`, or `neutral` (neutral = this interview says nothing about it), \
-            with a short `note` + quotes. \
-            (4) ALSO list any `notable` quotes or surprises (each with `segment_id`, `quote`, one-line `note`). \
+            with a short `note` + quotes. Ground stances in what the respondent volunteered; a bare «да» to a \
+            leading interviewer question is weak evidence — prefer `neutral`/`mixed` over `supports` for it. \
+            (4) ALSO list any `notable` quotes or surprises (each with `segment_id`, `quote`, one-line \
+            `note`) — неожиданные находки: things the guide never asked about but a researcher would care \
+            about (workarounds, emotions, unexpected comparisons, feature requests). \
             Use `guide` (the full guide markdown) to understand the INTENT behind each goal/question — why it \
             is asked and what target conclusions it expects — not only the structured list. \
             Weight RESPONDENT statements over interviewer prompts. Use ONLY the goal_ids / question_id / \
@@ -1113,8 +1134,9 @@ fn build_reduce_input(
     hypotheses: &[TemplateItem],
     questions: &[GuideQuestion],
     extractions: &[InterviewExtraction],
-    // Compact summary of the PREVIOUS wave's synthesis (executive_summary + findings by goal_id),
-    // or Value::Null when this is the first wave / no prev synthesis exists.
+    // Compact summary of the PREVIOUS wave's synthesis (executive_summary + findings by goal_id
+    // + its diff summary when present), capped — or Value::Null when this is the first wave /
+    // no prev synthesis exists. See prev_wave_block.
     prev_wave: &Value,
 ) -> Value {
     let mut input = json!({
@@ -1131,11 +1153,23 @@ fn build_reduce_input(
             (`answered`|`partially`|`not_answered`), a consolidated `answer` across interviews (note when it was \
             answered only indirectly), and `evidence`. Do not skip any question. \
             (4) cross-interview FINDINGS — each bound to one `goal_id`, with a `statement`, `confidence`, \
-            `support_count`, `evidence`, and a short `recommendation`; \
+            `support_count`, `evidence`, and a short `recommendation`. MERGE points that state the same \
+            conclusion in different words into ONE finding (count all its interviews in `support_count`); do \
+            not pad the list with near-duplicates. When interviews CONTRADICT each other, do NOT average the \
+            difference away — name the split and who diverges when the data shows it («расходятся: новички X, \
+            опытные — Y»), or surface it as an open question. Confidence criteria: `high` = several \
+            INDEPENDENT respondents/episodes agree unprompted; `medium` = a couple of respondents or \
+            consistent indirect evidence; `low` = a single mention, or an answer elicited by a leading \
+            question. Write each `statement` as an assertive conclusion, never as пересказ («Было выявлено, \
+            что…»). \
             (5) `open_questions` the wave did not resolve; and (6) an optional `by_role` breakdown per goal. \
-            If `previous_wave` is present, treat it ONLY as continuity context — confirm, extend, or revise \
-            it based on THIS wave's evidence; do NOT copy it, and never cite the previous wave as evidence \
-            for THIS wave's findings. \
+            If `previous_wave` is present (the prior wave's executive summary, findings, and — when \
+            available — its own wave-over-wave diff summary), BUILD ON it: explicitly note where THIS \
+            wave CONFIRMS or CONTRADICTS a prior finding (say so in the finding's statement or the \
+            executive summary), extend or revise prior conclusions based on THIS wave's evidence, and \
+            do NOT restate an unchanged prior finding verbatim — the diff stage reports what stayed \
+            the same. Never copy it, and never cite the previous wave as evidence for THIS wave's \
+            findings. \
             Use ONLY the goal_ids / hypothesis_id / question_id provided. Return ONLY JSON matching the schema.{STAGE_RULES}"),
         "product_desc": product_desc,
         "guide": guide,
@@ -1157,22 +1191,61 @@ fn build_reduce_input(
     input
 }
 
+// Hard cap (chars) on the SERIALIZED previous-wave continuity block. The reduce prompt already
+// carries every interview's extraction; the continuity context is a MEMO, not a second corpus —
+// the cap keeps a chatty prior wave from eating the stdin/prompt budget (10MB hard limit, but
+// every KB of prompt is also latency + attention).
+const PREV_WAVE_MAX_CHARS: usize = 4000;
+
+// Truncate a string to at most `max` CHARS (never bytes — Cyrillic is multi-byte and a byte
+// slice would panic mid-char). Pure.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
 // Build the COMPACT previous-wave continuity block from the prior wave's stored synthesis doc:
 // its executive summary + findings reduced to {goal_id, statement, confidence} (we drop evidence
-// quotes — those belong to the PREVIOUS wave's interviews and must never be cited for THIS wave).
-// Returns Value::Null when there's nothing worth carrying (no summary + no findings). Pure.
-fn prev_wave_block(prev: &SynthesisDoc) -> Value {
+// quotes — those belong to the PREVIOUS wave's interviews and must never be cited for THIS wave)
+// + the prior wave's own diff `summary` when one exists (what changed INTO that wave — the
+// trajectory signal). Capped at PREV_WAVE_MAX_CHARS serialized: the summaries are pre-truncated
+// and trailing findings are dropped until the block fits (the executive/diff summaries are the
+// strongest continuity signal; the findings list is the bulk). Returns Value::Null when there's
+// nothing worth carrying. Pure.
+fn prev_wave_block(prev: &SynthesisDoc, prev_diff_summary: &str) -> Value {
+    let summary = truncate_chars(prev.executive_summary.trim(), PREV_WAVE_MAX_CHARS / 2);
+    let diff_summary = truncate_chars(prev_diff_summary.trim(), PREV_WAVE_MAX_CHARS / 4);
     let findings: Vec<Value> = prev
         .findings
         .iter()
         .filter(|f| !f.statement.trim().is_empty())
         .map(|f| json!({ "goal_id": f.goal_id, "statement": f.statement.trim(), "confidence": f.confidence }))
         .collect();
-    let summary = prev.executive_summary.trim();
-    if summary.is_empty() && findings.is_empty() {
+    if summary.is_empty() && findings.is_empty() && diff_summary.is_empty() {
         return Value::Null;
     }
-    json!({ "executive_summary": summary, "findings": findings })
+    let mut block = json!({ "executive_summary": summary, "findings": findings });
+    if !diff_summary.is_empty() {
+        block["diff_summary"] = json!(diff_summary);
+    }
+    // Drop trailing findings until the serialized block fits the budget. The pre-truncated
+    // summaries alone always fit (half + quarter of the budget), so this terminates.
+    loop {
+        let len = serde_json::to_string(&block).map(|s| s.chars().count()).unwrap_or(0);
+        if len <= PREV_WAVE_MAX_CHARS {
+            break;
+        }
+        match block["findings"].as_array_mut() {
+            Some(arr) if !arr.is_empty() => {
+                arr.pop();
+            }
+            _ => break,
+        }
+    }
+    block
 }
 
 // --- assembly / invariant enforcement (the heart of M8, pure + unit-tested) ---
@@ -1951,8 +2024,9 @@ async fn gather_interview(
 
 // The compact previous-wave continuity block for a cycle, or Value::Null when there's no prior
 // wave to carry. Resolves cycle.prev_cycle_id (same column diff.rs aligns waves on) → the prev
-// cycle's stored synthesis (get_synthesis_db) → prev_wave_block. Best-effort: any DB error / a
-// missing prev synthesis just yields Null so synthesis runs exactly as a first wave.
+// cycle's stored synthesis (get_synthesis_db) + its own diff summary (what changed INTO that
+// wave) → prev_wave_block. Best-effort: any DB error / a missing prev synthesis just yields
+// Null so synthesis runs exactly as a first wave.
 async fn prev_wave_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Value {
     let prev_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT prev_cycle_id FROM cycle WHERE id = ?",
@@ -1968,7 +2042,12 @@ async fn prev_wave_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Value {
         return Value::Null;
     };
     match get_synthesis_db(pool, &prev_id).await {
-        Ok(Some(row)) => prev_wave_block(&row.doc),
+        Ok(Some(row)) => {
+            let diff_summary = crate::diff::latest_diff_summary_db(pool, &prev_id)
+                .await
+                .unwrap_or_default();
+            prev_wave_block(&row.doc, &diff_summary)
+        }
         _ => Value::Null,
     }
 }
@@ -2035,19 +2114,45 @@ async fn store_cycle_synthesis_db(
     }
 }
 
+// Whether a stored model_meta carries the `md_edited` marker (see SynthesisRow.edited_diverged).
+// Lenient: a missing / non-JSON / marker-less meta reads as NOT diverged. Pure.
+fn meta_md_edited(model_meta: Option<&str>) -> bool {
+    model_meta
+        .and_then(|m| serde_json::from_str::<Value>(m).ok())
+        .and_then(|v| v.get("md_edited").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+// Stamp the `md_edited` marker into an existing model_meta JSON, preserving its other keys.
+// A missing / non-object meta is replaced by a bare marker object (the marker matters more
+// than a malformed blob). Pure.
+fn meta_with_md_edited(model_meta: Option<&str>) -> String {
+    let mut v = model_meta
+        .and_then(|m| serde_json::from_str::<Value>(m).ok())
+        .unwrap_or_else(|| json!({}));
+    if !v.is_object() {
+        v = json!({});
+    }
+    v["md_edited"] = json!(true);
+    v.to_string()
+}
+
 // Update ONLY the cycle synthesis markdown (the user's Save edit). Errors if there's no
-// cycle synthesis row yet (you must run synthesis before editing).
+// cycle synthesis row yet (you must run synthesis before editing). Also stamps the
+// `md_edited` divergence marker into model_meta — the structured findings_json is now stale
+// relative to the user's markdown until the next machine run overwrites both.
 async fn save_cycle_markdown_db(pool: &SqlitePool, cycle_id: &str, content_md: &str) -> Result<SynthesisRow, String> {
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM synthesis WHERE cycle_id = ? AND interview_id IS NULL ORDER BY created_at DESC LIMIT 1",
+    let existing: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, model_meta FROM synthesis WHERE cycle_id = ? AND interview_id IS NULL ORDER BY created_at DESC LIMIT 1",
     )
     .bind(cycle_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let id = existing.ok_or("no synthesis to edit — run synthesis first")?;
-    sqlx::query("UPDATE synthesis SET content_md = ? WHERE id = ?")
+    let (id, model_meta) = existing.ok_or("no synthesis to edit — run synthesis first")?;
+    sqlx::query("UPDATE synthesis SET content_md = ?, model_meta = ? WHERE id = ?")
         .bind(content_md)
+        .bind(meta_with_md_edited(model_meta.as_deref()))
         .bind(&id)
         .execute(pool)
         .await
@@ -2073,6 +2178,7 @@ pub(crate) async fn get_synthesis_db(pool: &SqlitePool, cycle_id: &str) -> Resul
         Some((id, findings_json, content_md, model_meta, created_at)) => {
             let doc: SynthesisDoc =
                 serde_json::from_str(&findings_json).map_err(|e| format!("parse synthesis doc: {e}"))?;
+            let edited_diverged = meta_md_edited(model_meta.as_deref());
             Ok(Some(SynthesisRow {
                 id,
                 cycle_id: cycle_id.to_string(),
@@ -2080,6 +2186,7 @@ pub(crate) async fn get_synthesis_db(pool: &SqlitePool, cycle_id: &str) -> Resul
                 content_md,
                 model_meta,
                 created_at,
+                edited_diverged,
             }))
         }
         None => Ok(None),
@@ -2664,6 +2771,8 @@ pub async fn run_synthesis(
                 content_md,
                 model_meta: Some(model_meta),
                 created_at: now_ms(),
+                // A fresh machine run rewrites BOTH layers — the markdown matches the findings.
+                edited_diverged: false,
             })
         }
         Err(e) => {
@@ -3287,15 +3396,61 @@ mod tests {
             executive_summary: "  wave one summary  ".into(),
             ..Default::default()
         };
-        let block = prev_wave_block(&prev);
+        let block = prev_wave_block(&prev, "");
         assert_eq!(block["executive_summary"], "wave one summary", "summary trimmed");
         assert_eq!(block["findings"][0]["goal_id"], "G1");
         assert_eq!(block["findings"][0]["statement"], "users churn early", "finding statement trimmed");
         // Evidence quotes (which belong to the PREVIOUS wave's interviews) are NOT carried.
         assert!(block["findings"][0].get("evidence").is_none(), "prev evidence is dropped");
+        // No diff summary → no diff_summary key (no noise).
+        assert!(block.get("diff_summary").is_none());
 
         // An empty prior wave yields Null (no block on a first-ish wave).
-        assert!(prev_wave_block(&SynthesisDoc::default()).is_null());
+        assert!(prev_wave_block(&SynthesisDoc::default(), "").is_null());
+
+        // The prior wave's own diff summary rides along when present.
+        let with_diff = prev_wave_block(&prev, "  Net: pricing objection dropped.  ");
+        assert_eq!(with_diff["diff_summary"], "Net: pricing objection dropped.", "diff summary trimmed + carried");
+        // A diff summary ALONE is still worth carrying (edge: prev doc parsed empty).
+        let diff_only = prev_wave_block(&SynthesisDoc::default(), "Net: something changed.");
+        assert_eq!(diff_only["diff_summary"], "Net: something changed.");
+    }
+
+    // Cumulative-context truncation: a chatty prior wave is capped at PREV_WAVE_MAX_CHARS
+    // serialized — summaries pre-truncated, trailing findings dropped until the block fits.
+    #[test]
+    fn prev_wave_block_caps_serialized_size() {
+        let mut prev = SynthesisDoc {
+            goals: goals3(),
+            executive_summary: "s".repeat(PREV_WAVE_MAX_CHARS * 2),
+            ..Default::default()
+        };
+        for i in 0..200 {
+            prev.findings.push(Finding {
+                id: format!("F{}", i + 1),
+                goal_id: "G1".into(),
+                statement: format!("Finding {i}: a reasonably long statement about onboarding friction and stalls."),
+                confidence: "medium".into(),
+                support_count: 1,
+                evidence: vec![],
+                recommendation: String::new(),
+            });
+        }
+        let block = prev_wave_block(&prev, &"д".repeat(PREV_WAVE_MAX_CHARS * 2)); // multi-byte safe
+        let serialized = serde_json::to_string(&block).unwrap();
+        assert!(
+            serialized.chars().count() <= PREV_WAVE_MAX_CHARS,
+            "serialized block capped ({} chars > {PREV_WAVE_MAX_CHARS})",
+            serialized.chars().count()
+        );
+        // The executive summary is pre-truncated to half the budget; the diff summary to a quarter.
+        assert_eq!(block["executive_summary"].as_str().unwrap().chars().count(), PREV_WAVE_MAX_CHARS / 2);
+        assert_eq!(block["diff_summary"].as_str().unwrap().chars().count(), PREV_WAVE_MAX_CHARS / 4);
+        // Trailing findings were dropped to fit, but the leading ones survive in order.
+        let kept = block["findings"].as_array().unwrap();
+        assert!(kept.len() < 200, "trailing findings dropped");
+        assert!(!kept.is_empty(), "leading findings kept");
+        assert_eq!(kept[0]["statement"].as_str().unwrap(), prev.findings[0].statement, "input order preserved");
     }
 
     #[tokio::test]
@@ -3341,6 +3496,61 @@ mod tests {
         let edited = save_cycle_markdown_db(&pool, &cycle_id, "# Edited by hand").await.unwrap();
         assert_eq!(edited.content_md, "# Edited by hand");
         assert_eq!(edited.doc.findings[0].statement, "second run", "structured layer untouched");
+    }
+
+    // --- md↔findings divergence marker (v3 P0) ---------------------------------
+
+    #[test]
+    fn md_edited_marker_helpers_are_lenient_and_preserve_meta() {
+        assert!(!meta_md_edited(None), "no meta → not diverged");
+        assert!(!meta_md_edited(Some("not json")), "garbage meta → not diverged");
+        assert!(!meta_md_edited(Some(r#"{"adapter":"claude-code"}"#)), "marker-less meta → not diverged");
+
+        // Stamping preserves the run's other meta keys.
+        let stamped = meta_with_md_edited(Some(r#"{"adapter":"claude-code","findings":3}"#));
+        assert!(meta_md_edited(Some(&stamped)));
+        let v: Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(v["adapter"], "claude-code", "existing meta keys preserved");
+        assert_eq!(v["findings"], 3);
+
+        // A garbage / non-object meta is replaced by a bare marker object (save never fails).
+        assert!(meta_md_edited(Some(&meta_with_md_edited(Some("garbage")))));
+        assert!(meta_md_edited(Some(&meta_with_md_edited(Some("[1,2]")))));
+    }
+
+    // run → not diverged; save md → diverged; re-run → cleared.
+    #[tokio::test]
+    async fn edited_diverged_flag_transitions() {
+        let pool = test_pool().await;
+        let cycle_id = Uuid::new_v4().to_string();
+        let ts = now_ms();
+        sqlx::query("INSERT INTO cycle (id, name, created_at, updated_at) VALUES (?, 'c', ?, ?)")
+            .bind(&cycle_id).bind(ts).bind(ts).execute(&pool).await.unwrap();
+        let doc = SynthesisDoc { goals: goals3(), ..Default::default() };
+        let run_meta = json!({ "adapter": "claude-code" }).to_string();
+
+        // 1. Machine run → markdown matches findings → NOT diverged.
+        store_cycle_synthesis_db(&pool, &cycle_id, &doc, "# machine md", &run_meta).await.unwrap();
+        let got = get_synthesis_db(&pool, &cycle_id).await.unwrap().unwrap();
+        assert!(!got.edited_diverged, "fresh run is not diverged");
+
+        // 2. User saves the markdown → DIVERGED (both on the returned row and on re-read).
+        let saved = save_cycle_markdown_db(&pool, &cycle_id, "# hand edit").await.unwrap();
+        assert!(saved.edited_diverged, "save marks the markdown as diverged");
+        let reread = get_synthesis_db(&pool, &cycle_id).await.unwrap().unwrap();
+        assert!(reread.edited_diverged, "divergence persists across reads");
+        // The run's meta keys survive the stamp.
+        let meta: Value = serde_json::from_str(reread.model_meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["adapter"], "claude-code");
+
+        // A second save keeps it diverged (idempotent).
+        let saved2 = save_cycle_markdown_db(&pool, &cycle_id, "# hand edit 2").await.unwrap();
+        assert!(saved2.edited_diverged);
+
+        // 3. Machine re-run writes a fresh marker-less model_meta → CLEARED.
+        store_cycle_synthesis_db(&pool, &cycle_id, &doc, "# machine md v2", &run_meta).await.unwrap();
+        let cleared = get_synthesis_db(&pool, &cycle_id).await.unwrap().unwrap();
+        assert!(!cleared.edited_diverged, "re-run clears the divergence flag");
     }
 
     #[tokio::test]

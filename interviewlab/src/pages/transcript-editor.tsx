@@ -5,12 +5,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useBlocker, useNavigate, useParams } from "react-router-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   ArrowLeft,
   Check,
   ChevronDown,
+  ChevronUp,
   FileText,
   GitCompareArrows,
   ListTree,
@@ -20,6 +21,7 @@ import {
   Plus,
   RotateCcw,
   Save,
+  Search,
   Trash2,
   Undo2,
   Users,
@@ -57,6 +59,7 @@ import {
 } from "@/components/ui/resizable";
 import { RoleChip } from "@/components/role-chip";
 import { InterviewSummaryPanel } from "@/components/interview-summary-panel";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { useRoles } from "@/lib/role-queries";
 import type { Role } from "@/lib/tauri";
 import {
@@ -877,7 +880,9 @@ const PAGE_STR = {
     resumeFailed: (e: string) => `Не удалось продолжить. ${e}`,
     saveSuccess: "Правки транскрипта сохранены",
     saveFailed: (e: string) => `Не удалось сохранить. ${e}`,
-    leaveConfirm: "Уйти без сохранения? Изменения потеряются.",
+    unsavedTitle: "Несохранённые изменения",
+    unsavedBody: "Есть несохранённые изменения — уйти без сохранения?",
+    leaveAction: "Уйти без сохранения",
     // toolbar / body (used in JSX via t)
     backToCycle: "Назад к циклу",
     transcriptFallbackTitle: "Транскрипт",
@@ -904,6 +909,12 @@ const PAGE_STR = {
     retranscribeSelectionTitle: "Перетранскрибировать выделенный фрагмент аудио заново",
     retranscribe: "Перетранскрибировать",
     clear: "Сбросить",
+    // transcript search (Ctrl/Cmd+F)
+    searchPlaceholder: "Поиск по транскрипту…",
+    searchMatches: (n: number, total: number) => `${n}/${total}`,
+    prevMatch: "Предыдущее совпадение (Shift+Enter)",
+    nextMatch: "Следующее совпадение (Enter)",
+    closeSearch: "Закрыть поиск (Esc)",
   },
   en: {
     segmentRewritten: "Segment rewritten",
@@ -914,7 +925,9 @@ const PAGE_STR = {
     resumeFailed: (e: string) => `Couldn't resume. ${e}`,
     saveSuccess: "Transcript edits saved",
     saveFailed: (e: string) => `Couldn't save. ${e}`,
-    leaveConfirm: "Leave without saving? Your changes will be lost.",
+    unsavedTitle: "Unsaved changes",
+    unsavedBody: "You have unsaved changes — leave without saving?",
+    leaveAction: "Leave without saving",
     backToCycle: "Back to cycle",
     transcriptFallbackTitle: "Transcript",
     unsavedChanges: "Unsaved changes",
@@ -940,6 +953,11 @@ const PAGE_STR = {
     retranscribeSelectionTitle: "Re-transcribe the selected audio fragment from scratch",
     retranscribe: "Re-transcribe",
     clear: "Clear",
+    searchPlaceholder: "Search transcript…",
+    searchMatches: (n: number, total: number) => `${n}/${total}`,
+    prevMatch: "Previous match (Shift+Enter)",
+    nextMatch: "Next match (Enter)",
+    closeSearch: "Close search (Esc)",
   },
 };
 export function TranscriptEditorPage() {
@@ -1050,6 +1068,14 @@ export function TranscriptEditorPage() {
   const [pane, setPane] = useState<"transcript" | "summary">("transcript");
   // Global "show changes" toggle: expand every changed segment's diff vs the original at once.
   const [showDiff, setShowDiff] = useState(false);
+  // ── Transcript search (Ctrl/Cmd+F intercepted): slim inline bar over the segment list.
+  // Case-insensitive substring across segment text; Enter/Shift+Enter or ↑/↓ jump between
+  // matches (wrap-around), Esc closes. No regex, no replace.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  // Position within searchMatches (not a segment index).
+  const [searchCurrent, setSearchCurrent] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const waveRef = useRef<WaveformHandle | null>(null);
   // The scroll region holding the turn/segment list — used to move DOM focus between rows
   // for keyboard navigation (query the row by its data-segment-index).
@@ -1320,6 +1346,56 @@ export function TranscriptEditorPage() {
     }
   }, []);
 
+  // ── Transcript search machinery ──
+  // Segment indices whose text contains the query (case-insensitive substring).
+  const searchMatches = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [] as number[];
+    const out: number[] = [];
+    segments.forEach((s, i) => {
+      if (s.text.toLowerCase().includes(q)) out.push(i);
+    });
+    return out;
+  }, [searchQuery, segments]);
+
+  // Scroll a match's row into view + flash a brief accent ring on it. Plain (non-smooth)
+  // scrollIntoView — calm and respects prefers-reduced-motion by doing nothing animated.
+  const flashSegment = useCallback((index: number) => {
+    const el = listRef.current?.querySelector<HTMLElement>(
+      `[data-segment-index="${index}"]`,
+    );
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("ring-2", "ring-primary/60");
+    window.setTimeout(() => el.classList.remove("ring-2", "ring-primary/60"), 900);
+  }, []);
+
+  // Jump to match #pos (wrap-around in both directions).
+  const gotoMatch = useCallback(
+    (pos: number) => {
+      const n = searchMatches.length;
+      if (n === 0) return;
+      const wrapped = ((pos % n) + n) % n;
+      setSearchCurrent(wrapped);
+      flashSegment(searchMatches[wrapped]);
+    },
+    [searchMatches, flashSegment],
+  );
+
+  // A new query restarts from its first match (and shows it immediately, Ctrl+F-style).
+  useEffect(() => {
+    setSearchCurrent(0);
+    if (searchOpen && searchMatches.length > 0) flashSegment(searchMatches[0]);
+    // Only on query change — jumping on every keystroke of navigation would fight gotoMatch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery]);
+
+  function closeSearch() {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchCurrent(0);
+  }
+
   // Keyboard navigation between segment rows (roving tabindex):
   //   • ↑ / ↓            → move focus to the previous/next row,
   //   • Shift+↑ / Shift+↓ → extend the contiguous selection while moving (keyboard range),
@@ -1480,12 +1556,24 @@ export function TranscriptEditorPage() {
     }
   }, [interviewId, participants, segments, version?.language, saveMutation, roles]);
 
-  // ⌘/Ctrl+S saves; Esc clears an active selection.
+  // ⌘/Ctrl+S saves; ⌘/Ctrl+F opens the transcript search (instead of the webview's
+  // find-in-page, which can't see the segment model); Esc clears an active selection.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key.toLowerCase() === "s" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         if (dirty && !saveMutation.isPending) doSave();
+      } else if (e.key.toLowerCase() === "f" && (e.metaKey || e.ctrlKey)) {
+        // Only when the segment list is the visible pane — Summary / live view keep
+        // whatever the platform does by default.
+        if (pane !== "transcript" || isLive) return;
+        e.preventDefault();
+        setSearchOpen(true);
+        // Focus (and select, for quick retyping) after the bar renders.
+        requestAnimationFrame(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        });
       } else if (e.key === "Escape" && selected.size > 0) {
         // ponytail: Esc clears the selection (the bulk-assign bar's keyboard escape hatch).
         clearSelection();
@@ -1493,15 +1581,17 @@ export function TranscriptEditorPage() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [dirty, doSave, saveMutation.isPending, selected.size]);
+  }, [dirty, doSave, saveMutation.isPending, selected.size, pane, isLive]);
 
-  // Warn before leaving with unsaved edits. The dirty dot already exists in the toolbar;
-  // this makes the dirty state actually BLOCK an accidental exit instead of silently
-  // dropping the work. Native confirm() matches the existing pattern (guides.tsx:148).
+  // Leaving with unsaved edits is guarded by the router blocker below (back button,
+  // breadcrumbs, Cmd+K, citation links — ANY in-app navigation), so goBack just navigates.
   function goBack() {
-    if (dirty && !confirm(tr(PAGE_STR).leaveConfirm)) return;
     navigate(`/cycles/${cycleId}`);
   }
+
+  // Unsaved-changes guard: block in-app navigation while dirty and ask via the shared
+  // ConfirmDialog (rendered at the page root) — proceed leaves, cancel/Esc stays.
+  const blocker = useBlocker(dirty);
 
   // Guard the window/tab close (and Tauri window close) while there are unsaved edits.
   // The browser shows its own generic prompt; we only need to set returnValue to trigger it.
@@ -1736,13 +1826,103 @@ export function TranscriptEditorPage() {
           <div className="relative flex h-full min-h-0 flex-col">
             {/* ponytail: dropped the cryptic "shift-click a row…" hint — the per-row
                 selection checkbox + the bulk-assign bar make the interaction self-evident. */}
-            <div className="flex items-center justify-between border-b border-border px-4 py-2">
-              <span className="text-xs text-muted-foreground">
+            <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border px-4 py-1.5">
+              <span className="shrink-0 text-xs text-muted-foreground">
                 <span className="font-numeric tabular-nums text-foreground/70">
                   {segments.length}
                 </span>{" "}
                 {pluralSegments(segments.length)}
               </span>
+
+              {/* ── Inline transcript search (Ctrl/Cmd+F). Slim, hairline, right-aligned:
+                  query field + N/total counter (tabular) + prev/next + close. ── */}
+              {searchOpen ? (
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <div className="flex h-7 min-w-0 items-center gap-1.5 rounded-md border border-border bg-background px-2 focus-within:border-ring">
+                    <Search className="size-3.5 shrink-0 text-muted-foreground" />
+                    <input
+                      ref={searchInputRef}
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          gotoMatch(searchCurrent + (e.shiftKey ? -1 : 1));
+                        } else if (e.key === "ArrowDown") {
+                          e.preventDefault();
+                          gotoMatch(searchCurrent + 1);
+                        } else if (e.key === "ArrowUp") {
+                          e.preventDefault();
+                          gotoMatch(searchCurrent - 1);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          closeSearch();
+                        }
+                      }}
+                      placeholder={t.searchPlaceholder}
+                      aria-label={t.searchPlaceholder}
+                      className="w-44 min-w-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground sm:w-56"
+                    />
+                    <span className="shrink-0 font-numeric text-[11px] text-muted-foreground tabular-nums">
+                      {t.searchMatches(
+                        searchMatches.length === 0
+                          ? 0
+                          : Math.min(searchCurrent + 1, searchMatches.length),
+                        searchMatches.length,
+                      )}
+                    </span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground"
+                    disabled={searchMatches.length === 0}
+                    onClick={() => gotoMatch(searchCurrent - 1)}
+                    aria-label={t.prevMatch}
+                    title={t.prevMatch}
+                  >
+                    <ChevronUp className="size-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground"
+                    disabled={searchMatches.length === 0}
+                    onClick={() => gotoMatch(searchCurrent + 1)}
+                    aria-label={t.nextMatch}
+                    title={t.nextMatch}
+                  >
+                    <ChevronDown className="size-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground"
+                    onClick={closeSearch}
+                    aria-label={t.closeSearch}
+                    title={t.closeSearch}
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground"
+                  onClick={() => {
+                    setSearchOpen(true);
+                    requestAnimationFrame(() => searchInputRef.current?.focus());
+                  }}
+                  aria-label={t.searchPlaceholder}
+                >
+                  <Search className="size-3.5" />
+                  <kbd className="hidden font-numeric text-[10px] text-muted-foreground/70 sm:inline">
+                    {mod("F")}
+                  </kbd>
+                </Button>
+              )}
             </div>
 
             {/* ponytail: ONE clean scroll region for the whole segment list. pr-3 keeps the
@@ -1867,6 +2047,22 @@ export function TranscriptEditorPage() {
           )}
         </ResizablePanel>
       </ResizablePanelGroup>
+
+      {/* Unsaved-changes guard for in-app navigation (paired with the beforeunload
+          listener above for window close/reload). */}
+      <ConfirmDialog
+        open={blocker.state === "blocked"}
+        onOpenChange={(o) => {
+          if (!o && blocker.state === "blocked") blocker.reset();
+        }}
+        title={t.unsavedTitle}
+        body={t.unsavedBody}
+        confirmLabel={t.leaveAction}
+        destructive
+        onConfirm={() => {
+          if (blocker.state === "blocked") blocker.proceed();
+        }}
+      />
     </div>
   );
 }

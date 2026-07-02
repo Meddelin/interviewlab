@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MarkdownEditor } from "@/components/markdown-editor";
+import { CoveragePanel } from "@/components/coverage-panel";
 import { cn } from "@/lib/utils";
 import {
   useInterviewSummary,
@@ -571,6 +572,12 @@ export function InterviewSummaryPanel({
             </div>
           </div>
         )}
+
+        {/* Guide coverage (v3 F2): "did we ask everything?" — collapsible, below the
+            summary content so it's reachable whether or not a summary exists yet. */}
+        <div className="mt-6 border-t border-border pt-4">
+          <CoveragePanel interviewId={interviewId} />
+        </div>
       </div>
     </div>
   );

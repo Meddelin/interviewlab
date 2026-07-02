@@ -6,7 +6,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { ArrowUpRight, ChevronRight, Target } from "lucide-react";
+import { ArrowUpRight, Target } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,13 +29,16 @@ import { templateIsEmpty } from "@/lib/tauri";
 import { InterviewsTab } from "@/components/interviews-tab";
 import { SynthesisTab } from "@/components/synthesis-tab";
 import { DiffTab } from "@/components/diff-tab";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { absoluteDate } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 
 const STR = {
   ru: {
     empty: "Здесь пусто.",
-    discardConfirm: "Отменить несохранённые изменения цикла?",
+    unsavedTitle: "Несохранённые изменения",
+    unsavedBody: "Есть несохранённые изменения — уйти без сохранения?",
+    leaveAction: "Уйти без сохранения",
     untitledCycle: "Цикл без названия",
     cycleSaved: "Цикл сохранён",
     saveError: (e: string) => `Не удалось сохранить изменения. ${e}`,
@@ -76,7 +79,9 @@ const STR = {
   },
   en: {
     empty: "This is empty.",
-    discardConfirm: "Discard unsaved changes to this cycle?",
+    unsavedTitle: "Unsaved changes",
+    unsavedBody: "You have unsaved changes — leave without saving?",
+    leaveAction: "Leave without saving",
     untitledCycle: "Untitled cycle",
     cycleSaved: "Cycle saved",
     saveError: (e: string) => `Couldn't save your changes. ${e}`,
@@ -216,18 +221,10 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [dirty]);
 
-  // Guard in-app navigation away from a dirty Overview (back, breadcrumb, Cmd+K, links).
-  // ponytail: a native confirm() matches the existing guard pattern (guides.tsx:148,
-  // cycle-chat-panel.tsx:309) — no AlertDialog plumbing needed.
+  // Guard in-app navigation away from a dirty Overview (back, breadcrumb, Cmd+K, links,
+  // tab switches — those write ?tab= via the router, so they're navigations too). The
+  // shared ConfirmDialog renders below; proceed leaves, cancel/Esc stays.
   const blocker = useBlocker(dirty);
-  useEffect(() => {
-    if (blocker.state !== "blocked") return;
-    if (window.confirm(t.discardConfirm)) {
-      blocker.proceed();
-    } else {
-      blocker.reset();
-    }
-  }, [blocker]);
 
   if (isPending || !cycle) {
     return (
@@ -426,6 +423,22 @@ function OverviewTab({ cycleId }: { cycleId: string }) {
           {updateCycle.isPending ? t.saving : t.saveChanges}
         </Button>
       </div>
+
+      {/* Unsaved-changes guard for in-app navigation (paired with the beforeunload
+          listener above for window close/reload). */}
+      <ConfirmDialog
+        open={blocker.state === "blocked"}
+        onOpenChange={(o) => {
+          if (!o && blocker.state === "blocked") blocker.reset();
+        }}
+        title={t.unsavedTitle}
+        body={t.unsavedBody}
+        confirmLabel={t.leaveAction}
+        destructive
+        onConfirm={() => {
+          if (blocker.state === "blocked") blocker.proceed();
+        }}
+      />
     </div>
   );
 }
@@ -475,29 +488,17 @@ export function CycleDetailPage() {
   // ponytail: the Ask AI CTA + the chat panel were lifted to the shell (App.tsx) so they
   // persist on EVERY cycle screen incl. the transcript editor. This page is now just the
   // cycle's tabs; the shell docks the panel against the whole content area.
+  //
+  // Width: the shell (App.tsx) already centers content in a capped column — no inner
+  // max-w here, so the tabs fill the shell's width instead of pinning left with dead
+  // space on wide monitors (v3 audit, дизайнер #1). The Overview form keeps its own
+  // readable prose column; data tabs (Interviews/Synthesis/Diff) go full width.
   return (
-    <div className="mx-auto flex h-full min-h-0 w-full max-w-screen-xl flex-col gap-5 2xl:max-w-screen-2xl">
-      {/* Quiet wayfinding above the tabs: Cycles / {name}, Linear-style — no heavy H1. */}
-      <div className="flex flex-col gap-1">
-        <nav
-          aria-label={t.breadcrumb}
-          className="flex items-center gap-1 text-xs text-muted-foreground"
-        >
-          <Link
-            to="/cycles"
-            className="rounded-sm transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-          >
-            {t.cycles}
-          </Link>
-          <ChevronRight className="size-3 shrink-0 opacity-60" aria-hidden="true" />
-          <span className="truncate text-foreground/80">
-            {cycle?.name ?? "…"}
-          </span>
-        </nav>
-        <h1 className="truncate text-sm font-medium tracking-[-0.01em] text-foreground">
-          {cycle?.name ?? " "}
-        </h1>
-      </div>
+    <div className="flex h-full min-h-0 w-full flex-col gap-5">
+      {/* Wayfinding lives in the App header breadcrumbs (v3); the page keeps only its H1. */}
+      <h1 className="truncate text-sm font-medium tracking-[-0.01em] text-foreground">
+        {cycle?.name ?? " "}
+      </h1>
 
       <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1 gap-5">
         <TabsList variant="line" className="border-b border-border pb-0">

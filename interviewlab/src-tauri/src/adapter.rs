@@ -419,7 +419,9 @@ const CLAUDE_CODE_DESCRIPTOR: &str = r#"{
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
     "glossary-extract":        { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
-    "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] }
+    "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
+    "guide-coverage":          { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] },
+    "guide-generate":          { "args_template": ["-p", "{prompt}", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config"] }
   },
   "models": {
     "available": [
@@ -431,7 +433,9 @@ const CLAUDE_CODE_DESCRIPTOR: &str = r#"{
       "transcript-cleanup":"haiku",
       "cycle-synthesis":"sonnet","cycle-synthesis-extract":"sonnet","cycle-synthesis-reduce":"sonnet",
       "glossary-extract":"sonnet",
-      "cycle-diff":"sonnet"
+      "cycle-diff":"sonnet",
+      "guide-coverage":"sonnet",
+      "guide-generate":"sonnet"
     }
   },
   "chat": {
@@ -507,7 +511,9 @@ const QWEN_CODE_DESCRIPTOR: &str = r#"{
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
     "glossary-extract":        { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
-    "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json"] }
+    "cycle-diff":              { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
+    "guide-coverage":          { "args_template": ["-p", "{prompt}", "--output-format", "json"] },
+    "guide-generate":          { "args_template": ["-p", "{prompt}", "--output-format", "json"] }
   },
   "chat": {
     "mode": "descriptor",
@@ -563,7 +569,9 @@ const ANTIGRAVITY_CLI_DESCRIPTOR: &str = r#"{
     "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}"] },
     "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}"] },
     "glossary-extract":        { "args_template": ["-p", "{prompt}"] },
-    "cycle-diff":              { "args_template": ["-p", "{prompt}"] }
+    "cycle-diff":              { "args_template": ["-p", "{prompt}"] },
+    "guide-coverage":          { "args_template": ["-p", "{prompt}"] },
+    "guide-generate":          { "args_template": ["-p", "{prompt}"] }
   }
 }"#;
 
@@ -629,18 +637,22 @@ pub struct LoadedPlugin {
 // Write the bundled plugins to plugins/<id>/ on first run: manifest.json + a README.md
 // (the per-plugin agent notes) + the shared meta-instruction + manifest schema in the
 // plugins root. Best-effort: a write failure never blocks loading (defaults are compiled
-// in). Re-running is cheap — existing files are left untouched (so a user's edits survive).
+// in). Re-running is cheap — plugin manifests are left untouched (a user's edits survive);
+// only the app-owned root README/schema are refreshed when the shipped text changes.
 fn ensure_bundled_on_disk(app: &tauri::AppHandle) {
     let Ok(root) = plugins_dir(app) else { return };
     let _ = std::fs::create_dir_all(&root);
     // The agent-facing meta-instruction + JSON schema live in the plugins root so any
     // agent dropping a plugin finds them next to the folders (§9 / §3.3).
+    // These two are APP-OWNED reference docs (not user data): rewrite them whenever the
+    // shipped text changes, so a stale README can't keep giving the next agent outdated
+    // instructions. Per-plugin manifests below stay if-not-exists (user edits survive).
     let readme = root.join("README.md");
-    if !readme.exists() {
+    if std::fs::read_to_string(&readme).map(|t| t != META_INSTRUCTIONS).unwrap_or(true) {
         let _ = std::fs::write(&readme, META_INSTRUCTIONS);
     }
     let schema = root.join("manifest.schema.json");
-    if !schema.exists() {
+    if std::fs::read_to_string(&schema).map(|t| t != MANIFEST_SCHEMA).unwrap_or(true) {
         let _ = std::fs::write(&schema, MANIFEST_SCHEMA);
     }
     for (id, json) in bundled_descriptors() {
@@ -898,6 +910,9 @@ pub fn task_bucket(task: &str) -> Option<&'static str> {
         // Glossary extraction (B/C) shares the synthesis model bucket — it's the same kind of
         // analytical map step, so the user's synthesis model choice applies.
         "glossary-extract" => Some("synthesis"),
+        // Guide coverage + guide generation (v3 B1) are the same class of analytical work,
+        // so the user's synthesis model choice applies to them too.
+        "guide-coverage" | "guide-generate" => Some("synthesis"),
         "cycle-diff" => Some("diff"),
         _ => None,
     }
@@ -1421,8 +1436,13 @@ pub async fn run_cli_task_model(
 
     let prompt = render_prompt(task_name, input_json, output_schema);
     // Resolve the final model: user override, else the plugin's per-task manifest default.
+    // The override only applies when the plugin DECLARES a `models` block: the per-bucket
+    // override is stored app-wide, so a stale value saved under another plugin (e.g. claude's
+    // "sonnet") must never be forced on a CLI that declared no models — the documented
+    // invariant is "no `models` block → no model flag, ever".
     let model = model_override
         .filter(|s| !s.is_empty())
+        .filter(|_| adapter.models.is_some())
         .map(str::to_string)
         .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task_name).cloned()));
     // The plugin's model flag (default "--model"; empty → never inject a model).
@@ -1535,9 +1555,11 @@ pub async fn run_cli_task_text(
         .ok_or_else(|| TaskError::new("config", format!("adapter `{}` has no task `{task_name}`", adapter.id)))?;
 
     let prompt = render_prompt_text(task_name, input_json);
-    // Same model resolution as run_cli_task_model: user override, else the plugin's per-task default.
+    // Same model resolution as run_cli_task_model: user override (only when the plugin
+    // declares a `models` block — see the invariant note there), else the per-task default.
     let model = model_override
         .filter(|s| !s.is_empty())
+        .filter(|_| adapter.models.is_some())
         .map(str::to_string)
         .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task_name).cloned()));
     let model_flag = adapter
@@ -1638,7 +1660,10 @@ async fn probe_version(adapter: &Adapter) -> Result<String, TaskError> {
         .current_dir(neutral_cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Same orphan-proofing as spawn_once: if the timeout drops this future, the
+        // probe process is killed with it (v3 B1: kill_on_drop on ALL spawned CLIs).
+        .kill_on_drop(true);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1998,71 +2023,213 @@ pub fn delete_plugin(app: tauri::AppHandle, id: String) -> Result<(), String> {
 // minimal effort — by dropping a folder into %APPDATA%/com.interviewlab.app/plugins/<id>/.
 const META_INSTRUCTIONS: &str = r#"# Onboard a new CLI as an InterviewLab plugin
 
-You are authoring a self-contained InterviewLab **plugin** so the app can drive a local AI
-CLI for batch tasks and/or agentic chat — by dropping a folder into
-`%APPDATA%/com.interviewlab.app/plugins/<id>/`. You will NOT edit the app's source.
+You are authoring a self-contained InterviewLab **plugin** so the app can drive a LOCAL AI
+CLI for its LLM tasks (cleanup / synthesis / diff / glossary / guide coverage / guide
+generation) and, optionally, the streaming cycle chat. You will NOT edit the app's source:
+you drop a folder into the plugins directory and the app discovers it at runtime. Written
+for a human or an AI agent doing the setup. Everything below describes what the CURRENT
+build actually implements — nothing here is aspirational.
 
-## Plugin layout
+## 1. Where plugins live (per OS)
+
+- Windows: `%APPDATA%\com.interviewlab.app\plugins\<id>\`
+- macOS:   `~/Library/Application Support/com.interviewlab.app/plugins/<id>/`
+- Linux:   `~/.local/share/com.interviewlab.app/plugins/<id>/`
+
 ```
 plugins/<id>/
   manifest.json    # REQUIRED — the plugin descriptor (alias: adapter.json)
-  README.md        # notes: which CLI, how to install/login, caveats
-  adapter[.exe|.js]# OPTIONAL — adapter program (Tier 2; see §6 of feature-cli-plugins.md)
+  README.md        # recommended: which CLI, how to install/log in, caveats
 ```
-The folder name IS the canonical `id` and must equal `manifest.id`. Legacy flat
-`adapters/<id>.json` files are still loaded (degenerate batch-only plugins).
+- The folder name IS the canonical `id` and MUST equal `manifest.id` (validated).
+- Precedence (low → high): compiled-in bundled plugins < legacy flat `adapters/<id>.json`
+  < `plugins/<id>/manifest.json`. A folder manifest with a bundled id (claude-code,
+  qwen-code, antigravity-cli) OVERRIDES the bundled copy — edit those files on disk; the
+  in-app editor refuses bundled ids.
+- An invalid manifest is never dropped silently: Settings lists it as "(invalid plugin)"
+  with the exact validation error, and it is logged as [E-CLI-PLUGIN].
 
-## 1. Decide the tier (one decision)
-Run the CLI's `--help`. A **Tier 1 (descriptor-only, pure JSON, zero code)** plugin works if
-the CLI has:
-1. a one-shot prompt + machine-readable JSON mode (e.g. `-p … --output-format json`) → `batch-tasks`,
-2. a streaming ndjson mode matching a shipped parser (`claude-stream-json`, `gemini-stream-json`, `openai-jsonl`) → `streaming`,
-3. session/resume → `multi-turn`,
-4. MCP (loads an MCP config, calls `mcp__…` tools) → `tool-use`.
-If any needed piece doesn't map (bespoke output, no MCP, weird sessions) → **Tier 2: ship a
-small adapter program** that speaks the stdio chat protocol (feature-cli-plugins.md §6) and
-normalizes the CLI. Set `chat.mode: "adapter-program"` + an `adapter_program` block.
+## 2. How the app calls your CLI (batch contract)
 
-## 2. Write the manifest (validate against manifest.schema.json)
-- `id` = folder name; `command` = the executable; `capabilities` = the subset you verified.
-- Fill the blocks for ONLY those capabilities (orthogonality rule):
-  - `io` + `tasks` for **batch-tasks**. The prompt must say "return ONLY JSON matching this
-    schema". Preserve segment ids/timing/labels in cleanup (change only `text`); synthesis
-    findings carry `goal_id` + evidence; diff is findings-level.
-  - `chat.stream` (+ `parse`) for **streaming**; `chat.session` for **multi-turn**;
-    `chat.tools` (MCP) for **tool-use**.
-  - Use the placeholders the app fills: `{prompt}`, `{system_prompt_file}`,
-    `{mcp_config_file}`, `{session_id}`, and the app-managed `{session_args}` /
-    `{mcp_args}` / `{allowed_tools_args}` groups.
-- Write a `probe` (a cheap command + expected exit code) and an `auth` note (prefer the
-  CLI's own login over env keys; record any one-time interactive login the user does once).
+For every task the app spawns `command` + `tasks[<task>].args_template`, substituting
+`{prompt}`:
+- `{prompt}` = task instructions + (for JSON tasks) the required output JSON schema + the
+  input JSON, all rendered BY THE APP. You do not author prompts; the plugin only supplies
+  the command line.
+- The input JSON is ALSO piped to stdin when `io.payload_via` is `"stdin"` (recommended).
+  `"arg"` writes nothing to stdin — the copy inlined in `{prompt}` is what the CLI sees.
+  A `"file"` channel is NOT implemented.
+- cwd = the OS temp dir (neutral; no project files). Environment = the app's own env,
+  unchanged — the app NEVER sets env vars. `auth.env` / `auth.note` are informational: if
+  your CLI needs an API key, the user must already have it in the OS environment.
+- Expected stdout, per `io.result_extract`:
+  - `{"format":"json","json_path":"result"}` — an envelope object whose `result` field (or
+    your `json_path`) holds the answer as a STRING. Accepted shapes: one JSON object, one
+    JSON array of stream events, or JSONL (one object per line) — the last event carrying
+    the field wins. The answer string may be wrapped in markdown fences or prose; the app
+    tolerant-parses it. When the app passed `--json-schema`, a non-null `structured_output`
+    envelope field is preferred over `result`.
+  - `{"format":"raw"}` — no envelope: the whole stdout is tolerant-parsed as JSON (or taken
+    as plain text for the per-segment rewrite). Use this when the CLI prints the bare answer.
+- `--json-schema <schema>` is appended to schema tasks unless `io.json_schema_arg: false`.
+  Set false when your CLI rejects unknown flags — the schema still rides inside `{prompt}`.
+- Limits & retries: payload over `io.max_stdin_bytes` (default 10 MB) = config error; the
+  process is killed after `io.timeout_sec` (default 600 s) → [E-CLI-TIMEOUT]; a clean exit
+  with unparseable output gets exactly ONE retry, then [E-CLI-PARSE].
+- Windows: an npm-style `.cmd` shim often fails to spawn or mangles the multi-line
+  `{prompt}`. Point `command` at the real executable (an absolute path is fine), or set
+  `command: "node"` and put the CLI's JS entry as the FIRST element of every args_template.
 
-## 3. If Tier 2, write the adapter program (feature-cli-plugins.md §6)
-Read one JSON `turn` line from stdin; invoke your CLI with `text` as the prompt and `system`
-as the system prompt; stream `token` lines to stdout as output arrives; emit `done` with a
-`session_id`. For tools, emit a `tool_call` and wait for the host's `tool_result` line. Honor
-`cancel`. Keep it tiny — a 50-line script is a fine adapter. (v1 ships the descriptor tier;
-the adapter-program RUNTIME is a documented, frozen extension point — `protocol_version: 1`.)
+## 3. Task names — required vs optional
 
-## 4. Self-test (no app source; you do this)
-1. Validate `manifest.json` against `manifest.schema.json`. Fix until clean.
-2. Run the `probe` command; confirm the expected exit code (and that the CLI is logged in).
-3. For each batch task, pipe an example input through `command + tasks[t].args_template`;
-   confirm valid output JSON of the right shape (cleanup preserves ids/timing; synthesis
-   findings have `goal_id`+evidence; diff is findings-level).
-4. Chat smoke (descriptor): run the `chat.stream` command on a trivial prompt; confirm the
-   named parser yields ≥1 token event and a final event carrying a `session_id`.
-5. Install: drop the folder in `plugins/<id>/`, open Settings → **Rescan plugins**, select
-   the plugin, click **Test CLI** → Available. Run one real Clean and (if chat) one question.
+Bundled plugins reuse ONE args template for every task; do the same unless your CLI needs
+per-task flags.
 
-## Worked example — Claude Code (the reference plugin, all four capabilities)
-`-p --output-format json` (batch), `stream-json --verbose --include-partial-messages` (token
-stream), `--resume` (multi-turn), `--mcp-config … --strict-mcp-config` + `--allowedTools` +
-`--tools ""` + `--permission-mode dontAsk` (scoped MCP tools, no built-ins), `--setting-sources ""`
-+ neutral cwd + NO `--bare` (isolation + subscription auth). No adapter program, no code.
-Clone its `manifest.json` for the next descriptor-tier CLI: swap `command`, set the right
-`parse`, adjust the MCP-config flag names. (Gemini-CLI forks like Qwen Code reuse
-`parse: "gemini-stream-json"`.)"#;
+| task | needed for | if the manifest omits it |
+|---|---|---|
+| `ping` | the Test CLI round-trip | Test CLI reports Error (real tasks still run) |
+| `transcript-cleanup` | Clean + per-segment rewrite | those features fail: `[config] no task` |
+| `cycle-synthesis-extract` | Synthesis (map); also the FALLBACK for glossary-extract and guide-coverage | Synthesis fails |
+| `cycle-synthesis-reduce` | Synthesis (reduce) | Synthesis fails |
+| `cycle-diff` | Diff vs the previous wave | Diff fails |
+| `cycle-synthesis` | only as the FALLBACK for guide-generate | guide generation fails unless `guide-generate` present |
+| `glossary-extract` | OPTIONAL → falls back to `cycle-synthesis-extract` | nothing breaks |
+| `guide-coverage` | OPTIONAL → falls back to `cycle-synthesis-extract` | nothing breaks |
+| `guide-generate` | OPTIONAL → falls back to `cycle-synthesis` | nothing breaks |
+
+The fallbacks apply to ANY loaded manifest (bundled or yours). `transcript-cleanup` is also
+invoked in plain-text mode for single-segment rewrites — the reply is the rewritten text
+itself, not JSON; no extra CLI support needed (the rendered prompt asks for plain text).
+
+## 4. Minimal working manifest (batch-only)
+
+Copy, replace `my-cli` / `mycli` and the flags; validate against `manifest.schema.json`
+(next to this README; also shown in Settings → Add a plugin… → For an agent).
+
+```json
+{
+  "manifest_version": 1,
+  "id": "my-cli",
+  "name": "My CLI",
+  "version": "1.0",
+  "vendor": "",
+  "command": "mycli",
+  "capabilities": ["batch-tasks"],
+  "probe": { "args": ["--version"], "expect_exit_code": 0 },
+  "auth": { "type": "session", "env": [], "note": "run `mycli login` once" },
+  "io": {
+    "payload_via": "stdin",
+    "prompt_via": "arg",
+    "result_extract": { "format": "raw" },
+    "timeout_sec": 600,
+    "max_stdin_bytes": 10000000,
+    "json_schema_arg": false
+  },
+  "tasks": {
+    "ping":                    { "args_template": ["-p", "{prompt}"] },
+    "transcript-cleanup":      { "args_template": ["-p", "{prompt}"] },
+    "cycle-synthesis":         { "args_template": ["-p", "{prompt}"] },
+    "cycle-synthesis-extract": { "args_template": ["-p", "{prompt}"] },
+    "cycle-synthesis-reduce":  { "args_template": ["-p", "{prompt}"] },
+    "cycle-diff":              { "args_template": ["-p", "{prompt}"] }
+  }
+}
+```
+- Required fields: `id`, `name`, `command`, `probe`, `auth`, plus `capabilities` (or a
+  non-empty `tasks`, which implies `["batch-tasks"]`). `batch-tasks` requires BOTH `io`
+  and `tasks`; `streaming` requires `chat.stream`; `multi-turn` requires `chat.session`;
+  `tool-use` requires `chat.tools` or `adapter_program`.
+- `models` block (optional): `{"flag":"--model","available":[{"id":"…","label":"…"}],
+  "tasks":{"transcript-cleanup":"…"}}` enables the Settings "Task models" picker (buckets:
+  cleanup / synthesis / diff). OMIT the block entirely → the app never injects a model flag
+  (the CLI's own default runs) and the picker is hidden. The user's per-bucket picks are
+  stored app-wide, not per plugin — after switching the active plugin, re-check Task models
+  (pick "Plugin default" if the saved value belonged to another CLI).
+
+## 5. Chat (optional): streaming & multi-turn — honest status
+
+Declaring `"streaming"` + a `chat.stream` block enables the cycle chat for your plugin.
+`chat.stream.parse` names a stream parser, but THIS BUILD IMPLEMENTS ONLY
+`claude-stream-json` and reads every plugin's stream with it (`gemini-stream-json` /
+`openai-jsonl` are reserved names, not implemented). Your CLI's stdout must be ndjson this
+reader understands:
+- token deltas (optional, for live typing):
+  `{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}`
+  (also accepted wrapped: `{"type":"stream_event","event":{ …same… }}`)
+- final line: `{"type":"result","result":"<full answer>","session_id":"<id>"}` — carries
+  the session id (and optional `total_cost_usd`), and doubles as the whole answer when no
+  deltas were streamed. If stdout matches NEITHER shape, a zero-exit turn stores an EMPTY
+  answer — that is the failure mode of a wrong stream shape.
+
+No stream-json in your CLI? Honest options:
+1. Emit ONE final `result` line (a tiny wrapper script around your CLI is enough). Chat
+   works spinner-then-answer — no live tokens, everything else identical.
+2. Skip chat: omit `"streaming"`. Every batch feature still works; the chat panel returns
+   "the active plugin … does not support streaming chat".
+
+Placeholders the app fills in `chat.stream.args_template`: `{prompt}` (the user question),
+`{system_prompt_file}` (path to the grounding context file — the CLI MUST have a flag that
+reads a system prompt from a file, or answers will be ungrounded), `{session_args}`
+(expands to `chat.session.resume_args` with `{session_id}` filled on follow-up turns; empty
+on turn 1). `{mcp_args}` and `{allowed_tools_args}` currently expand to NOTHING. stdin is
+not used for chat. Idle watchdog: 120 s without a stdout line kills the turn.
+
+- `multi-turn` (optional): declare it + `chat.session`
+  `{"resume_args":["--resume","{session_id}"]}` if your CLI can resume a session (the id
+  is read from the final result line). Without it every turn is independent — still
+  grounded (the context file is passed each turn), but the model won't remember earlier
+  questions in the thread.
+- Chat ACTIONS need nothing from your CLI: the assistant edits the glossary or a synthesis
+  finding by emitting one fenced `invlab-action` code block in its final text; the app
+  extracts, validates, executes, and offers Undo. Plain text output is enough; this is NOT
+  gated by the `tool-use` capability.
+- `tool-use` / `chat.tools` / `adapter_program`: parsed, validated, and shown in the UI
+  (capability chip, "runs external program" label) — but NO runtime consumes them yet.
+  MCP wiring and the adapter-program stdio relay (`chat.mode: "adapter-program"`) are
+  documented extension points; do not rely on them in this build.
+
+## 6. Install & verify in the app
+
+1. Drop the folder into `plugins/<id>/` — or use Settings → AI CLI → "Add a plugin…"
+   (Form tab builds a batch-only manifest; Raw JSON tab for chat blocks; Save validates
+   with the loader's own rules and refuses bundled ids).
+2. Settings → AI CLI → **Rescan plugins** — the plugin appears (or shows its validation
+   error inline).
+3. Select it under **Active plugin**, click **Test CLI**:
+   - Available — installed AND the `ping` round-trip returned parseable output.
+   - Not found — `command` failed to spawn: not installed / not on PATH / a `.cmd` shim (§2).
+   - Not logged in — installed, but the round-trip stderr looks like an auth error: run the
+     CLI's own login once, outside the app.
+   - Error — anything else (e.g. no `ping` task, unparseable output): read the detail line.
+4. Run one real Clean on a small interview; if you declared chat, ask one question in the
+   cycle chat.
+
+## 7. Error codes → one-line remedies
+
+Grep the app log `interviewlab.log` (Windows: `%LOCALAPPDATA%\com.interviewlab.app\logs`,
+macOS: `~/Library/Logs/com.interviewlab.app`).
+
+- [E-CLI-PLUGIN] manifest invalid → fix the reported field, Rescan plugins.
+- [E-CLI-SPAWN] `command` didn't start → install the CLI / fix PATH / absolute path / §2.
+- [E-CLI-EXIT] non-zero exit (stderr is logged) → not logged in, or a flag the CLI rejects
+  (`--json-schema` → set `io.json_schema_arg: false`; `--model` → remove the `models` block).
+- [E-CLI-TIMEOUT] killed after `io.timeout_sec` → raise it, or check the CLI isn't waiting
+  for interactive input.
+- [E-CLI-PARSE] exit 0 but output never parsed (after one retry) → check `--output-format`,
+  `result_extract.json_path`, or switch to `{"format":"raw"}`.
+- [E-CLI-TEXT] the plain-text segment rewrite returned nothing usable → same checks.
+- [E-CLI-AUTH] the round-trip failed like an auth error → run the CLI's login once.
+- [E-CHAT-SPAWN|TURN|NO-ANSWER|TIMEOUT] chat turn failures → same remedies + the 120 s idle
+  rule; [E-CHAT-ACTION-*] an `invlab-action` block was rejected/failed (never executed).
+
+## Worked example — Claude Code (the bundled reference, all four capabilities)
+
+Batch: `-p {prompt} --output-format json --setting-sources "" --strict-mcp-config`
+(isolation flags; NO `--bare` — plain `-p` uses the user's `claude login` subscription
+session, while `--bare` would force ANTHROPIC_API_KEY). Chat: `--output-format stream-json
+--verbose --include-partial-messages --append-system-prompt-file {system_prompt_file}` +
+`parse: "claude-stream-json"`. Multi-turn: `--resume {session_id}`. Models: haiku / sonnet /
+opus. Clone `plugins/claude-code/manifest.json` and swap the command + flags for your CLI."#;
 
 // feature-cli-plugins.md §3.3 — the manifest JSON Schema, shipped in-app + on disk so an
 // authoring agent self-validates. Kept as a single source-of-truth string.
@@ -2104,7 +2271,7 @@ const MANIFEST_SCHEMA: &str = r#"{
       "description": "Required iff capabilities includes 'batch-tasks'.",
       "required": ["payload_via", "result_extract"],
       "properties": {
-        "payload_via": { "enum": ["stdin", "arg", "file"] },
+        "payload_via": { "enum": ["stdin", "arg"], "description": "'stdin' pipes the input JSON to the CLI's stdin (recommended). 'arg' writes nothing to stdin — the input JSON is always ALSO inlined in the rendered {prompt}, which is what an arg-only CLI reads. A 'file' channel is NOT implemented." },
         "prompt_via": { "type": "string" },
         "result_extract": {
           "type": "object",
@@ -2164,7 +2331,7 @@ const MANIFEST_SCHEMA: &str = r#"{
           "required": ["args_template"],
           "properties": {
             "args_template": { "type": "array", "items": { "type": "string" } },
-            "parse": { "enum": ["claude-stream-json", "gemini-stream-json", "openai-jsonl"] }
+            "parse": { "enum": ["claude-stream-json", "gemini-stream-json", "openai-jsonl"], "description": "Named stream parser. IMPLEMENTED TODAY: claude-stream-json only — every plugin's stream is read by it regardless of this value (the other names are reserved). See the plugin guide (plugins/README.md §5) for the exact line shapes it understands." }
           }
         },
         "session": {
@@ -2566,6 +2733,7 @@ mod tests {
         fn resolve(adapter: &Adapter, task: &str, override_: Option<&str>) -> (Option<String>, String) {
             let model = override_
                 .filter(|s| !s.is_empty())
+                .filter(|_| adapter.models.is_some())
                 .map(str::to_string)
                 .or_else(|| adapter.models.as_ref().and_then(|m| m.tasks.get(task).cloned()));
             let flag = adapter
@@ -2596,6 +2764,10 @@ mod tests {
         let spec = plain.tasks.get("transcript-cleanup").unwrap();
         let args = build_args(spec, "P", None, m.as_deref(), &flag, true);
         assert!(!args.iter().any(|x| x == "--model"));
+        // A STALE user override saved under another plugin never leaks into a plugin with
+        // no `models` block: the override is ignored, nothing resolves, no flag injected.
+        let (m, _) = resolve(&plain, "transcript-cleanup", Some("sonnet"));
+        assert!(m.is_none(), "override must not apply to a models-less plugin");
     }
 
     // The task→bucket map: the six task names collapse to the three user-facing buckets;

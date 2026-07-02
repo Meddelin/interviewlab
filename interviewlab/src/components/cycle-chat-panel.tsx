@@ -10,8 +10,11 @@
 // mirroring the DB thread, fed by the chat://<thread_id> Tauri-events stream) and provide
 // onNew (send) / onCancel (stop) / onReload (regenerate). The conversation is rendered with
 // our own Linear-styled list + Streamdown (per spec, Streamdown replaces the default
-// markdown renderer for the assistant turn). // ponytail: no tool-call UIs — tools are
-// Phase B/C; we render the streamed answer + citations only.
+// markdown renderer for the assistant turn).
+//
+// Phase B (v3 F3): assistant turns also render ACTION CHIPS — the whitelisted writes the
+// agent performed (chat_tool_call rows / live `action` events), with per-chip Undo — plus
+// a Retry affordance on failed turns.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -24,15 +27,22 @@ import {
 import { Streamdown } from "streamdown";
 import {
   ArrowUp,
+  Book,
   Check,
   ChevronDown,
+  Loader2,
   MessageSquarePlus,
   Pencil,
+  PenLine,
   PanelRightClose,
+  RotateCcw,
   Square,
   Trash2,
+  Undo2,
+  Wrench,
   X,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -51,10 +61,14 @@ import {
   cycleChatAppend,
   cycleChatCancel,
   cycleChatSend,
+  listChatToolCalls,
   onChatEvent,
+  undoChatAction,
   type ChatCitation,
   type ChatMessage,
+  type ChatToolCall,
 } from "@/lib/tauri";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import {
   chatKeys,
   useChatMessages,
@@ -64,9 +78,10 @@ import {
   useRenameChatThread,
 } from "@/lib/chat-queries";
 import { useInterviews } from "@/lib/interview-queries";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useUiStore } from "@/lib/ui-store";
 import { mod } from "@/lib/platform";
+import { cn } from "@/lib/utils";
 import { useT, tr } from "@/lib/i18n";
 
 const STR = {
@@ -92,8 +107,20 @@ const STR = {
     saveName: "Сохранить название",
     cancelRename: "Отменить переименование",
     chatName: "Название чата",
+    deleteChatTitle: "Удалить чат?",
     deleteConfirm: (label: string) => `Удалить «${label}»? Это действие нельзя отменить.`,
+    delete: "Удалить",
     thisChat: "этот чат",
+    retry: "Повторить",
+    retryAria: "Повторить ответ",
+    undoAction: "Отменить",
+    undoActionAria: (summary: string) => `Отменить действие: ${summary}`,
+    actionUndone: "Действие отменено",
+    undoFailed: (e: string) => `Не удалось отменить действие. ${e}`,
+    actionStatusApplied: "Применено",
+    actionStatusRejected: "Отклонено",
+    actionStatusFailed: "Ошибка",
+    actionStatusUndone: "Отменено",
     emptyHint:
       "Спросите что угодно об этом цикле — ответы опираются на синтез цикла, краткие итоги интервью и diff, со ссылками на источник.",
     interview: "Интервью",
@@ -123,8 +150,20 @@ const STR = {
     saveName: "Save name",
     cancelRename: "Cancel rename",
     chatName: "Chat name",
+    deleteChatTitle: "Delete chat?",
     deleteConfirm: (label: string) => `Delete "${label}"? This can't be undone.`,
+    delete: "Delete",
     thisChat: "this chat",
+    retry: "Retry",
+    retryAria: "Retry the answer",
+    undoAction: "Undo",
+    undoActionAria: (summary: string) => `Undo action: ${summary}`,
+    actionUndone: "Action undone",
+    undoFailed: (e: string) => `Couldn't undo the action. ${e}`,
+    actionStatusApplied: "Applied",
+    actionStatusRejected: "Rejected",
+    actionStatusFailed: "Failed",
+    actionStatusUndone: "Undone",
     emptyHint:
       "Ask anything about this cycle — answers are grounded in its synthesis, per-interview summaries, and diff, with citations back to the source.",
     interview: "Interview",
@@ -164,6 +203,56 @@ function toLive(m: ChatMessage): LiveMessage {
   };
 }
 
+// --- chat actions (M11 Phase B tool-use chips) ----------------------------------
+// What an action chip renders — a normalized slice of a chat_tool_call row, or of a live
+// `action` stream event (whose row isn't in the query cache yet).
+type ChipAction = {
+  id: string;
+  tool: string;
+  status: ChatToolCall["status"];
+  summary: string;
+  error: string | null;
+  /** Only persisted APPLIED rows are undoable (the live chip flips at `done`). */
+  undoable: boolean;
+};
+
+const toolCallsKey = (threadId: string) => ["chat-tool-calls", threadId] as const;
+
+// result_json always carries { summary } per the contract; fall back to the raw tool id
+// for failed/rejected rows whose result never materialized.
+function actionSummary(c: ChatToolCall): string {
+  if (c.result_json) {
+    try {
+      const v = JSON.parse(c.result_json) as { summary?: unknown };
+      if (typeof v.summary === "string" && v.summary) return v.summary;
+    } catch {
+      // fall through to the tool id
+    }
+  }
+  return c.tool;
+}
+
+function toChip(c: ChatToolCall): ChipAction {
+  return {
+    id: c.id,
+    tool: c.tool,
+    status: c.status,
+    summary: actionSummary(c),
+    error: c.error,
+    undoable: c.status === "applied" && c.undo_token != null,
+  };
+}
+
+// Hide the raw ```invlab-action {json}``` fenced block from the STREAMED text (the
+// persisted message is already stripped server-side; on `done` the refetch swaps it in).
+// Also hides a dangling, still-open fence mid-stream so it never flashes raw JSON.
+function stripActionBlocks(s: string): string {
+  return s
+    .replace(/```invlab-action[\s\S]*?```/g, "")
+    .replace(/```invlab-action[\s\S]*$/g, "")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
 export function CycleChatPanel({ cycleId }: { cycleId: string }) {
   const t = useT(STR);
   const qc = useQueryClient();
@@ -185,11 +274,49 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
 
   const { data: persisted } = useChatMessages(threadId ?? undefined);
 
+  // Persisted tool-call rows for this thread → action chips under their assistant turns.
+  // Live `action` stream events append to liveActions mid-turn; `done` invalidates this
+  // query (the rows are persisted by then) and clears the live buffer.
+  const { data: toolCalls } = useQuery({
+    queryKey: toolCallsKey(threadId ?? ""),
+    queryFn: () => listChatToolCalls(threadId as string),
+    enabled: !!threadId,
+  });
+  const actionsByMessage = useMemo(() => {
+    const map = new Map<string, ChipAction[]>();
+    for (const c of toolCalls ?? []) {
+      const chip = toChip(c);
+      const arr = map.get(c.message_id);
+      if (arr) arr.push(chip);
+      else map.set(c.message_id, [chip]);
+    }
+    return map;
+  }, [toolCalls]);
+
+  // Undo one applied action: consumes the row's undo_token, flips the chip to `undone`.
+  const undoAction = useMutation({
+    mutationFn: (toolCallId: string) => undoChatAction(toolCallId),
+    onSuccess: (updated) => {
+      qc.setQueryData<ChatToolCall[]>(toolCallsKey(updated.thread_id), (prev) =>
+        prev?.map((c) => (c.id === updated.id ? updated : c)),
+      );
+      toast.success(tr(STR).actionUndone);
+    },
+    onError: (e) => toast.error(tr(STR).undoFailed(String(e))),
+  });
+
   // The live message list = persisted history + an in-flight streaming buffer.
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const [streamBuf, setStreamBuf] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Actions streamed for the CURRENT turn (chips on the draft bubble, pre-persistence).
+  const [liveActions, setLiveActions] = useState<ChipAction[]>([]);
+  // The thread pending delete confirmation (ConfirmDialog replaced the native confirm).
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    label: string;
+  } | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
   // The thread whose turn is currently streaming. send() sets this BEFORE it sets
   // threadId (when creating a thread), so the reset effect below can tell a genuine
@@ -205,6 +332,7 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
     setStreamBuf("");
     setIsRunning(false);
     setError(null);
+    setLiveActions([]);
     unlistenRef.current?.();
     unlistenRef.current = null;
   }, [threadId]);
@@ -223,8 +351,80 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
     return base;
   }, [persisted, streamingId, streamBuf, isRunning]);
 
-  // Send a turn: ensure a thread, persist the user message, subscribe to the stream,
-  // then invoke cycle_chat_send. Tokens append to streamBuf; done refreshes the history.
+  // Run ONE assistant turn on a thread: subscribe to the stream, then invoke
+  // cycle_chat_send. The user message must already be persisted — retry() reuses this to
+  // re-run a failed turn WITHOUT appending a duplicate user message. Tokens append to
+  // streamBuf; `action` events chip onto the draft bubble; `done` refreshes the history
+  // (the persisted assistant message is stored stripped of the raw action block, so the
+  // refetch REPLACES the raw streamed draft).
+  async function runTurn(tid: string, text: string) {
+    runningThreadRef.current = tid;
+
+    // Set up the in-flight assistant buffer + subscribe BEFORE sending so no token is lost.
+    const localStreamId = "streaming-" + Date.now();
+    setStreamingId(localStreamId);
+    setStreamBuf("");
+    setLiveActions([]);
+    setIsRunning(true);
+
+    const threadForEvents = tid;
+    unlistenRef.current?.();
+    unlistenRef.current = onChatEvent(threadForEvents, (e) => {
+      if (e.kind === "token") {
+        setStreamBuf((b) => b + e.text);
+      } else if (e.kind === "action") {
+        // One processed whitelisted action — chip it onto the streaming bubble right
+        // away; the persisted row (with undo_token) lands with `done` below.
+        setLiveActions((prev) => [
+          ...prev,
+          {
+            id: e.tool_call_id,
+            tool: e.tool,
+            status: e.status,
+            summary: e.summary,
+            error: null,
+            undoable: false,
+          },
+        ]);
+      } else if (e.kind === "done") {
+        setIsRunning(false);
+        setStreamingId(null);
+        setStreamBuf("");
+        setLiveActions([]);
+        runningThreadRef.current = null;
+        unlistenRef.current?.();
+        unlistenRef.current = null;
+        qc.invalidateQueries({ queryKey: chatKeys.messages(threadForEvents) });
+        qc.invalidateQueries({ queryKey: toolCallsKey(threadForEvents) });
+        qc.invalidateQueries({ queryKey: chatKeys.threads(cycleId) });
+      } else if (e.kind === "error") {
+        setIsRunning(false);
+        setStreamingId(null);
+        setStreamBuf("");
+        setLiveActions([]);
+        runningThreadRef.current = null;
+        unlistenRef.current?.();
+        unlistenRef.current = null;
+        if (e.message !== "cancelled") setError(e.message);
+        qc.invalidateQueries({ queryKey: chatKeys.messages(threadForEvents) });
+        qc.invalidateQueries({ queryKey: toolCallsKey(threadForEvents) });
+      }
+    });
+
+    try {
+      await cycleChatSend(threadForEvents, cycleId, text);
+    } catch (err) {
+      setIsRunning(false);
+      setStreamingId(null);
+      setLiveActions([]);
+      runningThreadRef.current = null;
+      setError(String(err));
+      unlistenRef.current?.();
+      unlistenRef.current = null;
+    }
+  }
+
+  // Send a turn: ensure a thread, persist the user message, then run the turn.
   async function send(text: string) {
     const clean = text.trim();
     if (!clean || isRunning) return;
@@ -244,48 +444,21 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
     await cycleChatAppend(tid, clean);
     await qc.invalidateQueries({ queryKey: chatKeys.messages(tid) });
 
-    // Set up the in-flight assistant buffer + subscribe BEFORE sending so no token is lost.
-    const localStreamId = "streaming-" + Date.now();
-    setStreamingId(localStreamId);
-    setStreamBuf("");
-    setIsRunning(true);
+    await runTurn(tid, clean);
+  }
 
-    const threadForEvents = tid;
-    unlistenRef.current?.();
-    unlistenRef.current = onChatEvent(threadForEvents, (e) => {
-      if (e.kind === "token") {
-        setStreamBuf((b) => b + e.text);
-      } else if (e.kind === "done") {
-        setIsRunning(false);
-        setStreamingId(null);
-        setStreamBuf("");
-        runningThreadRef.current = null;
-        unlistenRef.current?.();
-        unlistenRef.current = null;
-        qc.invalidateQueries({ queryKey: chatKeys.messages(threadForEvents) });
-        qc.invalidateQueries({ queryKey: chatKeys.threads(cycleId) });
-      } else if (e.kind === "error") {
-        setIsRunning(false);
-        setStreamingId(null);
-        setStreamBuf("");
-        runningThreadRef.current = null;
-        unlistenRef.current?.();
-        unlistenRef.current = null;
-        if (e.message !== "cancelled") setError(e.message);
-        qc.invalidateQueries({ queryKey: chatKeys.messages(threadForEvents) });
-      }
-    });
-
-    try {
-      await cycleChatSend(threadForEvents, cycleId, clean);
-    } catch (err) {
-      setIsRunning(false);
-      setStreamingId(null);
-      runningThreadRef.current = null;
-      setError(String(err));
-      unlistenRef.current?.();
-      unlistenRef.current = null;
-    }
+  // Retry a FAILED assistant turn: re-run send for the user message that produced it,
+  // WITHOUT re-appending that user message (no duplicate). The fresh answer lands as a
+  // new assistant message on the same thread.
+  async function retry(failedMessageId: string) {
+    if (!threadId || isRunning) return;
+    setError(null);
+    const list = persisted ?? [];
+    const at = list.findIndex((m) => m.id === failedMessageId);
+    const scope = at === -1 ? list : list.slice(0, at);
+    const lastUser = [...scope].reverse().find((m) => m.role === "user");
+    if (!lastUser) return;
+    await runTurn(threadId, lastUser.content);
   }
 
   async function stop() {
@@ -293,6 +466,7 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
     setIsRunning(false);
     setStreamingId(null);
     setStreamBuf("");
+    setLiveActions([]);
     runningThreadRef.current = null;
     unlistenRef.current?.();
     unlistenRef.current = null;
@@ -363,17 +537,12 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
             }}
             onRename={(id, title) => renameThread.mutate({ threadId: id, title })}
             onDelete={(id) => {
-              // ponytail: reuse the codebase's existing window.confirm guard (same
-              // pattern as guides.tsx) instead of pulling in an AlertDialog.
+              // Destructive → the shared ConfirmDialog (v3 F3), not a native confirm.
               const thread = threads?.find((x) => x.id === id);
-              const label = thread?.title?.trim() || t.thisChat;
-              if (!confirm(t.deleteConfirm(label))) return;
-              deleteThread.mutate(id);
-              // Switch to the next remaining thread (newest), else empty state.
-              if (id === threadId) {
-                const next = threads?.find((x) => x.id !== id);
-                setThreadId(next ? next.id : null);
-              }
+              setDeleteTarget({
+                id,
+                label: thread?.title?.trim() || t.thisChat,
+              });
             }}
           />
           <Tooltip>
@@ -407,6 +576,20 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
                       content={m.content}
                       citations={m.citations}
                       streaming={m.streaming}
+                      actions={
+                        m.streaming
+                          ? liveActions
+                          : (actionsByMessage.get(m.id) ?? [])
+                      }
+                      error={m.error ?? null}
+                      canRetry={!isRunning}
+                      onRetry={() => retry(m.id)}
+                      onUndoAction={(id) => undoAction.mutate(id)}
+                      undoingId={
+                        undoAction.isPending
+                          ? (undoAction.variables ?? null)
+                          : null
+                      }
                       interviewTitle={interviewTitle}
                       onOpenCitation={openCitation}
                     />
@@ -424,6 +607,29 @@ export function CycleChatPanel({ cycleId }: { cycleId: string }) {
 
         {/* Composer. */}
         <Composer isRunning={isRunning} onSend={send} onStop={stop} />
+
+        {/* Thread-delete confirm (destructive; replaces the old native confirm). */}
+        <ConfirmDialog
+          open={deleteTarget !== null}
+          onOpenChange={(o) => {
+            if (!o) setDeleteTarget(null);
+          }}
+          title={t.deleteChatTitle}
+          body={t.deleteConfirm(deleteTarget?.label ?? "")}
+          confirmLabel={t.delete}
+          destructive
+          onConfirm={() => {
+            if (!deleteTarget) return;
+            const { id } = deleteTarget;
+            deleteThread.mutate(id);
+            // Switch to the next remaining thread (newest), else empty state.
+            if (id === threadId) {
+              const next = threads?.find((x) => x.id !== id);
+              setThreadId(next ? next.id : null);
+            }
+            setDeleteTarget(null);
+          }}
+        />
       </div>
     </AssistantRuntimeProvider>
   );
@@ -672,18 +878,38 @@ function AssistantBubble({
   content,
   citations,
   streaming,
+  actions,
+  error,
+  canRetry,
+  onRetry,
+  onUndoAction,
+  undoingId,
   interviewTitle,
   onOpenCitation,
 }: {
   content: string;
   citations: ChatCitation[];
   streaming?: boolean;
+  // Processed agent actions for THIS turn (persisted rows, or live events while streaming).
+  actions: ChipAction[];
+  // The persisted turn's error (status=error) — shown with a Retry affordance.
+  error: string | null;
+  canRetry: boolean;
+  onRetry: () => void;
+  onUndoAction: (toolCallId: string) => void;
+  // The tool-call id whose undo is in flight (spinner on that chip), if any.
+  undoingId: string | null;
   interviewTitle: (id: string) => string;
   onOpenCitation: (c: ChatCitation) => void;
 }) {
-  // Strip the inline [[…]] tokens for display (chips render in the Citations footer); a
-  // streaming half-token (a trailing "[[" mid-stream) is hidden so it never flashes raw.
-  const display = useMemo(() => stripCitationTokens(content), [content]);
+  const t = useT(STR);
+  // Strip the inline [[…]] tokens for display (chips render in the Citations footer) and
+  // the raw ```invlab-action``` fenced block (streamed text still carries it; the stored
+  // message is stripped server-side). A dangling half-token mid-stream never flashes raw.
+  const display = useMemo(
+    () => stripCitationTokens(stripActionBlocks(content)),
+    [content],
+  );
 
   return (
     <div className="flex flex-col gap-2">
@@ -693,6 +919,41 @@ function AssistantBubble({
           <span className="ml-0.5 inline-block h-3.5 w-1.5 translate-y-0.5 animate-pulse rounded-full bg-primary align-middle" />
         )}
       </div>
+
+      {/* Agent action chips: what this turn actually DID (glossary/synthesis writes). */}
+      {actions.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {actions.map((a) => (
+            <ActionChip
+              key={a.id}
+              action={a}
+              undoing={undoingId === a.id}
+              onUndo={a.undoable ? () => onUndoAction(a.id) : undefined}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Failed turn → the stored error + a Retry that re-runs the send (no duplicate
+          user message; see retry()). */}
+      {error && !streaming && (
+        <div className="flex items-center gap-2 rounded-md border border-status-error/40 bg-status-error/5 px-2.5 py-1.5">
+          <p className="min-w-0 flex-1 text-xs break-words text-status-error">
+            {error}
+          </p>
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={!canRetry}
+            aria-label={t.retryAria}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-border bg-secondary/40 px-1.5 py-0.5 text-[11px] font-medium text-foreground transition-colors hover:border-border-strong hover:bg-secondary focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-50"
+          >
+            <RotateCcw className="size-3" />
+            {t.retry}
+          </button>
+        </div>
+      )}
+
       {citations.length > 0 && (
         <CitationFooter
           citations={citations}
@@ -702,6 +963,86 @@ function AssistantBubble({
       )}
     </div>
   );
+}
+
+// --- action chips (M11 Phase B tool-use) ----------------------------------------
+// One flat chip per processed agent action, attached under its assistant turn. Status is
+// a quiet tint, not a loud badge: applied = ready-green with an inline Undo; rejected /
+// failed = muted error with the reason in a tooltip; undone = struck & dimmed.
+
+const TOOL_ICONS: Record<string, typeof Book> = {
+  "glossary.add_terms": Book,
+  "synthesis.update_finding": PenLine,
+};
+
+function ActionChip({
+  action,
+  undoing,
+  onUndo,
+}: {
+  action: ChipAction;
+  undoing: boolean;
+  onUndo?: () => void;
+}) {
+  const t = useT(STR);
+  const Icon = TOOL_ICONS[action.tool] ?? Wrench;
+  const failed = action.status === "rejected" || action.status === "failed";
+  const undone = action.status === "undone";
+  const statusLabel =
+    action.status === "applied"
+      ? t.actionStatusApplied
+      : action.status === "rejected"
+        ? t.actionStatusRejected
+        : action.status === "failed"
+          ? t.actionStatusFailed
+          : t.actionStatusUndone;
+
+  const chip = (
+    <span
+      title={failed ? undefined : statusLabel}
+      className={cn(
+        "inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-1 text-[11px]",
+        action.status === "applied" &&
+          "border-status-ready/30 bg-status-ready/10 text-status-ready",
+        failed && "border-status-error/25 bg-status-error/5 text-status-error/80",
+        undone && "border-border bg-secondary/30 text-muted-foreground",
+      )}
+    >
+      <Icon className="size-3 shrink-0" />
+      <span className={cn("min-w-0 truncate", undone && "line-through opacity-70")}>
+        {action.summary}
+      </span>
+      {onUndo && !undone && (
+        <button
+          type="button"
+          onClick={onUndo}
+          disabled={undoing}
+          aria-label={t.undoActionAria(action.summary)}
+          className="ml-0.5 flex shrink-0 items-center gap-1 rounded border border-transparent px-1 py-0.5 font-medium transition-colors hover:border-status-ready/40 hover:bg-status-ready/10 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-60"
+        >
+          {undoing ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <Undo2 className="size-3" />
+          )}
+          {t.undoAction}
+        </button>
+      )}
+    </span>
+  );
+
+  // Rejected/failed chips carry the reason in a tooltip (the chip stays quiet).
+  if (failed && action.error) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{chip}</TooltipTrigger>
+        <TooltipContent side="top" className="max-w-72 break-words">
+          {action.error}
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+  return chip;
 }
 
 function CitationFooter({

@@ -51,6 +51,7 @@ import {
   transcribeInterview,
 } from "@/lib/tauri";
 import { GlossarySuggestDialog } from "@/components/glossary-suggest-dialog";
+import { useConfirm } from "@/components/confirm-dialog";
 import { useT, tr } from "@/lib/i18n";
 // dev-mock: browser-only, never active under Tauri.
 import {
@@ -86,8 +87,10 @@ const STR = {
     noSupportedFiles: "В перетащенных файлах нет поддерживаемого аудио/видео",
     transcriptionFailed: (err: string) => `Не удалось транскрибировать: ${err}`,
     cleanupFailed: (err: string) => `Не удалось очистить: ${err}`,
-    reTranscribeConfirm: (title: string) =>
-      `Перетранскрибировать «${title}»? Это перезапишет существующий транскрипт и ручные правки/разметку спикеров.`,
+    reTranscribeTitle: "Перетранскрибировать заново?",
+    reTranscribeBody: (title: string) =>
+      `«${title}» будет транскрибировано заново. Это сотрёт ручные правки транскрипта и разметку спикеров — существующий транскрипт будет перезаписан.`,
+    reTranscribeAction: "Перетранскрибировать",
     modelNotDownloaded: (label: string) =>
       `Модель «${label}» ещё не скачана — скачайте её в Настройки → Транскрипция.`,
     diarNotDownloaded: "Модель диаризации не скачана — спикеры (S1/S2…) не будут размечены.",
@@ -102,15 +105,19 @@ const STR = {
     couldntImport: (err: string) => `Не удалось импортировать транскрипт. ${err}`,
     stopping: (title: string) => `Останавливаю «${title}»…`,
     couldntStop: (err: string) => `Не удалось остановить. ${err}`,
-    reDiarizeConfirm: (title: string) =>
-      `Заново разметить спикеров в «${title}»? Это перезапишет существующую разметку спикеров и ручные правки.`,
+    reDiarizeTitle: "Переразметить спикеров?",
+    reDiarizeBody: (title: string) =>
+      `Спикеры в «${title}» будут размечены заново. Это сотрёт ручные правки транскрипта и существующую разметку спикеров.`,
+    reDiarizeAction: "Переразметить",
     reDiarized: (title: string, speakers: number) =>
       `Спикеры заново размечены в «${title}» — обнаружено ${speakers} ${
         speakers === 1 ? "спикер" : "спик."
       }`,
     couldntRediarize: (err: string) => `Не удалось переразметить спикеров. ${err}`,
-    reCleanConfirm: (title: string) =>
-      `Очистить заново «${title}»? Это перезапишет существующий очищенный текст и ручные правки.`,
+    reCleanTitle: "Очистить заново?",
+    reCleanBody: (title: string) =>
+      `«${title}» будет очищено заново. Это сотрёт ручные правки транскрипта — очищенный текст будет перезаписан.`,
+    reCleanAction: "Очистить заново",
     cleaned: (title: string) => `Очищено «${title}»`,
     couldntClean: (err: string) => `Не удалось очистить. ${err}`,
     importing: (n: number) => `Импортирую ${n} ${n === 1 ? "файл" : "файлов"}…`,
@@ -144,8 +151,10 @@ const STR = {
     transcribe: "Транскрибировать",
     transcribeAria: (title: string) => `Транскрибировать «${title}»`,
     deleteAria: (title: string) => `Удалить «${title}»`,
-    deleteConfirm: (title: string) =>
-      `Удалить «${title}»? Это нельзя отменить — удалятся транскрипт, правки и саммари.`,
+    deleteTitle: "Удалить интервью?",
+    deleteBody: (title: string) =>
+      `Удалить «${title}» и все его данные — транскрипт, правки, саммари? Это действие необратимо.`,
+    deleteAction: "Удалить",
     deleted: "Удалено",
     couldntDelete: (err: string) => `Не удалось удалить. ${err}`,
     dragHereOr: "Перетащите сюда аудио или видео, или",
@@ -169,8 +178,10 @@ const STR = {
     noSupportedFiles: "No supported audio/video files in the drop",
     transcriptionFailed: (err: string) => `Transcription failed: ${err}`,
     cleanupFailed: (err: string) => `Cleanup failed: ${err}`,
-    reTranscribeConfirm: (title: string) =>
-      `Re-transcribe "${title}"? This overwrites the existing transcript and any manual edits / speaker labels.`,
+    reTranscribeTitle: "Re-transcribe from scratch?",
+    reTranscribeBody: (title: string) =>
+      `"${title}" will be transcribed again. This erases your manual transcript edits and speaker labels — the existing transcript is overwritten.`,
+    reTranscribeAction: "Re-transcribe",
     modelNotDownloaded: (label: string) =>
       `The "${label}" model isn't downloaded yet — get it in Settings → Transcription.`,
     diarNotDownloaded: "Diarization model isn't downloaded — speakers (S1/S2…) won't be labeled.",
@@ -185,15 +196,19 @@ const STR = {
     couldntImport: (err: string) => `Couldn't import the transcript. ${err}`,
     stopping: (title: string) => `Stopping "${title}"…`,
     couldntStop: (err: string) => `Couldn't stop. ${err}`,
-    reDiarizeConfirm: (title: string) =>
-      `Re-diarize "${title}"? This overwrites the existing speaker labels and manual edits.`,
+    reDiarizeTitle: "Re-diarize speakers?",
+    reDiarizeBody: (title: string) =>
+      `"${title}" will get fresh speaker labels. This erases your manual transcript edits and the existing speaker labels.`,
+    reDiarizeAction: "Re-diarize",
     reDiarized: (title: string, speakers: number) =>
       `Re-diarized "${title}" — ${speakers} speaker${
         speakers === 1 ? "" : "s"
       } detected`,
     couldntRediarize: (err: string) => `Couldn't re-diarize. ${err}`,
-    reCleanConfirm: (title: string) =>
-      `Re-clean "${title}"? This overwrites the existing cleaned text and manual edits.`,
+    reCleanTitle: "Re-clean transcript?",
+    reCleanBody: (title: string) =>
+      `"${title}" will be cleaned again. This erases your manual transcript edits — the cleaned text is overwritten.`,
+    reCleanAction: "Re-clean",
     cleaned: (title: string) => `Cleaned "${title}"`,
     couldntClean: (err: string) => `Couldn't clean. ${err}`,
     importing: (n: number) => `Importing ${n} file${n > 1 ? "s" : ""}…`,
@@ -227,8 +242,10 @@ const STR = {
     transcribe: "Transcribe",
     transcribeAria: (title: string) => `Transcribe ${title}`,
     deleteAria: (title: string) => `Delete ${title}`,
-    deleteConfirm: (title: string) =>
-      `Delete "${title}"? This can't be undone — the transcript, edits, and summary are removed.`,
+    deleteTitle: "Delete interview?",
+    deleteBody: (title: string) =>
+      `Delete "${title}" and all its data — transcript, edits, summary? This can't be undone.`,
+    deleteAction: "Delete",
     deleted: "Deleted",
     couldntDelete: (err: string) => `Couldn't delete. ${err}`,
     dragHereOr: "Drag audio or video files here, or",
@@ -264,6 +281,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   const deleteInterview = useDeleteInterview(cycleId);
   const qc = useQueryClient();
   const [isDragOver, setIsDragOver] = useState(false);
+  // Shared confirm dialog for the destructive row actions (delete / re-transcribe /
+  // re-clean / re-diarize) — replaces the old native confirm() guards (v3 F3 P0).
+  const { confirm: confirmAction, dialog: confirmDialog } = useConfirm();
 
   // The model + language + expected-speaker count chosen in Settings → Transcription drive
   // every Transcribe / Re-diarize.
@@ -456,10 +476,17 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // flips the row to 'transcribing'; the asr://progress stream + invalidation do the rest.
   async function transcribe(row: InterviewRow) {
     // Re-running on an already-processed interview overwrites the transcript and any
-    // manual edits / speaker labels — guard it (ponytail: native confirm, like delete).
+    // manual edits / speaker labels — confirm it explicitly (destructive).
     const s = tr(STR);
-    if (row.status !== "new" && !confirm(s.reTranscribeConfirm(row.title)))
-      return;
+    if (row.status !== "new") {
+      const ok = await confirmAction({
+        title: s.reTranscribeTitle,
+        body: s.reTranscribeBody(row.title),
+        confirmLabel: s.reTranscribeAction,
+        destructive: true,
+      });
+      if (!ok) return;
+    }
     if (!selectedModel?.downloaded) {
       toast.error(s.modelNotDownloaded(selectedModel?.label ?? asrModelId));
       return;
@@ -542,7 +569,13 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // badge — re-diarize is quick and doesn't change the interview's status.
   async function rediarize(row: InterviewRow) {
     const s = tr(STR);
-    if (!confirm(s.reDiarizeConfirm(row.title))) return;
+    const ok = await confirmAction({
+      title: s.reDiarizeTitle,
+      body: s.reDiarizeBody(row.title),
+      confirmLabel: s.reDiarizeAction,
+      destructive: true,
+    });
+    if (!ok) return;
     try {
       const speakers = await rediarizeInterview(row.id, expectedSpeakers);
       toast.success(s.reDiarized(row.title, speakers));
@@ -556,13 +589,17 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   // to 'cleaning'; the cleanup://progress stream + invalidation do the rest.
   async function clean(row: InterviewRow) {
     // First Clean on a raw transcript is non-destructive enough; but Re-clean over a
-    // cleaned/edited version overwrites manual edits — guard those.
+    // cleaned/edited version overwrites manual edits — confirm those (destructive).
     const s = tr(STR);
-    if (
-      (row.status === "cleaned" || row.status === "edited") &&
-      !confirm(s.reCleanConfirm(row.title))
-    )
-      return;
+    if (row.status === "cleaned" || row.status === "edited") {
+      const ok = await confirmAction({
+        title: s.reCleanTitle,
+        body: s.reCleanBody(row.title),
+        confirmLabel: s.reCleanAction,
+        destructive: true,
+      });
+      if (!ok) return;
+    }
     setCleanProgress((prev) => ({ ...prev, [row.id]: 0 }));
     try {
       await cleanTranscript(row.id);
@@ -599,6 +636,23 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
 
   function openEditor(row: InterviewRow) {
     navigate(`/cycles/${cycleId}/interviews/${row.id}`);
+  }
+
+  // Hard delete: interview + transcript + edits + summary. Confirmed via the shared
+  // ConfirmDialog («…и все его данные? Это действие необратимо»); undo is out of scope.
+  async function handleDelete(row: InterviewRow) {
+    const s = tr(STR);
+    const ok = await confirmAction({
+      title: s.deleteTitle,
+      body: s.deleteBody(row.title),
+      confirmLabel: s.deleteAction,
+      destructive: true,
+    });
+    if (!ok) return;
+    deleteInterview.mutate(row.id, {
+      onSuccess: () => toast.success(tr(STR).deleted),
+      onError: (e) => toast.error(tr(STR).couldntDelete(String(e))),
+    });
   }
 
   async function ingest(paths: string[]) {
@@ -871,16 +925,7 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
                 className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
                 onClick={(e) => {
                   e.stopPropagation();
-                  // ponytail: native confirm() guard, same pattern as guides.tsx:148
-                  // / cycle-chat-panel.tsx:309 — no AlertDialog needed for a destructive
-                  // one-off. Toast confirms after; undo is out of scope (hard delete).
-                  if (!confirm(tr(STR).deleteConfirm(row.original.title)))
-                    return;
-                  deleteInterview.mutate(row.original.id, {
-                    onSuccess: () => toast.success(tr(STR).deleted),
-                    onError: (e) =>
-                      toast.error(tr(STR).couldntDelete(String(e))),
-                  });
+                  handleDelete(row.original);
                 }}
               >
                 <Trash2 className="size-4" />
@@ -1019,6 +1064,9 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
           if (!open) setGlossaryFor(null);
         }}
       />
+
+      {/* Shared confirm for the destructive row actions (delete / re-run overwrites). */}
+      {confirmDialog}
     </div>
   );
 }

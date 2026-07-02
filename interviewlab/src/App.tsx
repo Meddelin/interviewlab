@@ -1,9 +1,10 @@
 import { useEffect } from "react";
-import { Search, Sparkles } from "lucide-react";
-import { NavLink, Outlet, useMatch } from "react-router-dom";
+import { ChevronRight, Search, Sparkles } from "lucide-react";
+import { Link, NavLink, Outlet, useMatch } from "react-router-dom";
 import { BackendStatus } from "@/components/backend-status";
 import { CommandPalette } from "@/components/command-palette";
 import { OnboardingWizard } from "@/components/onboarding-wizard";
+import { TaskCenter } from "@/components/task-center";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LanguageToggle } from "@/components/language-toggle";
 import { CycleChatPanel } from "@/components/cycle-chat-panel";
@@ -12,6 +13,9 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import { useCycle } from "@/lib/cycle-queries";
+import { useInterviews } from "@/lib/interview-queries";
+import { useTaskEvents } from "@/lib/task-store";
 import { useUiStore } from "@/lib/ui-store";
 import { useLiveAsr } from "@/lib/use-live-asr";
 import { mod } from "@/lib/platform";
@@ -29,6 +33,7 @@ const STR = {
     askAi: "Спросить AI",
     workspace: "InterviewLab",
     primaryNav: "Основная навигация",
+    breadcrumbs: "Вы здесь",
     openPalette: "Открыть командную палитру",
     search: "Поиск",
     skipToContent: "Перейти к содержимому",
@@ -43,6 +48,7 @@ const STR = {
     askAi: "Ask AI",
     workspace: "InterviewLab",
     primaryNav: "Primary",
+    breadcrumbs: "You are here",
     openPalette: "Open command palette",
     search: "Search",
     skipToContent: "Skip to content",
@@ -104,9 +110,77 @@ function AskAiButton({ cycleId }: { cycleId: string }) {
   );
 }
 
+// Header breadcrumbs (v3 F1, P1 wayfinding fix): inside a cycle the header shows
+// "Cycles › <cycle name> [› <interview title>]" so the current place is always visible
+// (tabs live in ?tab=; the crumb links stay one click from any level). Uses the same
+// react-query hooks the pages use, so the names are usually already cached.
+function Breadcrumbs() {
+  const t = useT(STR);
+  const detail = useMatch("/cycles/:id");
+  const editor = useMatch("/cycles/:cycleId/interviews/:interviewId");
+  const cycleId = editor?.params.cycleId ?? detail?.params.id ?? null;
+  const interviewId = editor?.params.interviewId ?? null;
+  const { data: cycle } = useCycle(cycleId ?? undefined);
+  // The interview list is only needed for the editor crumb's title.
+  const { data: interviews } = useInterviews(
+    interviewId ? (cycleId ?? undefined) : undefined,
+  );
+  if (!cycleId) return null;
+  const interview = interviewId
+    ? interviews?.find((i) => i.id === interviewId)
+    : undefined;
+  const cycleName = cycle?.name ?? "…";
+
+  return (
+    <nav
+      aria-label={t.breadcrumbs}
+      className="hidden min-w-0 items-center gap-1 text-xs text-muted-foreground md:flex"
+    >
+      <Link
+        to="/cycles"
+        className="shrink-0 rounded-sm transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+      >
+        {t.nav.cycles}
+      </Link>
+      <ChevronRight className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+      {interviewId ? (
+        <Link
+          to={`/cycles/${cycleId}`}
+          title={cycle?.name}
+          className="max-w-[22ch] truncate rounded-sm transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+        >
+          {cycleName}
+        </Link>
+      ) : (
+        // Terminal crumb = the current page: quiet, non-link.
+        <span
+          className="max-w-[26ch] truncate text-foreground/80"
+          title={cycle?.name}
+        >
+          {cycleName}
+        </span>
+      )}
+      {interviewId && (
+        <>
+          <ChevronRight
+            className="size-3 shrink-0 opacity-60"
+            aria-hidden="true"
+          />
+          <span
+            className="max-w-[26ch] truncate text-foreground/80"
+            title={interview?.title}
+          >
+            {interview?.title ?? "…"}
+          </span>
+        </>
+      )}
+    </nav>
+  );
+}
+
 // Compact top header: workspace mark + title, quiet nav links (accent active state),
-// the cycle-scoped Ask AI CTA (cycle routes only), the Search ⌘K affordance, the
-// backend-status dot, and the theme toggle.
+// breadcrumbs inside a cycle, the cycle-scoped Ask AI CTA (cycle routes only), the
+// Search ⌘K affordance, the task center, the backend-status dot, and the theme toggle.
 function Header({ cycleId }: { cycleId: string | null }) {
   const t = useT(STR);
   const setCommandOpen = useUiStore((s) => s.setCommandOpen);
@@ -153,6 +227,8 @@ function Header({ cycleId }: { cycleId: string | null }) {
         ))}
       </nav>
 
+      <Breadcrumbs />
+
       <div className="ml-auto flex items-center gap-2">
         {/* Ask AI — only within a cycle (detail or editor); hidden on list/guides/settings. */}
         {cycleId && <AskAiButton cycleId={cycleId} />}
@@ -169,6 +245,8 @@ function Header({ cycleId }: { cycleId: string | null }) {
             {mod("K")}
           </kbd>
         </button>
+        {/* Global task center — background-op progress that survives navigation. */}
+        <TaskCenter />
         <BackendStatus />
         <LanguageToggle />
         <ThemeToggle />
@@ -184,6 +262,11 @@ function App() {
   // Capture live transcription/diarization progress globally so opening an interview
   // mid-run shows it filling in (and the editor swaps to the stored transcript on finish).
   useLiveAsr();
+
+  // The ONE global subscription feeding the header task center: every backend progress
+  // stream (ASR, import, cleanup, synthesis, diarization, coverage, model downloads)
+  // normalizes into the task store, so long-op progress survives navigation.
+  useTaskEvents();
 
   // Chat state lives at the shell now (lifted from cycle-detail) so the panel docks on
   // ANY cycle screen, incl. the transcript editor. Open/width persist per cycle.
@@ -289,9 +372,10 @@ function WorkArea() {
       id="main"
       className={cn(
         "h-full w-full",
-        // Center content in a capped column so it isn't pinned to the left with dead
-        // space on wide/ultrawide screens (Linear-style). Editor stays full-bleed.
-        !isEditor && "mx-auto max-w-screen-xl px-6 py-6 lg:px-8",
+        // Center content in a capped column (~1536px) so it isn't pinned to the left
+        // with dead space on wide/ultrawide screens (v3 P0 #7, Linear-style). The
+        // transcript editor stays full-bleed — it's a dense two-pane work surface.
+        !isEditor && "mx-auto max-w-screen-2xl px-6 py-6 lg:px-8",
       )}
     >
       <Outlet />

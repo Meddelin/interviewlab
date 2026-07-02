@@ -5,15 +5,18 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
   Download,
+  FileDown,
   FileText,
   Info,
   LayoutList,
   Lightbulb,
   Loader2,
   Quote,
+  RotateCcw,
   Save,
   Sparkles,
   Target,
+  TriangleAlert,
   Users,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -29,6 +32,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { useInterviews } from "@/lib/interview-queries";
+import { useCycle } from "@/lib/cycle-queries";
 import {
   synthesisKeys,
   useCycleGoals,
@@ -37,8 +41,16 @@ import {
   useSynthesis,
 } from "@/lib/synthesis-queries";
 import {
+  buildCycleReportHtml,
+  downloadHtmlReport,
+  reportFileName,
+} from "@/lib/report-export";
+import {
+  getDiff,
+  getGuideCoverage,
   IN_TAURI,
   SYNTHESIS_PROGRESS_EVENT,
+  type CoverageRow,
   type Evidence,
   type Finding,
   type Goal,
@@ -111,6 +123,17 @@ const STR = {
     addGoalsSuffix: " в гайд интервью на вкладке «Обзор».",
     unknown: "неизвестно",
     interviewFallback: (id: string) => `Интервью ${id}`,
+    exportReportHtml: "Экспорт отчёта (HTML)",
+    exportReportTitle:
+      "Скачать standalone HTML-отчёт волны: резюме, выводы, дифф и покрытие",
+    exportingReport: "Собираем отчёт…",
+    reportExported: "HTML-отчёт скачан",
+    reportFailed: (e: string) => `Не удалось собрать отчёт. ${e}`,
+    divergedBanner:
+      "Markdown-версия отредактирована вручную — diff и чат используют исходные findings",
+    rebuild: "Пересобрать",
+    retry: "Повторить",
+    lastRunFailed: (e: string) => `Синтез не удался: ${e}`,
   },
   en: {
     copiedToClipboard: "Copied to clipboard",
@@ -167,6 +190,17 @@ const STR = {
     addGoalsSuffix: " section to the interview guide on the Overview tab first.",
     unknown: "unknown",
     interviewFallback: (id: string) => `Interview ${id}`,
+    exportReportHtml: "Export report (HTML)",
+    exportReportTitle:
+      "Download a standalone HTML report of this wave: summary, findings, diff and coverage",
+    exportingReport: "Building the report…",
+    reportExported: "HTML report downloaded",
+    reportFailed: (e: string) => `Couldn't build the report. ${e}`,
+    divergedBanner:
+      "The markdown version was edited manually — Diff and Chat use the original findings",
+    rebuild: "Re-run",
+    retry: "Retry",
+    lastRunFailed: (e: string) => `Synthesis failed: ${e}`,
   },
 };
 
@@ -579,12 +613,18 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
   const { data: synthesis, isPending } = useSynthesis(cycleId);
   const { data: goals } = useCycleGoals(cycleId);
   const { data: interviews } = useInterviews(cycleId);
+  const { data: cycle } = useCycle(cycleId);
   const runSynthesis = useRunSynthesis(cycleId);
   const saveArtifact = useSaveCycleSynthesis(cycleId);
 
   // Live stage progress (null when idle).
   const [progress, setProgress] = useState<SynthesisProgress | null>(null);
   const [view, setView] = useState<View>("artifact");
+  // The last run's error (null when the last run succeeded / nothing ran yet). Drives the
+  // error banner with its Retry action; cleared when a new run starts.
+  const [runError, setRunError] = useState<string | null>(null);
+  // HTML-report assembly in flight (gathering diff + per-interview coverage).
+  const [exportingReport, setExportingReport] = useState(false);
 
   // M11: a chat citation [[finding:Fn]] routes to #finding-Fn — switch to the structured
   // (findings) view and scroll the card into view when that hash is present. Re-runs on
@@ -645,6 +685,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
         setProgress(null);
         qc.invalidateQueries({ queryKey: synthesisKeys.detail(cycleId) });
         if (p.stage === "error") {
+          setRunError(p.error ?? t.unknown);
           toast.error(t.synthesisFailedEvent(p.error ?? t.unknown));
         }
       } else {
@@ -667,6 +708,7 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
   const running = runSynthesis.isPending || progress != null;
 
   async function handleRun() {
+    setRunError(null);
     setProgress({
       cycle_id: cycleId,
       stage: "extract",
@@ -677,12 +719,49 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
     });
     try {
       const row: SynthesisRow = await runSynthesis.mutateAsync();
+      setRunError(null);
       toast.success(
         t.synthesisComplete(row.doc.findings.length, row.doc.goals.length),
       );
     } catch (e) {
       setProgress(null);
+      setRunError(String(e));
       toast.error(t.synthesisFailedRun(String(e)));
+    }
+  }
+
+  // Assemble + download the standalone HTML wave report: the stored synthesis (with any
+  // saved markdown edits), the diff and each interview's coverage row are gathered on
+  // demand (Promise.all, nulls tolerated — the report simply omits missing sections).
+  async function handleExportReport() {
+    if (!synthesis || !cycle || exportingReport) return;
+    setExportingReport(true);
+    try {
+      const list = interviews ?? [];
+      const [diffRow, coverageRows] = await Promise.all([
+        getDiff(cycleId).catch(() => null),
+        Promise.all(
+          list.map((i) => getGuideCoverage(i.id).catch(() => null)),
+        ),
+      ]);
+      const coverageByInterview: Record<string, CoverageRow | null> = {};
+      list.forEach((i, idx) => {
+        coverageByInterview[i.id] = coverageRows[idx];
+      });
+      const html = buildCycleReportHtml({
+        cycle,
+        synthesis,
+        goals: groupGoals,
+        diff: diffRow,
+        coverageByInterview,
+        interviews: list,
+      });
+      downloadHtmlReport(html, reportFileName(cycle.name));
+      toast.success(t.reportExported);
+    } catch (e) {
+      toast.error(t.reportFailed(String(e)));
+    } finally {
+      setExportingReport(false);
     }
   }
 
@@ -801,6 +880,20 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
                 <Download className="size-3.5" />
                 {t.export}
               </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleExportReport}
+                disabled={exportingReport || !cycle}
+                title={t.exportReportTitle}
+              >
+                {exportingReport ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <FileDown className="size-3.5" />
+                )}
+                {exportingReport ? t.exportingReport : t.exportReportHtml}
+              </Button>
             </>
           )}
           <Button size="sm" onClick={handleRun} disabled={running}>
@@ -829,6 +922,56 @@ export function SynthesisTab({ cycleId }: { cycleId: string }) {
             className="h-full rounded-full bg-primary transition-all duration-500"
             style={{ width: `${progress?.progress ?? 5}%` }}
           />
+        </div>
+      )}
+
+      {/* The last run failed → a quiet red hairline banner with a Retry (same params). */}
+      {runError && !running && (
+        <div className="flex items-start justify-between gap-3 rounded-md border border-status-error/40 bg-status-error/10 px-3 py-2">
+          <div className="flex items-start gap-2">
+            <TriangleAlert
+              className="mt-0.5 size-3.5 shrink-0 text-status-error"
+              aria-hidden="true"
+            />
+            <p className="text-xs leading-relaxed text-foreground/80">
+              {t.lastRunFailed(runError)}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 px-2 text-xs"
+            onClick={handleRun}
+          >
+            <RotateCcw className="size-3" />
+            {t.retry}
+          </Button>
+        </div>
+      )}
+
+      {/* B3 hygiene: the markdown artifact diverged from the structured findings — an
+          amber hairline banner naming what still reads the machine version, with a
+          re-run action that regenerates both layers in sync. */}
+      {synthesis?.edited_diverged && !running && (
+        <div className="flex items-start justify-between gap-3 rounded-md border border-status-importing/40 bg-status-importing/10 px-3 py-2">
+          <div className="flex items-start gap-2">
+            <TriangleAlert
+              className="mt-0.5 size-3.5 shrink-0 text-status-importing"
+              aria-hidden="true"
+            />
+            <p className="text-xs leading-relaxed text-foreground/80">
+              {t.divergedBanner}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 px-2 text-xs"
+            onClick={handleRun}
+          >
+            <RotateCcw className="size-3" />
+            {t.rebuild}
+          </Button>
         </div>
       )}
 

@@ -3,8 +3,13 @@ import { useMatch, useNavigate } from "react-router-dom";
 import { useTheme } from "next-themes";
 import {
   BookText,
+  FileAudio,
   FolderKanban,
+  GitCompare,
   Keyboard,
+  LayoutDashboard,
+  Lightbulb,
+  ListChecks,
   MessageSquare,
   Moon,
   Package,
@@ -29,10 +34,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { modShift } from "@/components/task-center";
 import { useCycles } from "@/lib/cycle-queries";
 import { useGuides } from "@/lib/guide-queries";
+import { useInterviews } from "@/lib/interview-queries";
 import { useProducts } from "@/lib/product-queries";
 import { mod } from "@/lib/platform";
+import { useTaskStore } from "@/lib/task-store";
 import { useUiStore } from "@/lib/ui-store";
 import { useT } from "@/lib/i18n";
 
@@ -43,6 +51,7 @@ const STR = {
     actions: "Действия",
     newCycle: "Новый цикл",
     chatAboutCycle: "Обсудить этот цикл",
+    backgroundTasks: "Фоновые задачи",
     switchToLight: "Переключить на светлую тему",
     switchToDark: "Переключить на тёмную тему",
     keyboardShortcuts: "Горячие клавиши",
@@ -51,6 +60,16 @@ const STR = {
     guides: "Гайды",
     products: "Продукты",
     settings: "Настройки",
+    settingsAiCli: "Настройки · AI CLI",
+    settingsTranscription: "Настройки · Транскрипция",
+    settingsRoles: "Настройки · Роли",
+    settingsAbout: "Настройки · О приложении",
+    cycleTabs: "Разделы цикла",
+    tabOverview: "Обзор",
+    tabInterviews: "Интервью",
+    tabSynthesis: "Синтез",
+    tabDiff: "Сравнение",
+    cycleInterviews: "Интервью этого цикла",
     jumpToCycle: "Перейти к циклу",
     jumpToGuide: "Перейти к гайду",
     jumpToProduct: "Перейти к продукту",
@@ -58,6 +77,7 @@ const STR = {
     shortcutsHintAfter: " для полной командной палитры.",
     scOpenPalette: "Открыть командную палитру",
     scToggleChat: "Открыть/закрыть чат цикла (внутри цикла)",
+    scToggleTasks: "Открыть/закрыть фоновые задачи",
     scShowShortcuts: "Показать этот список горячих клавиш",
   },
   en: {
@@ -66,6 +86,7 @@ const STR = {
     actions: "Actions",
     newCycle: "New cycle",
     chatAboutCycle: "Chat about this cycle",
+    backgroundTasks: "Background tasks",
     switchToLight: "Switch to light theme",
     switchToDark: "Switch to dark theme",
     keyboardShortcuts: "Keyboard shortcuts",
@@ -74,6 +95,16 @@ const STR = {
     guides: "Guides",
     products: "Products",
     settings: "Settings",
+    settingsAiCli: "Settings · AI CLI",
+    settingsTranscription: "Settings · Transcription",
+    settingsRoles: "Settings · Roles",
+    settingsAbout: "Settings · About",
+    cycleTabs: "Cycle sections",
+    tabOverview: "Overview",
+    tabInterviews: "Interviews",
+    tabSynthesis: "Synthesis",
+    tabDiff: "Diff",
+    cycleInterviews: "Interviews in this cycle",
     jumpToCycle: "Jump to cycle",
     jumpToGuide: "Jump to guide",
     jumpToProduct: "Jump to product",
@@ -81,6 +112,7 @@ const STR = {
     shortcutsHintAfter: " for the full command palette.",
     scOpenPalette: "Open command palette",
     scToggleChat: "Toggle the cycle chat (within a cycle)",
+    scToggleTasks: "Toggle the background-tasks panel",
     scShowShortcuts: "Show this keyboard shortcuts list",
   },
 };
@@ -89,9 +121,13 @@ const STR = {
 // cheatsheet (opened with "?") and the hints shown next to palette items. Kept in this
 // file deliberately: the set is tiny and there's no second consumer yet, so a shared
 // module would be premature (// ponytail: a const beats a new module for ~4 keys).
-const SHORTCUTS: { keys: string; labelKey: "scOpenPalette" | "scToggleChat" | "scShowShortcuts" }[] = [
+const SHORTCUTS: {
+  keys: string;
+  labelKey: "scOpenPalette" | "scToggleChat" | "scToggleTasks" | "scShowShortcuts";
+}[] = [
   { keys: mod("K"), labelKey: "scOpenPalette" },
   { keys: mod("J"), labelKey: "scToggleChat" },
+  { keys: modShift("B"), labelKey: "scToggleTasks" },
   { keys: "?", labelKey: "scShowShortcuts" },
 ];
 
@@ -106,6 +142,7 @@ export function CommandPalette() {
   const setOpen = useUiStore((s) => s.setCommandOpen);
   const requestNewCycle = useUiStore((s) => s.requestNewCycle);
   const requestChatOpen = useUiStore((s) => s.requestChatOpen);
+  const toggleTasks = useTaskStore((s) => s.toggleOpen);
   const { data: cycles } = useCycles();
   const { data: guides } = useGuides();
   const { data: products } = useProducts();
@@ -115,6 +152,14 @@ export function CommandPalette() {
   const onCycleDetail = useMatch("/cycles/:id");
   const onTranscriptEditor = useMatch("/cycles/:cycleId/interviews/:interviewId");
   const inCycle = Boolean(onCycleDetail || onTranscriptEditor);
+  // The cycle the route is grounded on — drives the tab-switch + interview-jump groups.
+  const cycleId =
+    onTranscriptEditor?.params.cycleId ?? onCycleDetail?.params.id;
+  // Fetch the current cycle's interviews only while the palette is open (usually a
+  // cache hit — the Interviews tab shares the query key).
+  const { data: cycleInterviews } = useInterviews(
+    open ? cycleId : undefined,
+  );
   const t = useT(STR);
 
   // Global keys: Cmd/Ctrl+K toggles the palette; bare "?" opens the cheatsheet (but only
@@ -176,6 +221,14 @@ export function CommandPalette() {
               </CommandItem>
             )}
             <CommandItem
+              onSelect={() => run(() => toggleTasks())}
+              keywords={["tasks", "background", "progress", "задачи", "прогресс"]}
+            >
+              <ListChecks />
+              <span>{t.backgroundTasks}</span>
+              <CommandShortcut>{modShift("B")}</CommandShortcut>
+            </CommandItem>
+            <CommandItem
               onSelect={() => run(() => setTheme(isDark ? "light" : "dark"))}
               keywords={["dark", "light", "appearance"]}
             >
@@ -191,6 +244,82 @@ export function CommandPalette() {
               <CommandShortcut>?</CommandShortcut>
             </CommandItem>
           </CommandGroup>
+
+          {/* Inside a cycle: switch its tabs via the deep-linkable ?tab= param (the
+              cycle-detail page reads it; overview is the canonical bare URL). */}
+          {inCycle && cycleId && (
+            <>
+              <CommandSeparator />
+              <CommandGroup heading={t.cycleTabs}>
+                <CommandItem
+                  value="cycle tab overview"
+                  onSelect={() => run(() => navigate(`/cycles/${cycleId}`))}
+                  keywords={["overview", "обзор", "tab"]}
+                >
+                  <LayoutDashboard />
+                  <span>{t.tabOverview}</span>
+                </CommandItem>
+                <CommandItem
+                  value="cycle tab interviews"
+                  onSelect={() =>
+                    run(() => navigate(`/cycles/${cycleId}?tab=interviews`))
+                  }
+                  keywords={["interviews", "интервью", "tab"]}
+                >
+                  <FileAudio />
+                  <span>{t.tabInterviews}</span>
+                </CommandItem>
+                <CommandItem
+                  value="cycle tab synthesis"
+                  onSelect={() =>
+                    run(() => navigate(`/cycles/${cycleId}?tab=synthesis`))
+                  }
+                  keywords={["synthesis", "синтез", "findings", "tab"]}
+                >
+                  <Lightbulb />
+                  <span>{t.tabSynthesis}</span>
+                </CommandItem>
+                <CommandItem
+                  value="cycle tab diff"
+                  onSelect={() =>
+                    run(() => navigate(`/cycles/${cycleId}?tab=diff`))
+                  }
+                  keywords={["diff", "сравнение", "waves", "tab"]}
+                >
+                  <GitCompare />
+                  <span>{t.tabDiff}</span>
+                </CommandItem>
+              </CommandGroup>
+            </>
+          )}
+
+          {/* Inside a cycle: jump straight to any of its interviews (the editor). */}
+          {inCycle &&
+            cycleId &&
+            cycleInterviews &&
+            cycleInterviews.length > 0 && (
+              <>
+                <CommandSeparator />
+                <CommandGroup heading={t.cycleInterviews}>
+                  {cycleInterviews.map((interview) => (
+                    <CommandItem
+                      key={interview.id}
+                      value={`interview ${interview.title}`}
+                      onSelect={() =>
+                        run(() =>
+                          navigate(
+                            `/cycles/${cycleId}/interviews/${interview.id}`,
+                          ),
+                        )
+                      }
+                    >
+                      <FileAudio />
+                      <span className="truncate">{interview.title}</span>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </>
+            )}
 
           <CommandSeparator />
 
@@ -222,6 +351,42 @@ export function CommandPalette() {
             >
               <SettingsIcon />
               <span>{t.settings}</span>
+            </CommandItem>
+            {/* Settings sections — deep entries via ?tab= (harmless if the page
+                ignores the param; it still lands on Settings). */}
+            <CommandItem
+              value="settings section ai cli"
+              onSelect={() => run(() => navigate("/settings?tab=ai-cli"))}
+              keywords={["adapter", "plugin", "claude", "cli"]}
+            >
+              <SettingsIcon />
+              <span>{t.settingsAiCli}</span>
+            </CommandItem>
+            <CommandItem
+              value="settings section transcription"
+              onSelect={() =>
+                run(() => navigate("/settings?tab=transcription"))
+              }
+              keywords={["whisper", "asr", "model", "транскрипция"]}
+            >
+              <SettingsIcon />
+              <span>{t.settingsTranscription}</span>
+            </CommandItem>
+            <CommandItem
+              value="settings section roles"
+              onSelect={() => run(() => navigate("/settings?tab=roles"))}
+              keywords={["speaker", "роли", "participants"]}
+            >
+              <SettingsIcon />
+              <span>{t.settingsRoles}</span>
+            </CommandItem>
+            <CommandItem
+              value="settings section about"
+              onSelect={() => run(() => navigate("/settings?tab=about"))}
+              keywords={["version", "о приложении"]}
+            >
+              <SettingsIcon />
+              <span>{t.settingsAbout}</span>
             </CommandItem>
           </CommandGroup>
 
