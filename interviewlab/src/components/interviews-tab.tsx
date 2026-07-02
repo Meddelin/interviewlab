@@ -29,6 +29,7 @@ import {
   useAddInterviewFiles,
   useDeleteInterview,
   useInterviews,
+  useRenameInterview,
 } from "@/lib/interview-queries";
 import { asrKeys, useModels } from "@/lib/asr-queries";
 import { useUiStore } from "@/lib/ui-store";
@@ -150,6 +151,7 @@ const STR = {
     reTranscribe: "Перетранскрибировать",
     transcribe: "Транскрибировать",
     transcribeAria: (title: string) => `Транскрибировать «${title}»`,
+    renameAria: (title: string) => `Переименовать «${title}»`,
     deleteAria: (title: string) => `Удалить «${title}»`,
     deleteTitle: "Удалить интервью?",
     deleteBody: (title: string) =>
@@ -241,6 +243,7 @@ const STR = {
     reTranscribe: "Re-transcribe",
     transcribe: "Transcribe",
     transcribeAria: (title: string) => `Transcribe ${title}`,
+    renameAria: (title: string) => `Rename ${title}`,
     deleteAria: (title: string) => `Delete ${title}`,
     deleteTitle: "Delete interview?",
     deleteBody: (title: string) =>
@@ -279,8 +282,13 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
   });
   const addFiles = useAddInterviewFiles(cycleId);
   const deleteInterview = useDeleteInterview(cycleId);
+  const renameInterview = useRenameInterview(cycleId);
   const qc = useQueryClient();
   const [isDragOver, setIsDragOver] = useState(false);
+  // Row currently being renamed inline (id) + its draft title.
+  const [editing, setEditing] = useState<{ id: string; title: string } | null>(
+    null,
+  );
   // Shared confirm dialog for the destructive row actions (delete / re-transcribe /
   // re-clean / re-diarize) — replaces the old native confirm() guards (v3 F3 P0).
   const { confirm: confirmAction, dialog: confirmDialog } = useConfirm();
@@ -691,12 +699,51 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
       {
         accessorKey: "title",
         header: t.colInterview,
-        cell: ({ row }) => (
-          <span className="flex items-center gap-2 font-medium">
-            <FileAudio className="size-4 shrink-0 text-muted-foreground" />
-            <span className="truncate">{row.original.title}</span>
-          </span>
-        ),
+        cell: ({ row }) => {
+          const isEditing = editing?.id === row.original.id;
+          const save = () => {
+            const title = editing?.title.trim() ?? "";
+            if (title && title !== row.original.title) {
+              renameInterview.mutate({ id: row.original.id, title });
+            }
+            setEditing(null);
+          };
+          return (
+            <span className="flex items-center gap-2 font-medium">
+              <FileAudio className="size-4 shrink-0 text-muted-foreground" />
+              {isEditing ? (
+                <input
+                  autoFocus
+                  value={editing?.title ?? ""}
+                  onChange={(e) =>
+                    setEditing({ id: row.original.id, title: e.target.value })
+                  }
+                  onBlur={save}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") save();
+                    if (e.key === "Escape") setEditing(null);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="w-full min-w-0 rounded border border-border bg-background px-1.5 py-0.5 text-sm outline-none focus:border-primary"
+                />
+              ) : (
+                <span
+                  className="truncate"
+                  title={t.renameAria(row.original.title)}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    setEditing({
+                      id: row.original.id,
+                      title: row.original.title,
+                    });
+                  }}
+                >
+                  {row.original.title}
+                </span>
+              )}
+            </span>
+          );
+        },
       },
       {
         accessorKey: "duration_ms",
@@ -920,6 +967,21 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
               <Button
                 variant="ghost"
                 size="icon-sm"
+                aria-label={t.renameAria(row.original.title)}
+                className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditing({
+                    id: row.original.id,
+                    title: row.original.title,
+                  });
+                }}
+              >
+                <PencilLine className="size-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
                 disabled={busy}
                 aria-label={t.deleteAria(row.original.title)}
                 className="text-muted-foreground opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
@@ -938,6 +1000,8 @@ export function InterviewsTab({ cycleId }: { cycleId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       deleteInterview,
+      renameInterview,
+      editing,
       asrProgress,
       cleanProgress,
       selectedModel,

@@ -198,6 +198,20 @@ async fn list_interviews_db(
     .await
 }
 
+async fn rename_interview_db(
+    pool: &SqlitePool,
+    id: &str,
+    title: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE interview SET title = ?, updated_at = ? WHERE id = ?")
+        .bind(title)
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 async fn delete_interview_db(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     // recording rows cascade via the schema's ON DELETE CASCADE.
     sqlx::query("DELETE FROM interview WHERE id = ?")
@@ -441,6 +455,21 @@ pub async fn list_interviews(
     cycle_id: String,
 ) -> Result<Vec<InterviewRow>, String> {
     list_interviews_db(&db.pool, &cycle_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rename_interview(
+    db: tauri::State<'_, Db>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Title cannot be empty".into());
+    }
+    rename_interview_db(&db.pool, &id, title)
         .await
         .map_err(|e| e.to_string())
 }

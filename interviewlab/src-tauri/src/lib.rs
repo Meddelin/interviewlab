@@ -179,6 +179,7 @@ pub fn run() {
             cycle::delete_cycle,
             interview::add_interview_files,
             interview::list_interviews,
+            interview::rename_interview,
             interview::delete_interview,
             asr::asr_device,
             asr::list_models,

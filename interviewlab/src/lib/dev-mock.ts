@@ -1913,6 +1913,16 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       return Promise.resolve(created as T);
     }
 
+    case "rename_interview": {
+      const id = String(a.id);
+      const row = interviews.find((r) => r.id === id);
+      if (row) {
+        row.title = String(a.title).trim();
+        row.updated_at = Date.now();
+      }
+      return Promise.resolve(undefined as T);
+    }
+
     case "delete_interview": {
       const id = String(a.id);
       const i = interviews.findIndex((r) => r.id === id);
