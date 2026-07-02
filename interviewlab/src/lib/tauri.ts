@@ -119,6 +119,10 @@ export function addInterviewFiles(
   return invoke<InterviewRow[]>("add_interview_files", { cycleId, paths });
 }
 
+export function renameInterview(id: string, title: string): Promise<void> {
+  return invoke<void>("rename_interview", { id, title });
+}
+
 export function deleteInterview(id: string): Promise<void> {
   return invoke<void>("delete_interview", { id });
 }
