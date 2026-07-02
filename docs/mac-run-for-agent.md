@@ -36,18 +36,25 @@ the multi‑GB models, bandwidth. **Skip what was already confirmed and only do 
 > Rule of thumb: an init step is **"verified once, trusted thereafter."** Re‑verify it only if (a) this
 > update's changelog touched it, or (b) something downstream actually fails and points back at it.
 
-**Delta for THIS update (transcription quality + Mac speed):**
-- **Segment shape is fixed at the source.** Whisper used to fragment more and more toward the end of a
-  long interview (a sentence arriving as a few words, sometimes a lone pronoun). The backend now folds
-  consecutive same‑speaker fragments into **sentence‑level segments** before storing (logs
-  `coalesced N → M segments`). Nothing to configure — just confirm late‑interview segments now read as
-  whole sentences, not single words. (Source: `asr.rs` `merge_short_segments`.)
-- **CoreML ANE encoder is now auto‑fetched** — no more manual `.mlmodelc` placement (see §3.1). If you
-  switch to `--features metal,coreml` for the first time and the model was **already** downloaded, just
-  **re‑run the model download once** (Settings → ASR model): it's idempotent (existing files skipped),
-  and that one re‑run triggers the encoder fetch.
-- **Diarization now requests the CoreML execution provider on macOS** (§4) and **decode threads are
-  backend‑aware** (§3.1) — both automatic, nothing to set.
+**Delta for THIS update (v3.0 — product overhaul; previous delta's ASR items are baseline now):**
+- **Button rename:** the per‑segment rewrite in the transcript editor is now labeled
+  **«Переписать сегмент»** ("Rewrite segment"). Same mechanics — one segment, plain text in/out.
+- **Two new OPTIONAL batch tasks** through the same contract — nothing to install:
+  **`guide-coverage`** (did the interview cover the guide? — «Покрытие гайда» in the interview
+  summary panel) falls back to `cycle-synthesis-extract` when absent from your manifest;
+  **`guide-generate`** (draft a guide from a product — Guides page → «Сгенерировать из продукта»)
+  falls back to `cycle-synthesis`. Add them to `tasks`/`models.tasks` only for per‑task model control.
+- **Chat can now DO things (invlab-action):** the assistant may emit a fenced action block that the app
+  parses from its final text — adds glossary terms / updates a finding, rendered as chips with undo.
+  **No CLI support required** beyond normal text output; the `tool-use` capability flag is NOT needed.
+- **Cumulative synthesis** (REDUCE sees the previous wave), **HTML report export** (Synthesis tab),
+  **global task center** (header badge, Ctrl+Shift+B), tabs in URL, breadcrumbs.
+- **Glossary:** the starter seed grew to ~295 RU‑tuned terms (product editor → Glossary → «Базовый
+  набор»); re‑import now **merges** aliases into existing terms instead of duplicating.
+- **Destructive re‑runs confirm first:** delete / re‑transcribe / re‑clean / re‑diarize now open a
+  confirm dialog warning that manual edits are erased — expect the dialog, not silent data loss.
+- **Plugins folder docs self‑refresh:** `plugins/README.md` + `manifest.schema.json` are rewritten when
+  the app updates (your own `plugins/<id>/manifest.json` files are never touched).
 
 ---
 
@@ -55,9 +62,11 @@ the multi‑GB models, bandwidth. **Skip what was already confirmed and only do 
 
 So you know what to aim for. The human will do these clicks; you make each step **reachable** and report failures:
 
-1. Create a **Product** (markdown description) and a **Guide** (research goals) in the libraries.
-   The product editor also has a **Glossary** panel (see the note below) — optionally add a few
-   terms (e.g. `API`, `Figma`, `дедлайн`) before transcribing.
+1. Create a **Product** (markdown description) and a **Guide** (research goals) in the libraries —
+   or **generate a guide draft from the product** (Guides page → «Сгенерировать из продукта»; uses the
+   `guide-generate` task or its fallback). The product editor also has a **Glossary** panel (see the
+   note below) — import the **«Базовый набор»** starter set (~295 RU terms) or add a few terms
+   (e.g. `API`, `Figma`, `дедлайн`) before transcribing.
 2. Create a **Cycle**, link the product + guide.
 3. **Upload a real interview** audio file (30+ min, any common format).
 4. **Transcribe** it: pick a local Whisper model, language, `expected speakers = 2`. On Apple
@@ -65,36 +74,47 @@ So you know what to aim for. The human will do these clicks; you make each step 
    transcript stream in live**, percent and all, then a distinct **"Diarizing…"** phase (see §4.1).
 5. Confirm **speaker separation** (S1 / S2 turns) and that segments read as **merged paragraphs**.
 6. **Fix garbled segments** with the **per‑segment rewrite**: in the transcript editor each segment row
-   has a **"Хуйня, переписывай"** button — clicking it re‑cleans **just that one segment** through the
-   local CLI and swaps in the result. (There is **no** whole‑transcript "Clean" button anymore — see the
-   note below.) Save writes the `edited` version.
+   has a **«Переписать сегмент»** button — clicking it re‑cleans **just that one segment** through the
+   local CLI and swaps in the result. For the **whole transcript** there's a **"Clean"** action on the
+   Interviews tab (batch cleanup through the CLI; re‑running it opens a confirm dialog because it
+   overwrites manual edits — see the note below). Save writes the `edited` version.
 7. **Re‑do a bad chunk (optional):** if a span came out wrong (mis‑segmented, wrong speaker, garbled
    audio), **select those segment rows** and click **"Перетранскрибировать"** — whisper re‑runs on just
-   that time span and the whole file re‑diarizes so speakers stay consistent (see §4.1).
+   that time span and the whole file re‑diarizes so speakers stay consistent (see §4.1). Confirms first
+   (it erases manual edits on that span).
 8. **Build the glossary** (optional but recommended): on the **Interviews** tab each transcribed row has
    a **"Glossary"** button → suggest terms **From the transcript** or **From my edits**, review the
    candidates, and accept them into the product glossary (see the note below).
-9. **Assign roles** to the speakers (interviewer / respondent).
-10. **Synthesis** → findings grouped by goal + by role.
-11. (Optional) a second cycle → **Diff** vs the previous wave.
-12. **Chat** about the cycle (streaming, grounded answers).
+9. **Check guide coverage** (v3): open the interview → right‑panel **«Саммари»** → collapsible
+   **«Покрытие гайда»** → **«Проверить покрытие»** — per‑goal/question covered/partial/missed statuses
+   with evidence quotes, a 0‑100 score, and suggested follow‑up questions (uses the `guide-coverage`
+   task or its fallback).
+10. **Assign roles** to the speakers (interviewer / respondent).
+11. **Synthesis** → findings grouped by goal + by role. Long runs show in the **task center** (header
+    badge) and survive navigating away.
+12. **Export the wave report** (Synthesis tab → **«Экспорт отчёта (HTML)»**) — a standalone HTML file
+    with the summary, findings, diff, and coverage scores.
+13. (Optional) a second cycle → **Diff** vs the previous wave (REDUCE also builds on the prior wave).
+14. **Chat** about the cycle (streaming, grounded answers). Ask it to add glossary terms — the reply
+    renders an **action chip** with undo (invlab-action; works with any CLI, see §5).
 
 Everything is **local**: ASR (whisper.cpp) and diarization (sherpa‑onnx) run on‑device, no cloud, no Python.
-Only the LLM steps (cleanup / synthesis / diff / chat) go through a **local AI CLI you configure** (§5) —
-whatever your environment provides. **Claude is not available here**; no specific vendor is required.
+Only the LLM steps (cleanup / synthesis / diff / chat / guide coverage / guide generation / glossary
+mining) go through a **local AI CLI you configure** (§5) — whatever your environment provides.
+**Claude is not available here**; no specific vendor is required.
 
-> **Transcript cleanup is now per‑segment (not whole‑interview).** The old "Clean transcript" button cleaned
-> the entire interview in one CLI call that forced the model to re‑emit an `{id, text}` JSON object for *every*
-> segment — and that JSON‑echo contract is exactly where the model started hallucinating (drifting, inventing,
-> "tidying" spans it shouldn't). It's been **removed from the UI**. Cleanup now happens **one segment at a
-> time**: the editor's per‑row **"Хуйня, переписывай"** button sends **just that segment's text** and accepts a
-> plain‑text reply (the `rewrite_segment` command → `run_cli_task_text`). For your CLI this means: the rewrite
-> reuses the **`transcript-cleanup`** task's `args_template` from your manifest, but **never** injects
-> `--json-schema` and **never** expects `structured_output` — it just reads the envelope's `result` text. So
-> any manifest whose `transcript-cleanup` task emits the normal `--output-format json` envelope works with **no
-> changes** (a `json_schema_arg: false` plugin like Nessy works too — the rewrite ignores schema regardless).
-> The backend `clean_transcript` command + the `cleaned` transcript version still exist (nothing depends on
-> them being driven from the editor); they're simply no longer wired to a button.
+> **Transcript cleanup comes in two forms.** The **per‑segment rewrite** — the editor's per‑row
+> **«Переписать сегмент»** button — sends **just that segment's text** and accepts a plain‑text reply
+> (the `rewrite_segment` command → `run_cli_task_text`). It reuses the **`transcript-cleanup`** task's
+> `args_template` from your manifest, but **never** injects `--json-schema` and **never** expects
+> `structured_output` — it just reads the envelope's `result` text. So any manifest whose
+> `transcript-cleanup` task emits the normal `--output-format json` envelope works with **no changes**
+> (a `json_schema_arg: false` plugin like Nessy works too — the rewrite ignores schema regardless).
+> The **whole‑transcript batch cleanup** (Interviews tab → **"Clean" / «Очистить»**) drives the same
+> task with the full batched `{id, text}` JSON‑echo contract — guarded by a per‑batch retry + a hard
+> id‑alignment check, and re‑running it confirms first (it overwrites manual edits). If batch cleanup
+> repeatedly trips the alignment guard on a weaker model, the transcript stays intact — fall back to
+> per‑segment rewrites and report it per §6B.
 
 > **Glossary (anglicisms / technical terms / local product names).** Russian product/tech interviews are
 > full of English terms the ASR mangles (renders phonetically in Cyrillic, inconsistently). The fix is a
@@ -259,9 +279,18 @@ operation — NO source change, no recompile.**
    or the manifest `command`/args, then Test again.)
 
 A manifest declares: the CLI `command`; its `capabilities` (`batch-tasks` for the cleanup/synthesis/diff
-batch tasks, `streaming` + `multi-turn` for chat, `tool-use` if applicable); a per‑task `args_template`
-(how to invoke the CLI for each task, with `{prompt}` substitution); how to **extract the result** from the
-CLI's output (e.g. a JSON path); and, for chat, a `chat.stream` block naming the stream parser.
+batch tasks, `streaming` + `multi-turn` for chat; `tool-use` is parsed but currently has **no runtime
+effect** — chat "actions" don't need it, see below); a per‑task `args_template` (how to invoke the CLI for
+each task, with `{prompt}` substitution); how to **extract the result** from the CLI's output (e.g. a JSON
+path); and, for chat, a `chat.stream` block naming the stream parser.
+
+> **v3 task names & fallbacks:** `guide-coverage` and `guide-generate` are **optional** — omit them and
+> the app falls back to your `cycle-synthesis-extract` / `cycle-synthesis` task config respectively.
+> **Chat actions (invlab-action) need NO manifest support**: the app parses the fenced block from the
+> assistant's final text, whatever CLI produced it. The always‑current full guide (minimal manifest,
+> required vs optional tasks, limits, `[E-CLI-*]` remedies) is written to
+> `…/com.interviewlab.app/plugins/README.md` and **refreshes on app updates** — read it on‑disk, or via
+> Settings → AI CLI → "For agent".
 
 > **Batch output shape:** `result_extract: { format: "json", json_path: "result" }` accepts a single JSON
 > object, a **JSONL / stream-json** stream (one object per line), OR a **JSON array** of stream events — the
@@ -311,11 +340,15 @@ is tolerant-parsed (JSONL/array + markdown-fence stripping). This is config-only
     "tasks": {"transcript-cleanup":"tgpt/qwen36-35b-a3b-fp8","cycle-synthesis-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-synthesis-reduce":"tgpt/qwen35-397b-a17b-fp8","glossary-extract":"tgpt/qwen35-397b-a17b-fp8","cycle-diff":"tgpt/qwen35-397b-a17b-fp8"} }
 }
 ```
-> **`glossary-extract`** (new) powers the glossary auto‑suggest (§0 note). It's a plain batch task like
+> **`glossary-extract`** powers the glossary auto‑suggest (§0 note). It's a plain batch task like
 > the synthesis ones — same `--output-format json` shape, same `json_schema_arg: false` handling — so the
 > line above is all it needs. It's **optional**: omit it and the app falls back to `cycle-synthesis-extract`
-> for suggestions; the term list itself is optional too. Share the Synthesis "Task models" bucket (so the
+> for suggestions; the term list itself is optional too. Shares the Synthesis "Task models" bucket (so the
 > `models.tasks` entry above is what sets its model).
+>
+> **`guide-coverage` / `guide-generate`** (v3, optional) work exactly the same way — plain batch tasks with
+> the same `args_template` shape. Add them for per‑task model control, or omit them: coverage falls back to
+> `cycle-synthesis-extract`, guide generation to `cycle-synthesis`. Both share the Synthesis model bucket.
 The optional **`models`** block is what lets you pick Nessy's models per task: `flag` is the CLI's
 model flag (`--model`), `available` populates the **Settings → AI CLI → "Task models"** picker (Cleanup /
 Synthesis / Diff), and `tasks` sets each task's default model. **If you OMIT `models` entirely, the app injects
@@ -337,14 +370,14 @@ Then: Settings → AI CLI → **Rescan** → select **Nessy** active → **Test 
   real stream matches that, add a `chat.stream` block with **`"parse": "claude-stream-json"`** plus
   `capabilities` `streaming` + `multi-turn` — **no new parser needed**. If the stream shape differs, a new
   named parser is a **source change** (§6B) — report the actual stream format rather than guessing.
-- **Residual risk — cleanup id-alignment:** this applies only to the **whole-transcript** `clean_transcript`
-  command, which is **no longer driven from the UI** (cleanup is per-segment now — see the note in §0). If you
-  somehow invoke that batch path: without `--json-schema`, the model holds the "echo EVERY segment id exactly
-  once" contract by prompt only. It's guarded by a per-batch retry + a hard alignment check, but a weaker model
-  may trip it more often (you'll see a cleanup error; the transcript stays intact and re-runnable). If it fails
-  repeatedly, that's a prompt tweak (generic, not Nessy-specific) — report it, don't hand-parse the output
-  (parsing speaker-labelled prose back to segments by order silently corrupts the transcript). **The per-segment
-  rewrite ("Хуйня, переписывай") sidesteps this entirely** — one segment, plain text in/out, no ids to align.
+- **Residual risk — cleanup id-alignment:** this applies to the **whole-transcript** batch cleanup
+  (Interviews tab → "Clean" / «Очистить»). Without `--json-schema`, the model holds the "echo EVERY segment id
+  exactly once" contract by prompt only. It's guarded by a per-batch retry + a hard alignment check, but a
+  weaker model may trip it more often (you'll see a cleanup error; the transcript stays intact and
+  re-runnable). If it fails repeatedly, that's a prompt tweak (generic, not Nessy-specific) — report it, don't
+  hand-parse the output (parsing speaker-labelled prose back to segments by order silently corrupts the
+  transcript). **The per-segment rewrite («Переписать сегмент») sidesteps this entirely** — one segment, plain
+  text in/out, no ids to align.
 
 **Reference templates** are written to the plugins folder on first run — `claude-code`, `qwen-code`,
 `antigravity`. **Copy whichever is closest to your CLI's I/O shape and adapt it** (command, args, auth,
