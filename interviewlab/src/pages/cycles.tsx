@@ -1,10 +1,12 @@
 import { useNavigate } from "react-router-dom";
-import { Waves } from "lucide-react";
+import { useQueries } from "@tanstack/react-query";
+import { Check, GitCompare, Mic, Waves } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { NewCycleDialog } from "@/components/new-cycle-dialog";
 import { useCycles } from "@/lib/cycle-queries";
 import { relativeTime, absoluteDate } from "@/lib/format";
-import type { Cycle } from "@/lib/tauri";
+import { getDiff, getSynthesis, listInterviews, type Cycle } from "@/lib/tauri";
+import { cn } from "@/lib/utils";
 import { useT } from "@/lib/i18n";
 
 const STR = {
@@ -19,6 +21,11 @@ const STR = {
     emptyTitle: "Пока нет циклов",
     emptyBody:
       "Создайте первый, чтобы начать волну исследования — загрузите записи, расшифруйте и синтезируйте выводы.",
+    interviewsCount: (n: number) => `Интервью: ${n}`,
+    synthesized: "Синтез готов",
+    notSynthesized: "Синтеза ещё нет",
+    diffDone: "Сравнение с прошлой волной готово",
+    noDiff: "Сравнения ещё нет",
   },
   en: {
     wave: (n: number) => `wave ${n}`,
@@ -31,14 +38,94 @@ const STR = {
     emptyTitle: "No cycles yet",
     emptyBody:
       "Create your first to start a research wave — ingest recordings, transcribe, and synthesize findings.",
+    interviewsCount: (n: number) => `Interviews: ${n}`,
+    synthesized: "Synthesized",
+    notSynthesized: "Not synthesized yet",
+    diffDone: "Diff vs previous wave done",
+    noDiff: "No diff yet",
   },
 };
 
+// Compact per-cycle status pulled alongside the list (v3 F1 "cycles polish"): the
+// Cycle row itself carries no work-state, so each row fetches its interviews count +
+// synthesized/diff flags in ONE grouped queryFn. // ponytail: 3 invokes per cycle is an
+// accepted N+1 — local SQLite round-trips are ~free and a list_cycles schema change is
+// out of this package's scope.
+type CycleStatusSummary = {
+  interviews: number;
+  synthesized: boolean;
+  hasDiff: boolean;
+};
+
+function useCycleStatuses(cycles: Cycle[] | undefined) {
+  return useQueries({
+    queries: (cycles ?? []).map((cycle) => ({
+      queryKey: ["cycle-status", cycle.id] as const,
+      queryFn: async (): Promise<CycleStatusSummary> => {
+        const [interviews, synthesis, diff] = await Promise.all([
+          listInterviews(cycle.id),
+          getSynthesis(cycle.id),
+          getDiff(cycle.id),
+        ]);
+        return {
+          interviews: interviews.length,
+          synthesized: synthesis != null,
+          hasDiff: diff != null,
+        };
+      },
+      staleTime: 30_000,
+    })),
+  });
+}
+
+// A quiet boolean slot: a small semantic check when true, a dim dash when false —
+// fixed width so the columns align across rows (dot + icon vocabulary, low saturation).
+function CheckSlot({
+  ok,
+  icon: Icon,
+  titleOn,
+  titleOff,
+}: {
+  ok: boolean | undefined;
+  icon: typeof Check;
+  titleOn: string;
+  titleOff: string;
+}) {
+  return (
+    <span
+      className="hidden w-6 shrink-0 items-center justify-center md:flex"
+      title={ok ? titleOn : titleOff}
+    >
+      {ok ? (
+        <Icon className="size-3.5 text-status-ready" aria-hidden="true" />
+      ) : (
+        <span
+          className={cn(
+            "text-xs text-muted-foreground/40",
+            ok === undefined && "opacity-0",
+          )}
+          aria-hidden="true"
+        >
+          –
+        </span>
+      )}
+      <span className="sr-only">{ok ? titleOn : titleOff}</span>
+    </span>
+  );
+}
+
 // ponytail: the old status dot derived processing/idle from record age (updated_at < 7d),
-// which is a lie — it told nothing about real work. The honest interview-count metadata
-// isn't on the Cycle type (would need a backend/list_cycles change, out of scope here), so
-// the dot is removed rather than faked. The "wave N" index already carries quiet metadata.
-function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
+// which is a lie — it told nothing about real work. v3: the row now shows HONEST work
+// state (interview count + synthesized/diff checks) fetched per cycle.
+function CycleRow({
+  cycle,
+  index,
+  summary,
+}: {
+  cycle: Cycle;
+  index: number;
+  summary: CycleStatusSummary | undefined;
+}) {
   const navigate = useNavigate();
   const open = () => navigate(`/cycles/${cycle.id}`);
   const t = useT(STR);
@@ -60,8 +147,29 @@ function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
         {cycle.name}
       </span>
 
+      {/* Status summary — interviews count, synthesized ✓, diff ✓; muted + tabular. */}
+      <span
+        className="hidden w-12 shrink-0 items-center justify-end gap-1 font-numeric text-xs text-muted-foreground sm:flex"
+        title={t.interviewsCount(summary?.interviews ?? 0)}
+      >
+        <Mic className="size-3 opacity-60" aria-hidden="true" />
+        {summary ? summary.interviews : "·"}
+      </span>
+      <CheckSlot
+        ok={summary?.synthesized}
+        icon={Check}
+        titleOn={t.synthesized}
+        titleOff={t.notSynthesized}
+      />
+      <CheckSlot
+        ok={summary?.hasDiff}
+        icon={GitCompare}
+        titleOn={t.diffDone}
+        titleOff={t.noDiff}
+      />
+
       {/* Wave index — a quiet nod to "research waves", right-aligned metadata. */}
-      <span className="hidden font-numeric text-xs text-muted-foreground/70 sm:inline">
+      <span className="hidden w-16 shrink-0 text-right font-numeric text-xs text-muted-foreground/70 sm:inline">
         {t.wave(index + 1)}
       </span>
 
@@ -77,6 +185,7 @@ function CycleRow({ cycle, index }: { cycle: Cycle; index: number }) {
 
 export function CyclesPage() {
   const { data: cycles, isPending, isError, error, refetch } = useCycles();
+  const statuses = useCycleStatuses(cycles);
   const t = useT(STR);
 
   return (
@@ -102,7 +211,8 @@ export function CyclesPage() {
               className="flex h-12 items-center gap-3 border-b border-border px-3 last:border-b-0"
             >
               <Skeleton className="h-4 w-48" />
-              <Skeleton className="ml-auto h-3 w-16" />
+              <Skeleton className="ml-auto h-3 w-10" />
+              <Skeleton className="h-3 w-16" />
             </div>
           ))}
         </div>
@@ -139,7 +249,12 @@ export function CyclesPage() {
       ) : (
         <div className="overflow-hidden rounded-lg border border-border bg-card/40">
           {cycles.map((cycle, i) => (
-            <CycleRow key={cycle.id} cycle={cycle} index={i} />
+            <CycleRow
+              key={cycle.id}
+              cycle={cycle}
+              index={i}
+              summary={statuses[i]?.data}
+            />
           ))}
         </div>
       )}

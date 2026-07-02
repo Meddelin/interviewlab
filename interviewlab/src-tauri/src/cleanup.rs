@@ -115,14 +115,21 @@ struct CleanupOutput {
 // ponytail: rules + a few illustrative examples, NOT a term dump — over-stuffing a glossary
 // is counterproductive (WMT'25 terminology work). The product context (below) is the entity
 // phrase-list that anchors named-entity / brand spellings the model otherwise can't recover.
-// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / glossary.rs / diff.rs so it
+// UNIFIED LLM-STAGE RULES — kept byte-identical across cleanup.rs / diff.rs / coverage.rs so it
 // can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
-// константой во все стадии"). Do NOT diverge the wording per file.
+// константой во все стадии"). Do NOT diverge the wording across these files. (glossary.rs carries
+// the previous wording — owned by a parallel change; re-align it when hoisting.)
 const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
-    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Output language = the language of the interview (for Russian interviews — Russian; mirror \
+    the interview's language otherwise); do NOT translate terms the speaker used.\n\
+    - Own prose (findings, summaries, notes — never transcript text or quotes) must read as \
+    natural, professional Russian, not translationese: no канцелярит («имеет место непонимание» → \
+    «пользователи не понимают»); state conclusions as assertions, not as «было выявлено, что…».\n\
     - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
     better than guessing.\n\
-    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Terminology: in your own prose use the canonical spellings from the glossary; a Latin \
+    original, its Cyrillic transliteration, and declined forms are the SAME term \
+    (фича = feature, «в Слаке» = Slack). Quotes copied from the transcript stay verbatim.\n\
     - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
     numbers, and NO markdown headings inside string fields of the JSON.";
 
@@ -164,27 +171,48 @@ fn guidelines_for(language: Option<&str>) -> String {
     let lang = language.unwrap_or("the original");
     format!(
         "Rewrite each segment into clean, readable {lang} that says EXACTLY what the speaker said. \
-         Fix grammar, punctuation, and capitalization; remove only pure filler that carries no meaning \
-         (Russian «эм», «ну вот», «значит», «как бы», «короче»; English \"um\", \"uh\", \"like\"). Do NOT \
-         paraphrase, translate, summarize, merge, split, or reorder, and keep the speaker's meaning, tone, \
-         and language mix. Do NOT invent words, names, or numbers that aren't in the audio — when a span is \
-         unclear, keep it close to the original rather than guessing.\n\
+         This is a light copy-edit of an ASR transcript, NOT an improvement of the speaker's speech: \
+         fix grammar, punctuation, and capitalization; do NOT paraphrase, compress, translate, \
+         summarize, merge, split, or reorder, and NEVER alter facts, numbers, or names. Keep the \
+         speaker's meaning, tone, register, and language mix. Do NOT invent words, names, or numbers \
+         that aren't in the audio — when a span is unclear, keep it close to the original rather than \
+         guessing.\n\
+         \n\
+         Fillers & disfluencies: remove a filler ONLY where it is pure noise (Russian «эм», «ну вот», \
+         «значит», «как бы», «вот», «типа», «короче», «это самое»; English \"um\", \"uh\", \"like\"). \
+         The same words used as discourse markers can carry hedging or emphasis («как бы не совсем \
+         то» — here «как бы» softens the claim and must stay): if removing a word changes the tone or \
+         certainty of the sentence, keep it.\n\
+         \n\
+         Russian ASR-error repair (conservative — fix ONLY when the intended reading is clear from \
+         context; otherwise leave the span as heard):\n\
+         - Rejoin words the ASR split and separate words it merged; fix «-тся/-ться» from the grammar \
+           of the sentence; restore «ё» where it disambiguates (все/всё).\n\
+         - Punctuate to standard Russian norms: тире in «X — это Y», запятые при вводных словах и \
+           обращениях, proper sentence-final punctuation for questions.\n\
          \n\
          English terms & anglicisms (these are tech/product interviews, so getting them right matters — the \
          ASR often mangles them or renders them phonetically in Cyrillic):\n\
+         - A Latin original, its Cyrillic transliteration, and its declined forms are the SAME term: \
+           «фича» = feature, «в Слаке» = Slack, «джира»/«в джире» = Jira.\n\
          - Fix phonetically garbled / mis-heard English terms when the intended term is clear from context: \
            «эй-пи-ай»/«апишка» → «API», «продакт-маркет фит» → «product-market fit», «джира» → «Jira», \
-           «эс-кью-эл» → «SQL», «гитхаб» → «GitHub».\n\
+           «эс-кью-эл» → «SQL», «гит хаб»/«гитхаб» → «GitHub», «ноушен» → «Notion».\n\
          - Acronyms / initialisms → UPPERCASE Latin: API, MVP, SaaS, B2B, KPI, UX, UI, AI, ML, LLM, CRM, SDK, ROI.\n\
          - Product / brand / tool / library names → their canonical spelling: Figma, Jira, GitHub, Notion, Slack.\n\
          - Anglicisms fully assimilated into Russian speech → keep the normal Cyrillic spelling, do NOT \
            Latinize them: дедлайн, фича, баг, релиз, кейс, юзер, фидбэк, апдейт, таск, митинг, бэклог, онбординг.\n\
-         - Never TRANSLATE a term the speaker chose (don't turn «churn» into «отток» or «отток» into «churn») — \
-           keep their word, just spell it canonically.\n\
+         - Keep every sentence GRAMMATICAL after normalizing: a Latin brand name reads fine undeclined \
+           («в Slack», «в Jira»), but never swap a declined Russian common noun for a bare Latin \
+           nominative that breaks the sentence («все таски» stays «все таски», not «все task») — \
+           normalize the spelling, never the syntax.\n\
+         - Never TRANSLATE a term the speaker chose (don't turn «churn» into «отток» or «отток» into «churn») \
+           and never \"improve\" their word choice — keep their word, just spell it canonically.\n\
          - Spell each term CONSISTENTLY — pick one form per term and use it every time.\n\
          When a `glossary` is provided below, it is the AUTHORITY: each entry maps a `canonical` spelling to \
-         the variant/garbled `aliases` the ASR produces — wherever the text contains a term (in any of its \
-         alias forms), rewrite it to that entry's canonical spelling. The `product_desc` context is a secondary \
+         the variant/garbled `aliases` the ASR produces — wherever the text contains a term (in any alias, \
+         transliterated, or declined form), rewrite it to that entry's canonical spelling, keeping the \
+         sentence grammatical. The `product_desc` context is a secondary \
          authority for any product/brand/domain term not in the glossary. Both override the general rules above."
     )
 }
@@ -248,8 +276,9 @@ fn build_batch_input(
         // the renderer in adapter.rs also says "return ONLY JSON matching the schema".
         "instructions": "Return ONLY a JSON object {\"segments\":[{\"id\":<int>,\"text\":<cleaned string>}, …]}. \
                          Include EVERY input segment id exactly once. Change ONLY the text — apply the \
-                         `guidelines` (grammar, filler, and the English-terms / anglicism normalization), \
-                         using the `glossary` (term→canonical, with aliases) as the AUTHORITY for term \
+                         `guidelines` (grammar + punctuation, meaning-free fillers, conservative ASR-error \
+                         repair, and the English-terms / anglicism normalization), using the `glossary` \
+                         (term→canonical, with aliases) as the AUTHORITY for term \
                          spellings and `product_desc` for any other product/brand/domain term. When present, \
                          `guide_topics` lists the interview's themes/questions — use them ONLY to \
                          disambiguate unclear spans, never to add or change meaning. Do not add, \
@@ -969,7 +998,8 @@ fn build_rewrite_input(language: Option<&str>, product_desc: &str, glossary: &Va
         "language": language.unwrap_or("auto"),
         "rules": UNIFIED_LLM_RULES,
         "guidelines": guidelines_for(language),
-        "instructions": "Rewrite the ONE segment in `text` per `guidelines` (grammar, filler, the \
+        "instructions": "Rewrite the ONE segment in `text` per `guidelines` (grammar + punctuation, \
+                         meaning-free fillers, conservative ASR-error repair, the \
                          English-terms / anglicism normalization), using the `glossary` \
                          (term→canonical, with aliases) as the AUTHORITY for term spellings and \
                          `product_desc` for any other product/brand/domain term. Return ONLY the \

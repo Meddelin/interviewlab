@@ -614,7 +614,7 @@ export function cleanTranscript(
   });
 }
 
-// Rewrite ONE transcript segment's text via the CLI ("хуйня, переписывай"). Sends just this
+// Rewrite ONE transcript segment's text via the CLI ("rewrite segment"). Sends just this
 // segment's text and gets back PLAIN TEXT — the simplest shape, far less prone to the
 // hallucination the whole-transcript JSON-echo cleanup invites. Resolves with the cleaned text
 // (or the original unchanged when the model returns nothing usable). Stateless server-side: the
@@ -724,6 +724,8 @@ export type SynthesisRow = {
   content_md: string;
   model_meta: string | null;
   created_at: number;
+  // True once the user's markdown edits diverged from the structured doc (cleared on re-run).
+  edited_diverged: boolean;
 };
 
 // --- Per-interview summary (Milestone 10b) ------------------------------------
@@ -906,6 +908,10 @@ export type DiffEntry = {
   prev_finding_id?: string | null;
   statement: string;
   why?: string;
+  // Referenced findings' confidence labels resolved at diff time (serde-default in Rust —
+  // absent on rows stored before the fields shipped, hence optional).
+  confidence?: string | null;
+  prev_confidence?: string | null;
 };
 
 // One goal's diff entries (Rust `GoalDiff`) — the grouping the UI renders.
@@ -1401,6 +1407,9 @@ export type ChatMessage = {
 };
 
 // The streamed event payload on chat://<thread_id> (Rust `ChatEvent`, tagged `kind`).
+// `action` (Phase B): one processed whitelisted action from the assistant's turn —
+// emitted BEFORE `done` so the panel can render the chip live; `summary` is the short
+// human string (Russian) the chip shows.
 export type ChatEvent =
   | { kind: "token"; thread_id: string; text: string }
   | {
@@ -1410,7 +1419,15 @@ export type ChatEvent =
       session_id: string | null;
       cost_usd: number | null;
     }
-  | { kind: "error"; thread_id: string; message: string };
+  | { kind: "error"; thread_id: string; message: string }
+  | {
+      kind: "action";
+      thread_id: string;
+      tool_call_id: string;
+      tool: string;
+      status: "applied" | "rejected" | "failed";
+      summary: string;
+    };
 
 // The per-thread event name a turn streams on.
 export function chatEventName(threadId: string): string {
@@ -1475,6 +1492,36 @@ export function cycleChatCancel(threadId: string): Promise<void> {
   return invoke<void>("cycle_chat_cancel", { threadId });
 }
 
+// --- Chat actions (M11 Phase B) -------------------------------------------------
+// A chat_tool_call row (Rust `ChatToolCall`): one processed whitelisted action from an
+// assistant turn. `kind` is always 'write' today; result_json carries { summary, … };
+// undo_token (applied rows only) is what undo_chat_action consumes.
+export type ChatToolCall = {
+  id: string;
+  message_id: string;
+  thread_id: string;
+  tool: string;
+  kind: string;
+  args_json: string;
+  result_json: string | null;
+  status: "applied" | "rejected" | "failed" | "undone";
+  error: string | null;
+  undo_token: string | null;
+  undone_at: number | null;
+  created_at: number;
+};
+
+// All processed actions for a thread (for re-rendering chips on reload).
+export function listChatToolCalls(threadId: string): Promise<ChatToolCall[]> {
+  return invoke<ChatToolCall[]>("list_chat_tool_calls", { threadId });
+}
+
+// Undo one APPLIED action (consumes its undo_token). Returns the updated row
+// (status 'undone', undone_at stamped).
+export function undoChatAction(toolCallId: string): Promise<ChatToolCall> {
+  return invoke<ChatToolCall>("undo_chat_action", { toolCallId });
+}
+
 // Subscribe to a thread's stream. Real Tauri → webview event on chat://<thread_id>;
 // browser → the dev-mock bus. Returns an unlisten fn (matches the Tauri contract).
 export function onChatEvent(
@@ -1491,4 +1538,101 @@ export function onChatEvent(
   return () => {
     unlisten.then((fn) => fn());
   };
+}
+
+// --- Guide coverage (v3 B1, docs/v3-roast-and-plan.md) --------------------------
+// "Did we ask everything?" — the LLM maps every guide goal/question of an interview's
+// cycle to covered | partial | missed with evidence quotes, an overall 0-100 score, and
+// suggested follow-up questions. Mirrors the Rust coverage.rs structs.
+
+// One guide item's coverage status.
+export type CoverageStatus = "covered" | "partial" | "missed";
+
+// One evidence reference: transcript segment index + a short verbatim quote.
+export type CoverageEvidence = {
+  segment_id: number;
+  quote: string;
+};
+
+// One guide item's verdict (Rust `CoverageItem`). id/text/kind/section are stamped
+// server-side from the GUIDE; only status/evidence/note come from the model.
+export type CoverageItem = {
+  id: string; // G1.. (goal) or Q1.. (question)
+  text: string;
+  kind: "goal" | "question";
+  section?: string; // questions only: 'qualifying' | 'main' | 'hypothesis'
+  status: CoverageStatus;
+  evidence: CoverageEvidence[];
+  note?: string;
+};
+
+// A suggested follow-up question for a missed/partial item (Rust `CoverageFollowUp`).
+// related_id points at the CoverageItem it targets ("" = a general suggestion).
+export type CoverageFollowUp = {
+  related_id: string;
+  question: string;
+};
+
+// The full validated coverage document (Rust `CoverageDoc`).
+export type CoverageDoc = {
+  items: CoverageItem[];
+  score: number; // 0..100
+  summary: string;
+  follow_ups: CoverageFollowUp[];
+};
+
+// A stored coverage row (Rust `CoverageRow`). One per interview; re-runs overwrite.
+export type CoverageRow = {
+  interview_id: string;
+  doc: CoverageDoc;
+  model_meta: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+// Payload of the `coverage://progress` event (Rust `CoverageProgress`), for the global
+// task center + the coverage panel.
+export type CoverageProgress = {
+  interview_id: string;
+  stage: string; // 'started' | 'running' | 'done' | 'error'
+  progress: number; // 0..100
+  error: string | null;
+};
+
+export const COVERAGE_PROGRESS_EVENT = "coverage://progress";
+
+// Run (or re-run) the guide-coverage analysis for one interview. Progress streams via
+// COVERAGE_PROGRESS_EVENT; resolves with the stored coverage row.
+export function runGuideCoverage(
+  interviewId: string,
+  adapterId?: string,
+): Promise<CoverageRow> {
+  return invoke<CoverageRow>("run_guide_coverage", {
+    interviewId,
+    adapterId: adapterId ?? null,
+  });
+}
+
+// Get the stored coverage doc for an interview (null before the first run).
+export function getGuideCoverage(
+  interviewId: string,
+): Promise<CoverageRow | null> {
+  return invoke<CoverageRow | null>("get_guide_coverage", { interviewId });
+}
+
+// --- Guide draft generation (v3 B1) ---------------------------------------------
+// Generate a guide DRAFT from a product + the researcher's research questions: the LLM
+// returns a structured template (цели / гипотезы / вопросные блоки) and the backend
+// stores a new Guide named "Draft: <product> (<date>)" with canonically-rendered,
+// derive_goals-compatible content_md. Resolves with the stored guide, ready to edit/link.
+export function generateGuideDraft(
+  productId: string,
+  researchQuestions: string,
+  adapterId?: string,
+): Promise<Guide> {
+  return invoke<Guide>("generate_guide_draft", {
+    productId,
+    researchQuestions,
+    adapterId: adapterId ?? null,
+  });
 }

@@ -17,7 +17,11 @@ import type {
   ChatEvent,
   ChatMessage,
   ChatThread,
+  ChatToolCall,
   CleanupProgress,
+  CoverageDoc,
+  CoverageProgress,
+  CoverageRow,
   CreateGuideInput,
   CreateRoleInput,
   Cycle,
@@ -582,6 +586,17 @@ function emitSummary(payload: InterviewSummaryProgress) {
   for (const h of summaryHandlers) h(payload);
 }
 
+// Guide-coverage event bus (mirrors the Tauri `coverage://progress` event, v3 B1).
+type CoverageHandler = (payload: CoverageProgress) => void;
+const coverageHandlers = new Set<CoverageHandler>();
+export function mockOnCoverageProgress(handler: CoverageHandler): () => void {
+  coverageHandlers.add(handler);
+  return () => coverageHandlers.delete(handler);
+}
+function emitCoverage(payload: CoverageProgress) {
+  for (const h of coverageHandlers) h(payload);
+}
+
 // --- Chat mock bus + state (mirrors the chat://<thread_id> event, M11 Phase A) -
 // Per-thread handler sets (the real backend emits on a per-thread event name).
 type ChatHandler = (payload: ChatEvent) => void;
@@ -657,6 +672,62 @@ seedChatThread("chat-thread-onboarding", "Onboarding confusion", 26 * HOUR, [
     'Designers flagged the **empty dashboard** as the real blocker — there was no obvious first action — and asked for three suggested events with inline examples instead of a long field list.',
   ],
 ]);
+
+// --- Chat actions seed (M11 Phase B) ------------------------------------------
+// Processed tool calls per thread (mirrors the chat_tool_call table): one APPLIED
+// glossary.add_terms + one REJECTED synthesis.update_finding on the seeded "Top
+// objections" thread so the chips render both states for design review. `kind` is
+// always 'write' (the Rust recorder hardcodes it); result_json carries { summary, … }.
+const mockChatToolCalls: Record<string, ChatToolCall[]> = {
+  "chat-thread-objections": [
+    {
+      id: "toolcall-glossary-applied",
+      message_id: "chat-thread-objections-m1",
+      thread_id: "chat-thread-objections",
+      tool: "glossary.add_terms",
+      kind: "write",
+      args_json: JSON.stringify({
+        action: "glossary.add_terms",
+        terms: [
+          { canonical: "воронка", aliases: ["funnel"] },
+          { canonical: "маппинг событий", aliases: ["event mapping"] },
+        ],
+      }),
+      result_json: JSON.stringify({
+        summary: "Добавлено 2 термина в глоссарий",
+        added: 2,
+        skipped: 0,
+      }),
+      status: "applied",
+      error: null,
+      undo_token: JSON.stringify({
+        kind: "glossary.add_terms",
+        term_ids: ["mock-term-funnel", "mock-term-mapping"],
+      }),
+      undone_at: null,
+      created_at: now - 2 * HOUR + 2 * MIN,
+    },
+    {
+      id: "toolcall-synthesis-rejected",
+      message_id: "chat-thread-objections-m1",
+      thread_id: "chat-thread-objections",
+      tool: "synthesis.update_finding",
+      kind: "write",
+      args_json: JSON.stringify({
+        action: "synthesis.update_finding",
+        goal_id: "G1",
+        finding_id: "F9",
+        confidence: "high",
+      }),
+      result_json: JSON.stringify({ summary: "Отклонено: вывод F9 не найден" }),
+      status: "rejected",
+      error: "finding F9 not found in the current synthesis",
+      undo_token: null,
+      undone_at: null,
+      created_at: now - 2 * HOUR + 2 * MIN,
+    },
+  ],
+};
 
 // Audio source for the editor's player in the BROWSER preview: there is no real file
 // on disk, so every interview maps to the bundled mock WAV data URI (mock-audio.ts).
@@ -897,20 +968,20 @@ plugins/<id>/
 \`\`\`
 The folder name IS the canonical \`id\` and must equal \`manifest.id\`. Legacy flat \`adapters/<id>.json\` files still load.
 
-## 1. Decide the tier
-Run the CLI's \`--help\`. **Tier 1 (descriptor-only, zero code)** works if it has a one-shot prompt + JSON mode (\`batch-tasks\`), a streaming ndjson mode matching a shipped parser (\`streaming\`), session/resume (\`multi-turn\`), and/or MCP (\`tool-use\`). If something doesn't map → **Tier 2: ship a small adapter program** speaking the stdio chat protocol.
+## 1. What works today
+**Batch tasks** (\`batch-tasks\`: cleanup / synthesis / diff / glossary / guide coverage & generation) need a one-shot prompt + parseable output. **Chat** (\`streaming\`) needs an ndjson stream the built-in \`claude-stream-json\` parser reads — the ONLY parser implemented today (a CLI without it can emit a single final \`{"type":"result","result":"…"}\` line for spinner-then-answer chat, or skip chat entirely; batch still works). \`multi-turn\` = session resume. \`tool-use\`/\`adapter_program\` are parsed + shown but NOT executed yet (extension points).
 
 ## 2. Write the manifest (validate against manifest.schema.json)
 - \`id\` = folder name; \`command\` = the executable; \`capabilities\` = the subset you verified.
-- Fill ONLY the blocks for those capabilities: \`io\`+\`tasks\` (batch), \`chat.stream\`+\`parse\` (streaming), \`chat.session\` (multi-turn), \`chat.tools\` (tool-use). Use placeholders \`{prompt}\`, \`{system_prompt_file}\`, \`{session_id}\`, \`{session_args}\`.
-- Constraints: cleanup preserves segment ids/timing/labels (only \`text\` changes); synthesis findings carry \`goal_id\` + evidence; diff is findings-level.
+- Fill ONLY the blocks for those capabilities: \`io\`+\`tasks\` (batch), \`chat.stream\`+\`parse\` (streaming), \`chat.session\` (multi-turn). Use placeholders \`{prompt}\`, \`{system_prompt_file}\`, \`{session_id}\`, \`{session_args}\`.
+- Prompts are rendered by the APP — the plugin only supplies the command line; the input JSON is piped to stdin and inlined into \`{prompt}\`.
 - Write a \`probe\` (cheap command + exit code) + an \`auth\` note (prefer the CLI's own login; Claude Code avoids \`--bare\`, which forces an API key).
 
 ## 3. Self-test
-Validate the manifest → run \`probe\` → pipe a fixture through each batch task → chat smoke (≥1 token + a session_id) → drop the folder in \`plugins/<id>/\`, **Rescan plugins**, select it, **Test CLI** → Available.
+Validate the manifest → run \`probe\` → pipe a fixture through each batch task → chat smoke (≥1 token or a final result line, with a session_id) → drop the folder in \`plugins/<id>/\`, **Rescan plugins**, select it, **Test CLI** → Available.
 
 ## Worked example — Claude Code (reference plugin, all four capabilities)
-\`-p --output-format json\` (batch), \`stream-json --verbose --include-partial-messages\` (stream), \`--resume\` (multi-turn), \`--mcp-config … --strict-mcp-config\` + \`--allowedTools\` + \`--tools ""\` (scoped MCP tools), \`--setting-sources ""\` + NO \`--bare\` (subscription auth). Clone its manifest for the next CLI (Gemini-CLI forks like Qwen Code reuse \`parse: "gemini-stream-json"\`).`;
+\`-p --output-format json\` (batch), \`stream-json --verbose --include-partial-messages\` (stream, \`parse: "claude-stream-json"\`), \`--resume\` (multi-turn), \`--setting-sources ""\` + NO \`--bare\` (isolation + subscription auth). Clone its manifest for the next CLI and swap the command + flags.`;
 
 // The manifest JSON Schema, abridged for the browser preview (the real command returns the
 // full schema; the Add-plugin dialog shows it so an authoring agent self-validates).
@@ -1131,6 +1202,9 @@ const mockSynthesis: Record<string, SynthesisRow> = {
     id: "synth-" + ID.activation,
     cycle_id: ID.activation,
     created_at: now - 2 * HOUR,
+    // Seeded TRUE so the "edited diverged" badge is visible in the browser preview
+    // (run_synthesis clears it, save_cycle_synthesis sets it — mirrors the Rust flag).
+    edited_diverged: true,
     model_meta: JSON.stringify({
       adapter: "claude-code",
       cycle: "Activation deep-dive",
@@ -1263,6 +1337,7 @@ const mockSynthesis: Record<string, SynthesisRow> = {
     id: "synth-" + ID.onboarding,
     cycle_id: ID.onboarding,
     created_at: now - 42 * DAY,
+    edited_diverged: false,
     model_meta: JSON.stringify({
       adapter: "claude-code",
       cycle: "Onboarding · Wave 3",
@@ -1437,6 +1512,8 @@ const mockDiff: Record<string, DiffRow> = {
               statement:
                 "New accounts stall at the data-source connect because it demands warehouse credentials users don't have on hand at signup.",
               why: "Confidence rose low→high and the root cause sharpened — last wave it was a vague 'something around connecting a data source', now it's specifically missing credentials at signup. Support grew 1→4.",
+              confidence: "high",
+              prev_confidence: "low",
             },
           ],
         },
@@ -1450,6 +1527,8 @@ const mockDiff: Record<string, DiffRow> = {
               statement:
                 "Event mapping is the most confusing step: too many fields with no guidance, so users guess and get half-empty funnels.",
               why: "Same conclusion and recommendation as last wave; no material shift.",
+              confidence: "high",
+              prev_confidence: "high",
             },
             {
               status: "new",
@@ -1458,6 +1537,8 @@ const mockDiff: Record<string, DiffRow> = {
               statement:
                 "A guided setup wizard would collapse a two-day stall into minutes — users explicitly asked for prescriptive steps.",
               why: "No matching finding last wave; the explicit ask for a wizard is new this cycle.",
+              confidence: "medium",
+              prev_confidence: null,
             },
             {
               status: "dropped",
@@ -1466,6 +1547,8 @@ const mockDiff: Record<string, DiffRow> = {
               statement:
                 "Pricing came up as an objection that stalled some users mid-onboarding.",
               why: "No supporting evidence this wave — the pricing objection did not recur in any interview.",
+              confidence: null,
+              prev_confidence: "medium",
             },
           ],
         },
@@ -1479,6 +1562,8 @@ const mockDiff: Record<string, DiffRow> = {
               statement:
                 "Users won't invite a teammate until they themselves have something to show — activation must precede any invite prompt.",
               why: "The previous wave surfaced nothing for the invite goal; this is the first finding tied to G3.",
+              confidence: "medium",
+              prev_confidence: null,
             },
           ],
         },
@@ -1489,6 +1574,98 @@ const mockDiff: Record<string, DiffRow> = {
 
 // Compute the Diff tab's precondition status for a cycle the same way Rust's diff_status
 // does: no prev cycle → 'no-prev-cycle'; else check both syntheses exist.
+// --- Guide coverage seed (v3 B1: "did we ask everything?") --------------------
+//
+// A realistic MIXED coverage doc against the Activation guide's goals (G1/G2/G3) + two
+// probe questions, with evidence pointing at real seeded RAW_DIALOGUE segment indexes,
+// so the coverage panel renders populated (covered/partial/missed + score + follow-ups)
+// in the browser preview. Keyed per interview; run_guide_coverage (re)fills it.
+function mockCoverageDoc(): CoverageDoc {
+  return {
+    items: [
+      {
+        id: "G1",
+        text: "Why do new accounts stall before creating their first funnel?",
+        kind: "goal",
+        status: "covered",
+        evidence: [
+          { segment_id: 3, quote: "it asked me to pick a warehouse and I didn't have those credentials on hand, so I sort of stalled there" },
+          { segment_id: 5, quote: "I had to go bug our data engineer on Slack, and by then I'd already lost the thread" },
+        ],
+        note: "Explored in depth: the stall point (source connect) and its cause are both established.",
+      },
+      {
+        id: "G2",
+        text: "Which onboarding step causes the most confusion (source connect vs. event mapping)?",
+        kind: "goal",
+        status: "partial",
+        evidence: [
+          { segment_id: 7, quote: "the mapping screen had a lot of fields and I wasn't confident I was picking the right ones" },
+        ],
+        note: "Event mapping was probed, but the two steps were never directly compared.",
+      },
+      {
+        id: "G3",
+        text: "What would make someone invite a teammate in week one?",
+        kind: "goal",
+        status: "missed",
+        evidence: [],
+        note: "The question was asked at the very end but the answer was cut off by the recording.",
+      },
+      {
+        id: "Q1",
+        text: "Walk me through the first time you logged in.",
+        kind: "question",
+        section: "main",
+        status: "covered",
+        evidence: [
+          { segment_id: 1, quote: "I just kind of poked around. I saw the dashboard was empty" },
+        ],
+      },
+      {
+        id: "Q2",
+        text: "Where did you get stuck, and what did you do next?",
+        kind: "question",
+        section: "main",
+        status: "partial",
+        evidence: [
+          { segment_id: 9, quote: "the funnel showed up but two steps were empty, and I couldn't tell if that was my setup" },
+        ],
+        note: "The 'what next' half was answered only for the credentials stall, not the mapping one.",
+      },
+    ],
+    score: 62,
+    summary:
+      "The stall story (G1) is well covered with strong quotes; step comparison (G2) is only half-explored and the teammate-invite goal (G3) got no usable answer.",
+    follow_ups: [
+      { related_id: "G3", question: "Что должно произойти в первую неделю, чтобы вы позвали коллегу в продукт?" },
+      { related_id: "G2", question: "Если сравнить подключение источника и маппинг событий — что из этого запутало сильнее и почему?" },
+      { related_id: "G2", question: "Что помогло бы вам выбирать поля на экране маппинга увереннее?" },
+    ],
+  };
+}
+
+const mockCoverage: Record<string, CoverageRow> = {
+  [FIRST_INTERVIEW_ID]: {
+    interview_id: FIRST_INTERVIEW_ID,
+    doc: mockCoverageDoc(),
+    model_meta: JSON.stringify({ adapter: "claude-code", task: "guide-coverage", items: 5, score: 62 }),
+    created_at: now - 2 * DAY,
+    updated_at: now - 2 * DAY,
+  },
+};
+
+function cloneCoverage(row: CoverageRow): CoverageRow {
+  return {
+    ...row,
+    doc: {
+      ...row.doc,
+      items: row.doc.items.map((i) => ({ ...i, evidence: i.evidence.map((e) => ({ ...e })) })),
+      follow_ups: row.doc.follow_ups.map((f) => ({ ...f })),
+    },
+  };
+}
+
 function mockDiffStatus(cycleId: string): DiffStatusRow {
   const cycle = cycles.find((c) => c.id === cycleId);
   const prevId = cycle?.prev_cycle_id ?? null;
@@ -2108,7 +2285,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     }
 
     case "rewrite_segment": {
-      // Per-segment rewrite ("хуйня, переписывай"): the real backend sends ONE segment's text to
+      // Per-segment rewrite: the real backend sends ONE segment's text to
       // the CLI and gets back plain text. The browser preview has no CLI, so reuse the toy
       // mockCleanText after a short delay to demonstrate the loading → replace flow for review.
       const original = String(a.text ?? "");
@@ -2246,6 +2423,8 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
             id: seeded?.id ?? "synth-" + cycleId,
             cycle_id: cycleId,
             created_at: Date.now(),
+            // A fresh run always clears the divergence flag (mirrors Rust).
+            edited_diverged: false,
             // M10b: re-render the editable markdown artifact from the (regenerated) doc.
             content_md: renderCycleMarkdown(doc),
             model_meta: JSON.stringify({
@@ -2289,6 +2468,7 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
         );
       }
       row.content_md = contentMd; // structured doc untouched (matches Rust).
+      row.edited_diverged = true; // a save marks the markdown as diverged (matches Rust).
       return Promise.resolve(
         { ...row, doc: structuredClone(row.doc) } as T,
       );
@@ -2704,6 +2884,102 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       return new Promise((resolve) => setTimeout(() => resolve(result as T), 500));
     }
 
+    // --- Guide coverage + guide draft (v3 B1) ----------------------------------
+
+    case "get_guide_coverage": {
+      const interviewId = String(a.interviewId);
+      const row = mockCoverage[interviewId];
+      return Promise.resolve((row ? cloneCoverage(row) : null) as T);
+    }
+
+    case "run_guide_coverage": {
+      const interviewId = String(a.interviewId);
+      emitCoverage({ interview_id: interviewId, stage: "started", progress: 5, error: null });
+      setTimeout(
+        () => emitCoverage({ interview_id: interviewId, stage: "running", progress: 40, error: null }),
+        250,
+      );
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          const ts = Date.now();
+          const row: CoverageRow = {
+            interview_id: interviewId,
+            doc: mockCoverageDoc(),
+            model_meta: JSON.stringify({ adapter: "claude-code", task: "guide-coverage", items: 5, score: 62 }),
+            created_at: mockCoverage[interviewId]?.created_at ?? ts,
+            updated_at: ts,
+          };
+          mockCoverage[interviewId] = row;
+          emitCoverage({ interview_id: interviewId, stage: "done", progress: 100, error: null });
+          resolve(cloneCoverage(row) as T);
+        }, 1400);
+      });
+    }
+
+    case "generate_guide_draft": {
+      const productId = String(a.productId);
+      const product = products.find((p) => p.id === productId);
+      if (!product) {
+        return Promise.reject(new Error(`product not found: ${productId}`));
+      }
+      // A realistic RU draft (цели / гипотезы / вопросные блоки), rendered through the
+      // SAME resolveGuideWrite path a manual templated save uses — so content_md/goals
+      // mirror the Rust command byte-for-byte in shape.
+      const template: GuideTemplate = normalizeTemplate({
+        hypotheses: [
+          { id: "", text: "Новые аккаунты стопорятся на подключении источника данных, потому что у них нет учётных данных под рукой." },
+          { id: "", text: "Пользователь зовёт коллегу только после первого «показуемого» результата." },
+        ],
+        tasks: [
+          { id: "", text: "Понять, почему новые аккаунты не доходят до первой воронки за 24 часа." },
+          { id: "", text: "Выяснить, какой шаг онбординга вызывает больше всего путаницы." },
+          { id: "", text: "Определить, что мотивирует пригласить коллегу в первую неделю." },
+        ],
+        qualifying_questions: [
+          { id: "", text: "Какая у вас роль в команде и как давно вы пользуетесь продуктом?" },
+        ],
+        main_blocks: [
+          {
+            title: "Первая сессия",
+            questions: [
+              { id: "", text: "Расскажите про вашу первую сессию после регистрации — что вы сделали в первую очередь?" },
+              { id: "", text: "Где вы застряли и что сделали дальше?" },
+              { id: "", text: "Что вы ожидали увидеть на пустом дашборде?" },
+            ],
+          },
+          {
+            title: "Подключение данных и маппинг событий",
+            questions: [
+              { id: "", text: "Как прошло подключение первого источника данных?" },
+              { id: "", text: "Насколько уверенно вы выбирали события на экране маппинга?" },
+            ],
+          },
+          {
+            title: "Команда",
+            questions: [
+              { id: "", text: "В какой момент вы позвали (или позвали бы) коллегу в продукт?" },
+            ],
+          },
+        ],
+        hypothesis_questions: [],
+      });
+      const w = resolveGuideWrite("", template);
+      const ts = Date.now();
+      const date = new Date(ts).toISOString().slice(0, 10);
+      const guide: Guide = {
+        id: uuid(),
+        name: `Draft: ${product.name} (${date})`,
+        content_md: w.content_md,
+        goals: w.goals,
+        template: w.template,
+        created_at: ts,
+        updated_at: ts,
+      };
+      guides.push(guide);
+      // The real command runs a full CLI turn; a delay keeps the button's busy state honest.
+      return new Promise((resolve) => setTimeout(() => resolve(cloneGuide(guide) as T), 1200));
+    }
+
     // --- Cycle chat (M11 Phase A) ---------------------------------------------
     case "list_chat_threads": {
       const cycleId = String(a.cycleId);
@@ -2833,6 +3109,44 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
           thread.session_id = thread.session_id ?? "dev-mock-session-" + threadId.slice(0, 8);
           thread.updated_at = ts;
         }
+        // Phase B: persist one applied tool call + emit its Action event BEFORE Done
+        // (mirrors the Rust runner's ordering) so the chips are visible in browser dev.
+        const call: ChatToolCall = {
+          id: uuid(),
+          message_id: msg.id,
+          thread_id: threadId,
+          tool: "glossary.add_terms",
+          kind: "write",
+          args_json: JSON.stringify({
+            action: "glossary.add_terms",
+            terms: [
+              { canonical: "воронка", aliases: ["funnel"] },
+              { canonical: "маппинг событий", aliases: ["event mapping"] },
+            ],
+          }),
+          result_json: JSON.stringify({
+            summary: "Добавлено 2 термина в глоссарий",
+            added: 2,
+            skipped: 0,
+          }),
+          status: "applied",
+          error: null,
+          undo_token: JSON.stringify({
+            kind: "glossary.add_terms",
+            term_ids: [uuid(), uuid()],
+          }),
+          undone_at: null,
+          created_at: ts,
+        };
+        (mockChatToolCalls[threadId] ??= []).push(call);
+        emitChat(threadId, {
+          kind: "action",
+          thread_id: threadId,
+          tool_call_id: call.id,
+          tool: call.tool,
+          status: "applied",
+          summary: "Добавлено 2 термина в глоссарий",
+        });
         emitChat(threadId, {
           kind: "done",
           thread_id: threadId,
@@ -2850,6 +3164,32 @@ export function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
       mockChatCancelled.add(threadId);
       if (mockChatTimer) clearTimeout(mockChatTimer);
       return Promise.resolve(undefined as T);
+    }
+
+    // --- Chat actions (M11 Phase B) ---------------------------------------------
+
+    case "list_chat_tool_calls": {
+      const threadId = String(a.threadId);
+      const rows = mockChatToolCalls[threadId] ?? [];
+      return Promise.resolve(rows.map((c) => ({ ...c })) as T);
+    }
+
+    case "undo_chat_action": {
+      const toolCallId = String(a.toolCallId);
+      for (const rows of Object.values(mockChatToolCalls)) {
+        const row = rows.find((c) => c.id === toolCallId);
+        if (!row) continue;
+        if (row.status !== "applied") {
+          // Mirrors the Rust guard: only an applied (not-yet-undone) action is undoable.
+          return Promise.reject(
+            new Error(`tool call is not undoable (status: ${row.status})`),
+          );
+        }
+        row.status = "undone";
+        row.undone_at = Date.now();
+        return Promise.resolve({ ...row } as T);
+      }
+      return Promise.reject(new Error(`tool call not found: ${toolCallId}`));
     }
 
     default:

@@ -38,7 +38,15 @@ const STR = {
       "Пока нет терминов. Добавьте англицизмы, аббревиатуры и названия продуктов, которые распознаются неверно — или сгенерируйте их из интервью на вкладке «Интервью».",
     importBase: "Базовый набор",
     importBaseTitle: "Добавить готовый словарь IT/продуктовых терминов с русскими особенностями",
-    imported: (n: number) => (n > 0 ? `Добавлено терминов: ${n}` : "Все термины уже в глоссарии"),
+    imported: (added: number, merged: number, skipped: number) => {
+      if (added === 0 && merged === 0) return "Все термины уже в глоссарии";
+      const parts: string[] = [];
+      if (added > 0) parts.push(`добавлено ${added}`);
+      if (merged > 0) parts.push(`дополнено ${merged}`);
+      if (skipped > 0) parts.push(`пропущено ${skipped}`);
+      const s = parts.join(", ");
+      return s.charAt(0).toUpperCase() + s.slice(1);
+    },
     importFailed: (e: string) => `Не удалось импортировать набор. ${e}`,
   },
   en: {
@@ -63,7 +71,15 @@ const STR = {
       "No terms yet. Add the anglicisms, acronyms, and product names that get mis-transcribed — or auto-suggest them from an interview on the Interviews tab.",
     importBase: "Starter set",
     importBaseTitle: "Add a ready-made IT / product glossary tuned for Russian speech",
-    imported: (n: number) => (n > 0 ? `Added ${n} term${n === 1 ? "" : "s"}` : "All terms are already in the glossary"),
+    imported: (added: number, merged: number, skipped: number) => {
+      if (added === 0 && merged === 0) return "All terms are already in the glossary";
+      const parts: string[] = [];
+      if (added > 0) parts.push(`added ${added}`);
+      if (merged > 0) parts.push(`updated ${merged}`);
+      if (skipped > 0) parts.push(`skipped ${skipped}`);
+      const s = parts.join(", ");
+      return s.charAt(0).toUpperCase() + s.slice(1);
+    },
     importFailed: (e: string) => `Couldn't import the set. ${e}`,
   },
 };
@@ -207,12 +223,19 @@ export function GlossaryPanel({ productId }: { productId: string }) {
     }
   }
 
-  // One-click: bulk-add the curated IT/product starter glossary (backend dedups against
-  // existing terms, so re-importing only adds what's new).
+  // One-click: bulk-add the curated IT/product starter glossary. The backend dedups on the
+  // canonical (case-insensitive) and MERGES new aliases into existing terms instead of
+  // duplicating them; it returns the rows actually touched (inserted + alias-merged). We derive
+  // the exact counts from that: a returned id we already had = merged, a fresh id = added,
+  // anything not returned = skipped (pure duplicate). Re-importing is therefore always safe.
   async function importSeed() {
     try {
-      const added = await addTerms.mutateAsync(GLOSSARY_SEED);
-      toast.success(t.imported(added.length));
+      const existingIds = new Set((terms ?? []).map((t) => t.id));
+      const affected = await addTerms.mutateAsync(GLOSSARY_SEED);
+      const merged = affected.filter((t) => existingIds.has(t.id)).length;
+      const added = affected.length - merged;
+      const skipped = GLOSSARY_SEED.length - affected.length;
+      toast.success(t.imported(added, merged, skipped));
     } catch (e) {
       toast.error(t.importFailed(String(e)));
     }

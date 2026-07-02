@@ -1501,7 +1501,7 @@ const AI_CLI_STR = {
     rescanFailed: (err: string) => `Пересканирование не удалось. ${err}`,
     activePlugin: "Активный плагин",
     activePluginHintPre:
-      "Локальный CLI, который InterviewLab использует для очистки, синтеза и сравнения. Claude Code использует вашу сессию ",
+      "Локальный CLI, который InterviewLab использует для всех LLM-задач (очистка, синтез, сравнение, покрытие и генерация гайдов, глоссарий) и чата по циклу. Claude Code использует вашу сессию ",
     activePluginHintPost: " — ключ API не нужен.",
     selectPlugin: "Выберите плагин",
     testCli: "Проверить CLI",
@@ -1519,7 +1519,7 @@ const AI_CLI_STR = {
     rescanFailed: (err: string) => `Rescan failed. ${err}`,
     activePlugin: "Active plugin",
     activePluginHintPre:
-      "The local CLI InterviewLab uses for cleanup, synthesis, and diff. Claude Code uses your ",
+      "The local CLI InterviewLab uses for every LLM task (cleanup, synthesis, diff, guide coverage & generation, glossary) and the cycle chat. Claude Code uses your ",
     activePluginHintPost: " session — no API key needed.",
     selectPlugin: "Select a plugin",
     testCli: "Test CLI",

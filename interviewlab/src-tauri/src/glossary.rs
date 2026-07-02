@@ -140,31 +140,109 @@ fn term_key(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-// Render the glossary as the compact JSON array the cleanup/synthesis prompts carry:
-// [{canonical, aliases, notes}, …]. Empty-canonical rows are skipped. Used as the entity
-// phrase-list — the model maps any alias/variant in the text to its canonical spelling.
-pub fn render_for_prompt(terms: &[GlossaryTerm]) -> Value {
-    let items: Vec<Value> = terms
+// Merge incoming aliases into an existing alias list: case-insensitive dedupe (against the
+// existing aliases AND the canonical itself — an alias equal to the canonical is noise),
+// existing order preserved, genuinely-new aliases appended (trimmed) in incoming order.
+// Returns None when nothing new would be added — the caller then skips the DB write.
+// Pure → unit-tested.
+fn merge_aliases(canonical: &str, existing: &[String], incoming: &[String]) -> Option<Vec<String>> {
+    let mut seen: std::collections::HashSet<String> = existing.iter().map(|a| term_key(a)).collect();
+    seen.insert(term_key(canonical));
+    let mut merged: Vec<String> = existing.to_vec();
+    let mut grew = false;
+    for a in incoming {
+        let t = a.trim();
+        if t.is_empty() || !seen.insert(term_key(t)) {
+            continue;
+        }
+        merged.push(t.to_string());
+        grew = true;
+    }
+    grew.then_some(merged)
+}
+
+// Render the glossary as the compact block the cleanup/synthesis/diff/chat prompts carry.
+//
+// SHAPE CONTRACT: the return value stays a JSON ARRAY (call sites gate inclusion on
+// `.as_array().map(|a| !a.is_empty())` and clone the Value into their input JSON) — but the
+// elements are now compact instruction LINES instead of {canonical, aliases, notes} objects:
+//   [ header, "каноничное — варианты: в1, в2 (заметка)", …, "…и ещё N терминов"? ]
+// One line per term keeps the block ~3–4x smaller than the object form, the header makes the
+// mapping self-explanatory, and a HARD total-size cap (whole lines cut, with a "…и ещё N"
+// trailer) keeps a big glossary from blowing up prompt budgets. Notes are included only when
+// short — they're a gloss for the UI, not payload the model needs. Empty glossary → `[]`.
+const GLOSSARY_PROMPT_MAX_CHARS: usize = 2_500;
+const GLOSSARY_PROMPT_NOTE_MAX_CHARS: usize = 48;
+
+// Russian plural of «термин» for the cut-off trailer.
+fn ru_terms_plural(n: usize) -> &'static str {
+    let (m10, m100) = (n % 10, n % 100);
+    if m10 == 1 && m100 != 11 {
+        "термин"
+    } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+        "термина"
+    } else {
+        "терминов"
+    }
+}
+
+// One compact line per term: «каноничное — варианты: …» (+ short note in parentheses).
+fn term_prompt_line(t: &GlossaryTerm) -> Option<String> {
+    let canonical = t.canonical.trim();
+    if canonical.is_empty() {
+        return None;
+    }
+    let mut line = canonical.to_string();
+    let aliases: Vec<&str> = t
+        .aliases
         .iter()
-        .filter(|t| !t.canonical.trim().is_empty())
-        .map(|t| {
-            let mut o = json!({ "canonical": t.canonical.trim() });
-            let aliases: Vec<&str> = t
-                .aliases
-                .iter()
-                .map(|a| a.trim())
-                .filter(|a| !a.is_empty())
-                .collect();
-            if !aliases.is_empty() {
-                o["aliases"] = json!(aliases);
-            }
-            if !t.notes.trim().is_empty() {
-                o["notes"] = json!(t.notes.trim());
-            }
-            o
-        })
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
         .collect();
-    json!(items)
+    if !aliases.is_empty() {
+        line.push_str(" — варианты: ");
+        line.push_str(&aliases.join(", "));
+    }
+    let note = t.notes.trim();
+    if !note.is_empty() && note.chars().count() <= GLOSSARY_PROMPT_NOTE_MAX_CHARS {
+        line.push_str(&format!(" ({note})"));
+    }
+    Some(line)
+}
+
+pub fn render_for_prompt(terms: &[GlossaryTerm]) -> Value {
+    let lines: Vec<String> = terms.iter().filter_map(term_prompt_line).collect();
+    if lines.is_empty() {
+        return json!([]);
+    }
+    let header = "Глоссарий: используй канонические написания; «варианты» в строке — тот же \
+                  термин в искажённой записи (ASR/другая графика), заменяй их на каноничную форму."
+        .to_string();
+    let total: usize =
+        header.chars().count() + lines.iter().map(|l| l.chars().count()).sum::<usize>();
+    let mut out = vec![header];
+    if total <= GLOSSARY_PROMPT_MAX_CHARS {
+        out.extend(lines);
+        return json!(out);
+    }
+    // Over budget: keep whole lines while they fit (reserving room for the trailer), then say
+    // how many were cut — the model knows the list is trimmed, the head is highest-priority.
+    let trailer_reserve = 28;
+    let budget = GLOSSARY_PROMPT_MAX_CHARS.saturating_sub(trailer_reserve);
+    let mut used = out[0].chars().count();
+    let mut included = 0usize;
+    for line in &lines {
+        let len = line.chars().count();
+        if used + len > budget {
+            break;
+        }
+        used += len;
+        out.push(line.clone());
+        included += 1;
+    }
+    let rest = lines.len() - included;
+    out.push(format!("…и ещё {} {}", rest, ru_terms_plural(rest)));
+    json!(out)
 }
 
 // Render the CANONICAL terms as a compact comma-separated blurb for the whisper initial_prompt
@@ -270,29 +348,98 @@ async fn delete_term_db(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
-// Bulk-add terms (the suggest-accept flow + a path for importing). Skips any term whose
-// canonical is empty, already exists for the product (case-insensitive), or duplicates an
-// earlier term in this same batch — so accepting suggestions never creates dupes. Returns the
-// rows actually inserted.
-async fn add_terms_db(
+// Update ONLY a term's alias list (the merge path) — canonical/notes stay untouched, so a
+// re-import can never clobber a user's manual edits to a term.
+async fn update_aliases_db(pool: &SqlitePool, id: &str, aliases: &[String]) -> Result<GlossaryTerm, String> {
+    let aliases_json = serde_json::to_string(aliases).map_err(|e| format!("serialize aliases: {e}"))?;
+    sqlx::query("UPDATE glossary_term SET aliases_json = ?, updated_at = ? WHERE id = ?")
+        .bind(&aliases_json)
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    get_term_db(pool, id)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|t| t.expect("just updated"))
+}
+
+// Outcome of a bulk add/import. `affected` = the rows actually touched — inserted rows AND
+// existing rows whose alias list grew (merged) — in processing order, each row at most once.
+// Exact counters ride alongside for logging/tests. Invariant: added + merged + skipped ==
+// terms.len() (every input term lands in exactly one bucket).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AddTermsOutcome {
+    pub affected: Vec<GlossaryTerm>,
+    pub added: usize,
+    pub merged: usize,
+    pub skipped: usize,
+}
+
+// Bulk-add terms — the shared path for the one-click seed import, the suggest-accept flow, and
+// the chat `glossary.add_terms` action. Dedup + MERGE semantics:
+//   * canonical match is case-insensitive on the trimmed canonical (existing rows and earlier
+//     terms in the same batch alike) — a duplicate NEVER creates a second row;
+//   * on a match, NEW aliases are merged into the existing row's alias list (case-insensitive
+//     dedupe there too, existing order preserved, new ones appended) → counted as `merged`;
+//     a duplicate contributing nothing new is counted as `skipped` (no DB write);
+//   * empty canonicals are `skipped`; genuinely new canonicals are inserted → `added`.
+// pub(crate) so the chat action can share this one source of truth instead of re-implementing.
+pub(crate) async fn add_terms_db(
     pool: &SqlitePool,
     product_id: &str,
     terms: &[NewTerm],
-) -> Result<Vec<GlossaryTerm>, String> {
+) -> Result<AddTermsOutcome, String> {
     let existing = list_for_product_db(pool, product_id)
         .await
         .map_err(|e| e.to_string())?;
-    let mut seen: std::collections::HashSet<String> =
-        existing.iter().map(|t| term_key(&t.canonical)).collect();
-    let mut inserted = Vec::new();
+    // key → (row id, canonical, current aliases) for existing rows AND rows created/merged in
+    // this batch — so an in-batch duplicate merges into the row its first occurrence created.
+    let mut by_key: std::collections::HashMap<String, (String, String, Vec<String>)> = existing
+        .iter()
+        .map(|t| (term_key(&t.canonical), (t.id.clone(), t.canonical.clone(), t.aliases.clone())))
+        .collect();
+    let mut affected: Vec<GlossaryTerm> = Vec::new();
+    // row id → index in `affected`, so a row touched twice appears once (freshest version).
+    let mut slot_by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let (mut added, mut merged, mut skipped) = (0usize, 0usize, 0usize);
+
     for t in terms {
         let key = term_key(&t.canonical);
-        if key.is_empty() || !seen.insert(key) {
+        if key.is_empty() {
+            skipped += 1;
             continue;
         }
-        inserted.push(create_term_db(pool, product_id, &t.canonical, &t.aliases, &t.notes).await?);
+        match by_key.get(&key).cloned() {
+            Some((id, canonical, aliases)) => match merge_aliases(&canonical, &aliases, &t.aliases) {
+                Some(grown) => {
+                    let row = update_aliases_db(pool, &id, &grown).await?;
+                    by_key.insert(key, (id.clone(), canonical, grown));
+                    match slot_by_id.get(&id) {
+                        Some(&i) => affected[i] = row,
+                        None => {
+                            slot_by_id.insert(id, affected.len());
+                            affected.push(row);
+                        }
+                    }
+                    merged += 1;
+                }
+                None => skipped += 1,
+            },
+            None => {
+                // Sanitize the new row's own aliases the same way the merge path does
+                // (trim, case-insensitive dedupe, drop alias == canonical).
+                let clean_aliases = merge_aliases(&t.canonical, &[], &t.aliases).unwrap_or_default();
+                let row = create_term_db(pool, product_id, &t.canonical, &clean_aliases, &t.notes).await?;
+                by_key.insert(key, (row.id.clone(), row.canonical.clone(), row.aliases.clone()));
+                slot_by_id.insert(row.id.clone(), affected.len());
+                affected.push(row);
+                added += 1;
+            }
+        }
     }
-    Ok(inserted)
+    Ok(AddTermsOutcome { affected, added, merged, skipped })
 }
 
 // --- shared resolution (the glossary for an interview / product) --------------
@@ -538,25 +685,43 @@ fn diff_pairs(raw: &[Segment], fixed: &[Segment]) -> Vec<(String, String)> {
 // can be trivially hoisted into ONE Rust constant later (roadmap §4 "общий мини-блок правил одной
 // константой во все стадии"). Do NOT diverge the wording per file.
 const UNIFIED_LLM_RULES: &str = "Unified rules for every LLM stage:\n\
-    - Output language = the language of the interview; do NOT translate terms.\n\
+    - Output language = the language of the interview (for Russian interviews — Russian; mirror \
+    the interview's language otherwise); do NOT translate terms the speaker used.\n\
+    - Own prose (findings, summaries, notes — never transcript text or quotes) must read as \
+    natural, professional Russian, not translationese: no канцелярит («имеет место непонимание» → \
+    «пользователи не понимают»); state conclusions as assertions, not as «было выявлено, что…».\n\
     - Anti-hallucination: never invent names/numbers/quotes; \"not established / no answer\" is \
     better than guessing.\n\
-    - Terminology: use the canonical spellings from the glossary, both in prose and inside quotes.\n\
+    - Terminology: in your own prose use the canonical spellings from the glossary; a Latin \
+    original, its Cyrillic transliteration, and declined forms are the SAME term \
+    (фича = feature, «в Слаке» = Slack). Quotes copied from the transcript stay verbatim.\n\
     - Artifact style: neutral analytical tone, no filler, one consistent format for quotes and \
     numbers, and NO markdown headings inside string fields of the JSON.";
 
 // Shared extract instructions: what a glossary term IS and the never-hallucinate guardrails. The
 // language / anti-hallucination policy comes from UNIFIED_LLM_RULES (one source of truth); this
 // string covers only the extract-task SPECIFICS so it can't drift from the other stages.
+// RU-optimized: mirrors the seed-glossary conventions (glossary-seed.ts) so mined terms and the
+// starter set never disagree on canonical spelling style.
 const EXTRACT_GUIDELINES: &str = "Build a focused GLOSSARY for fixing speech-to-text of \
-    Russian product/tech interviews. A glossary term = a brand / product / tool name, an \
-    acronym/initialism, a technical term, or an anglicism that the ASR mis-renders. For each \
-    term return its CANONICAL spelling (acronyms → UPPERCASE Latin like API/MVP/SaaS; \
-    products/tools → canonical like Figma/Jira/GitHub; assimilated anglicisms → standard \
-    Cyrillic like дедлайн/фича/баг — do NOT Latinize those) plus `aliases`: the garbled / \
-    phonetic / mis-spelled forms to map to it (e.g. canonical \"API\" with aliases \
-    [\"эй-пи-ай\",\"апишка\"]). Only include terms ACTUALLY present in the provided text. Skip \
-    ordinary words. Prefer fewer, high-value entries over an exhaustive dump.";
+    Russian product/tech interviews. MINE these kinds of terms: (1) domain jargon and \
+    product/tech anglicisms (дедлайн, фича, ретеншн, кастдев); (2) TRANSLITERATION PAIRS — the \
+    same term appearing both in Cyrillic and Latin in the text (джира/Jira, фигма/Figma, \
+    промт/prompt): the strongest signal an entry is needed; (3) brand / product / tool names, \
+    including the team's own product and feature names; (4) acronyms/initialisms, including \
+    their spoken letter-by-letter forms («эй-пи-ай» = API, «эн-пи-эс» = NPS, «би-ту-би» = B2B); \
+    (5) team-specific slang for features, projects, processes. EXCLUDE: ordinary Russian words; \
+    one-off mishearings that are not a recurring term; personal names of the interview \
+    participants (respondent, moderator, colleagues mentioned in passing); filler. CANONICAL \
+    spelling rules (match the seed-glossary conventions): acronyms → UPPERCASE Latin (API, MVP, \
+    NPS, B2B); brand/product/tool names → the official Latin name (Figma, Jira, GitHub); \
+    assimilated anglicisms → the standard Cyrillic spelling (дедлайн, фича, баг) — do NOT \
+    Latinize those; team-internal names → the spelling the team itself uses. `aliases` = the \
+    variant/garbled forms to map to the canonical: ALWAYS include the exact variants seen in \
+    the provided text, plus plausible ASR phoneticizations (lowercase unless a proper name); \
+    no near-duplicate spam, no plain Russian words whose replacement would corrupt normal \
+    speech. `notes` = a SHORT Russian gloss, 2–4 words (e.g. «метрика удержания»). Prefer \
+    fewer, high-value entries over an exhaustive dump.";
 
 // Build the extract input for the transcript-mining path (B).
 fn build_extract_input(
@@ -571,9 +736,14 @@ fn build_extract_input(
         "rules": UNIFIED_LLM_RULES,
         "guidelines": EXTRACT_GUIDELINES,
         "instructions": "Read `transcript_text` (and `product_desc` for product/brand spellings) \
-            and propose NEW glossary terms per `guidelines`. Do NOT propose any term already in \
-            `existing_terms`. Return ONLY {\"terms\":[{\"canonical\":…,\"aliases\":[…],\"notes\":…,\
-            \"reason\":…}]} — `reason` = a short note on why it's worth adding.",
+            and propose NEW glossary terms per `guidelines`. Hunt specifically for: recurring \
+            domain terms; the SAME term spelled several ways (Cyrillic vs Latin, hyphenation, \
+            phonetic renderings) — unify them under one canonical; brand/tool mentions; spoken \
+            acronym forms. Do NOT propose any term already in `existing_terms` and do NOT \
+            propose participants' personal names. `aliases` must include the exact variants seen \
+            in the transcript. Return ONLY {\"terms\":[{\"canonical\":…,\"aliases\":[…],\"notes\":…,\
+            \"reason\":…}]} — `reason` = a short Russian note on why it's worth adding (e.g. \
+            which variants appear in the text).",
         "existing_terms": existing.iter().map(|t| t.canonical.as_str()).collect::<Vec<_>>(),
         "transcript_text": transcript_text,
     });
@@ -601,11 +771,15 @@ fn build_extract_from_edits_input(
         "rules": UNIFIED_LLM_RULES,
         "guidelines": EXTRACT_GUIDELINES,
         "instructions": "`corrections` are (before → after) edits a human made to the transcript. \
-            Find TERM-LEVEL normalizations among them (a brand/acronym/anglicism spelled one way in \
-            `before` and canonically in `after`) and turn each into a glossary term: `canonical` = \
-            the AFTER spelling, `aliases` = the BEFORE form(s). Ignore pure grammar/filler/wording \
-            edits that aren't about a term. Skip anything already in `existing_terms`. Return ONLY \
-            {\"terms\":[{\"canonical\":…,\"aliases\":[…],\"notes\":…,\"reason\":…}]}.",
+            Find TERM-LEVEL normalizations among them (a brand / acronym / anglicism / domain \
+            term spelled one way in `before` and canonically in `after`) and turn each into a \
+            glossary term: `canonical` = the AFTER spelling (the user's own choice is \
+            authoritative — keep it, only normalizing obvious case per the acronym/brand rules \
+            in `guidelines`), `aliases` = the BEFORE form(s) actually seen plus close phonetic \
+            variants the ASR would plausibly produce. Ignore pure grammar/punctuation/filler/\
+            wording edits that aren't about a term, one-off slips, and participants' personal \
+            names. Skip anything already in `existing_terms`. `notes` = a short Russian gloss. \
+            Return ONLY {\"terms\":[{\"canonical\":…,\"aliases\":[…],\"notes\":…,\"reason\":…}]}.",
         "existing_terms": existing.iter().map(|t| t.canonical.as_str()).collect::<Vec<_>>(),
         "corrections": pairs,
     });
@@ -655,14 +829,26 @@ pub async fn delete_glossary_term(db: tauri::State<'_, Db>, id: String) -> Resul
 }
 
 // Bulk-accept suggested (or imported) terms into a product's glossary. Returns the rows
-// actually inserted (dupes/empties skipped).
+// actually TOUCHED: inserted rows plus existing rows that gained aliases via merge (each at
+// most once). RETURN-SHAPE DECISION: the tauri.ts contract is `Promise<GlossaryTerm[]>` and
+// must not change, so the exact {added, merged, skipped} counters can't ride along — instead
+// the UI derives them: merged = returned ids already present in its pre-import cache, added =
+// the rest, skipped = submitted − returned.len(). Rows that were pure duplicates (nothing new
+// to merge) are simply absent from the result — "fewer entries for merged/skipped" is the
+// least invasive extension of the old inserted-rows contract.
 #[tauri::command]
 pub async fn add_glossary_terms(
     db: tauri::State<'_, Db>,
     product_id: String,
     terms: Vec<NewTerm>,
 ) -> Result<Vec<GlossaryTerm>, String> {
-    add_terms_db(&db.pool, &product_id, &terms).await
+    let out = add_terms_db(&db.pool, &product_id, &terms).await?;
+    log::info!(
+        target: "interviewlab::glossary",
+        "add_glossary_terms: product '{product_id}': {} added, {} merged, {} skipped (of {})",
+        out.added, out.merged, out.skipped, terms.len()
+    );
+    Ok(out.affected)
 }
 
 // B — suggest glossary terms by mining an interview's transcript + its product context. The
@@ -833,28 +1019,83 @@ mod tests {
         assert_eq!(list_for_product_db(&pool, &pid).await.unwrap().len(), 0);
     }
 
-    // Bulk-add skips empties, existing (case-insensitive), and in-batch dupes.
+    // Bulk-add: empties skipped, a duplicate canonical (case-insensitive) never creates a second
+    // row — its NEW aliases merge into the existing row; contributing nothing new → skipped.
     #[tokio::test]
-    async fn add_terms_dedupes() {
+    async fn add_terms_merges_and_dedupes() {
         let pool = test_pool().await;
         let pid = seed_product(&pool).await;
-        create_term_db(&pool, &pid, "Jira", &[], "").await.unwrap();
+        create_term_db(&pool, &pid, "Jira", &["джира".into()], "трекер").await.unwrap();
 
-        let added = add_terms_db(
+        let out = add_terms_db(
             &pool,
             &pid,
             &[
-                NewTerm { canonical: "jira".into(), aliases: vec!["джира".into()], notes: "".into() }, // dup (ci)
-                NewTerm { canonical: "API".into(), aliases: vec![], notes: "".into() },                // new
-                NewTerm { canonical: "  ".into(), aliases: vec![], notes: "".into() },                 // empty
-                NewTerm { canonical: "api".into(), aliases: vec![], notes: "".into() },                // in-batch dup
+                // dup (ci) WITH a new alias → merged (existing alias order kept, new appended)
+                NewTerm { canonical: "jira".into(), aliases: vec!["джира".into(), "жира".into()], notes: "x".into() },
+                // new; own alias list sanitized (trim, ci-dupe, alias == canonical dropped)
+                NewTerm { canonical: "API".into(), aliases: vec!["апи".into(), " АПИ ".into(), "API".into()], notes: "".into() },
+                // empty canonical → skipped
+                NewTerm { canonical: "  ".into(), aliases: vec![], notes: "".into() },
+                // in-batch dup with nothing new → skipped
+                NewTerm { canonical: "api".into(), aliases: vec!["апи".into()], notes: "".into() },
             ],
         )
         .await
         .unwrap();
-        assert_eq!(added.len(), 1, "only API is genuinely new");
-        assert_eq!(added[0].canonical, "API");
-        assert_eq!(list_for_product_db(&pool, &pid).await.unwrap().len(), 2);
+
+        assert_eq!((out.added, out.merged, out.skipped), (1, 1, 2), "every input lands in one bucket");
+        assert_eq!(out.affected.len(), 2, "one merged row + one inserted row");
+        let jira = out.affected.iter().find(|t| t.canonical == "Jira").unwrap();
+        assert_eq!(
+            jira.aliases,
+            vec!["джира".to_string(), "жира".to_string()],
+            "merge preserves existing order and appends only the genuinely new alias"
+        );
+        assert_eq!(jira.notes, "трекер", "merge never touches the existing notes");
+        let api = out.affected.iter().find(|t| t.canonical == "API").unwrap();
+        assert_eq!(api.aliases, vec!["апи".to_string()], "insert path sanitizes its own aliases");
+        assert_eq!(list_for_product_db(&pool, &pid).await.unwrap().len(), 2, "no duplicate rows");
+    }
+
+    // A second in-batch occurrence with NEW aliases merges into the row created moments ago,
+    // and the affected list carries that row once, in its freshest state.
+    #[tokio::test]
+    async fn add_terms_in_batch_merge_updates_created_row() {
+        let pool = test_pool().await;
+        let pid = seed_product(&pool).await;
+        let out = add_terms_db(
+            &pool,
+            &pid,
+            &[
+                NewTerm { canonical: "Notion".into(), aliases: vec!["ноушн".into()], notes: "".into() },
+                NewTerm { canonical: "notion".into(), aliases: vec!["нотион".into(), "ноушн".into()], notes: "".into() },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.added, out.merged, out.skipped), (1, 1, 0));
+        assert_eq!(out.affected.len(), 1, "a row touched twice appears once");
+        assert_eq!(out.affected[0].canonical, "Notion", "first occurrence's canonical wins");
+        assert_eq!(out.affected[0].aliases, vec!["ноушн".to_string(), "нотион".to_string()]);
+        assert_eq!(list_for_product_db(&pool, &pid).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_aliases_dedupes_and_preserves_order() {
+        let existing = vec!["джира".to_string(), "JIRA cloud".to_string()];
+        let merged = merge_aliases(
+            "Jira",
+            &existing,
+            &[" жира ".into(), "ДЖИРА".into(), "jira".into(), "".into(), "jira cloud".into()],
+        );
+        assert_eq!(
+            merged,
+            Some(vec!["джира".to_string(), "JIRA cloud".to_string(), "жира".to_string()]),
+            "trimmed + ci-deduped (against aliases AND the canonical), existing order kept"
+        );
+        assert_eq!(merge_aliases("Jira", &existing, &["джира".into()]), None, "nothing new → None");
+        assert_eq!(merge_aliases("Jira", &existing, &[]), None);
     }
 
     // Deleting a product cascades its glossary terms (FK ON DELETE CASCADE + pragma).
@@ -913,13 +1154,66 @@ mod tests {
 
     #[test]
     fn render_for_prompt_shape() {
-        let g = terms(&[("API", &["эй-пи-ай"]), ("дедлайн", &[]), ("   ", &[])]);
+        let g = terms(&[("API", &["эй-пи-ай", "апишка"]), ("дедлайн", &[]), ("   ", &[])]);
         let v = render_for_prompt(&g);
         let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 2, "empty-canonical row dropped");
-        assert_eq!(arr[0]["canonical"], "API");
-        assert_eq!(arr[0]["aliases"][0], "эй-пи-ай");
-        assert!(arr[1].get("aliases").is_none(), "no aliases key when there are none");
+        // Still a JSON ARRAY (call sites gate on as_array + non-empty): header + one line/term.
+        assert_eq!(arr.len(), 3, "header + 2 term lines; empty-canonical row dropped");
+        assert!(
+            arr[0].as_str().unwrap().contains("канонические написания"),
+            "header explains the alias→canonical mapping"
+        );
+        assert_eq!(arr[1], "API — варианты: эй-пи-ай, апишка");
+        assert_eq!(arr[2], "дедлайн", "no aliases → bare canonical line");
+        assert_eq!(render_for_prompt(&[]), json!([]), "empty glossary stays an empty array");
+    }
+
+    #[test]
+    fn render_for_prompt_notes_only_when_short() {
+        let mut g = terms(&[("фича", &["feature"])]);
+        g[0].notes = "функция продукта".into();
+        assert_eq!(render_for_prompt(&g)[1], "фича — варианты: feature (функция продукта)");
+        g[0].notes = "о".repeat(GLOSSARY_PROMPT_NOTE_MAX_CHARS + 1);
+        assert_eq!(
+            render_for_prompt(&g)[1],
+            "фича — варианты: feature",
+            "a long note is dropped from the prompt line"
+        );
+    }
+
+    #[test]
+    fn render_for_prompt_caps_whole_lines_with_trailer() {
+        // ~200 lines × ~45 chars ≈ 9000 chars — far over the cap.
+        let many: Vec<GlossaryTerm> = (0..200)
+            .map(|i| GlossaryTerm {
+                id: "x".into(),
+                product_id: "p".into(),
+                canonical: format!("термин-номер-{i:03}"),
+                aliases: vec![format!("вариант-а-{i:03}"), format!("вариант-б-{i:03}")],
+                notes: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .collect();
+        let v = render_for_prompt(&many);
+        let arr = v.as_array().unwrap();
+        let total: usize = arr.iter().map(|l| l.as_str().unwrap().chars().count()).sum();
+        assert!(total <= GLOSSARY_PROMPT_MAX_CHARS, "hard cap holds (got {total})");
+        let last = arr.last().unwrap().as_str().unwrap();
+        assert!(last.starts_with("…и ещё"), "cut-off trailer present, got: {last}");
+        assert!(last.ends_with("терминов") || last.ends_with("термина") || last.ends_with("термин"));
+        assert!(arr.len() > 10, "a healthy head of whole lines survives the cap");
+        assert!(
+            arr[1].as_str().unwrap().starts_with("термин-номер-000 — варианты:"),
+            "lines are cut whole, never mid-line; priority head leads"
+        );
+    }
+
+    #[test]
+    fn ru_terms_plural_forms() {
+        for (n, want) in [(1, "термин"), (2, "термина"), (5, "терминов"), (11, "терминов"), (21, "термин"), (104, "термина")] {
+            assert_eq!(ru_terms_plural(n), want, "n = {n}");
+        }
     }
 
     #[test]

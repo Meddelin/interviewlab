@@ -8,6 +8,7 @@ mod adapter;
 mod asr;
 mod chat;
 mod cleanup;
+mod coverage;
 mod cycle;
 mod diarize;
 mod diff;
@@ -250,6 +251,11 @@ pub fn run() {
             chat::cycle_chat_append,
             chat::cycle_chat_send,
             chat::cycle_chat_cancel,
+            coverage::run_guide_coverage,
+            coverage::get_guide_coverage,
+            guides::generate_guide_draft,
+            chat::list_chat_tool_calls,
+            chat::undo_chat_action,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
